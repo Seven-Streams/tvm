@@ -320,7 +320,13 @@ def _extract_tile(layout, region):
     if isinstance(layout, ComposeLayout):
         return layout.tile_layout
     if isinstance(layout, SwizzleLayout):
-        extents = [int(end - start) for (start, end) in region]
+        # The region bounds may be constant-valued but carried as unfolded
+        # TIR exprs (e.g. a loop var substituted to ``0`` leaves ``0*64`` as a
+        # ``Mul`` node, so ``end - start`` is a ``Sub`` of two such terms).
+        # ``int()`` only accepts folded constants, so simplify first; a tile
+        # extent that is genuinely symbolic still raises, as it must.
+        analyzer = arith.Analyzer()
+        extents = [int(analyzer.simplify(end - start)) for (start, end) in region]
         return TileLayout(S[tuple(extents)])
     return layout
 

@@ -150,7 +150,12 @@ def _check_layout_operands_agree(plan, sctx) -> tuple[bool, str | None]:
     for br in layout_brs:
         st, ext = get_st_extent(br)
         with sctx.target:
-            sliced = get_sublayout_from_region(br.buffer.layout, br.buffer.shape, st, ext)
+            # Canonicalize before slicing so a raw ``.16x*b`` atom layout
+            # (``laneid`` + ``wid_in_wg``) fuses to ``tid_in_wg`` first; slicing the
+            # raw form leaves a mixed ``laneid``/``tid_in_wg`` layout that
+            # ``canonicalize()`` then rejects ("conflicting scopes for thread").
+            base = br.buffer.layout.canonicalize()
+            sliced = get_sublayout_from_region(base, br.buffer.shape, st, ext)
             canon = sliced.canonicalize()
         sig = layout_signature(canon)
         if sig is None:
