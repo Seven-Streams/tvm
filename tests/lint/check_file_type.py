@@ -41,6 +41,7 @@ ALLOW_EXTENSION = {
     "sh",
     "bat",
     "py",
+    "rs",
     # configurations
     "cfg",
     "mk",
@@ -89,6 +90,8 @@ ALLOW_FILE_NAME = {
     "CODEOWNERSHIP",
     "condarc",
     "with_the_same_user",
+    "Cargo.lock",
+    "tvm-ffi-config",
 }
 
 # List of specific files allowed in relpath to <proj_root>

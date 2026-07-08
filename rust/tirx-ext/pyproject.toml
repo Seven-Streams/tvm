@@ -1,0 +1,47 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[project]
+name = "tirx-ext"
+version = "0.1.0"
+description = "Rust-implemented tirx IR analysis tools, exposed to Python through tvm-ffi"
+readme = "README.md"
+license = { text = "Apache 2.0" }
+requires-python = ">=3.9"
+# Runtime deps are `tvm` and `tvm_ffi`, both supplied by the tir development
+# environment (repo PYTHONPATH + venv), not by PyPI — so they are deliberately
+# not declared. Install with --no-build-isolation inside that environment.
+
+[build-system]
+requires = ["scikit-build-core>=0.10.0"]
+build-backend = "scikit_build_core.build"
+
+# Anchors pytest's rootdir (and confcutdir) here, keeping the tir repo's own
+# conftest.py — which demands an enabled codegen target — out of these tests.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.scikit-build]
+# The wheel is Python ABI-agnostic (ctypes only, no extension module).
+wheel.py-api = "py3"
+# The package lives at python/tirx_ext; the CMake-installed libtvm_tirx.so
+# joins it under the same import dir.
+wheel.packages = ["python/tirx_ext"]
+wheel.install-dir = "tirx_ext"
+build-dir = "build-wheel"
+cmake.version = "CMakeLists.txt"
+cmake.build-type = "Release"

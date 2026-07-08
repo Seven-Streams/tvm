@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# Shim that points the Rust `tvm-ffi-sys` build script at tir's own build/lib —
+# the SAME libtvm_ffi.so that libtvm_compiler.so was built against — rather
+# than a pip copy. This guarantees a single, consistent ffi global-function
+# registry in the process. CMakeLists.txt prepends this directory to PATH and
+# sets TIRX_LIB_DIR; for bare `cargo build` the repo-relative defaults apply.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
+
+LIBDIR="${TIRX_LIB_DIR:-$REPO/build/lib}"
+INCDIR="${TIRX_INC_DIR:-$REPO/3rdparty/tvm-ffi/include}"
+
+case "${1:-}" in
+  --libdir)      echo "$LIBDIR" ;;
+  --includedir)  echo "$INCDIR" ;;
+  --cflags)      echo "-I$INCDIR" ;;
+  --libs)        echo "-ltvm_ffi" ;;
+  *)             echo "$LIBDIR" ;;
+esac

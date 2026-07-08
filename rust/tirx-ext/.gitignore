@@ -1,0 +1,7 @@
+# scikit-build-core build tree (pyproject.toml: build-dir = "build-wheel")
+build-wheel/
+# re-include past the repo root's `*.lock` rule: a cdylib crate pins its deps
+!rust/Cargo.lock
+# bare `cargo build` artifacts (CMake redirects CARGO_TARGET_DIR into build-wheel/)
+rust/target/
+__pycache__/
