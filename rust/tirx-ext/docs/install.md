@@ -62,7 +62,10 @@ prerequisite amounts to "tir's conda dev environment is in place".
 
 The env carries the whole build toolchain, mirroring the official TVM guide and
 adding Rust for the crate. `cxx-compiler` pins a conda-forge gcc/g++ so tir and
-the LLVM static libs share one `libstdc++`.
+the LLVM static libs share one `libstdc++`. `zlib` and `zstd` are the **dev**
+packages (headers + unversioned `.so`) that static LLVM's `find_package(ZLIB)`
+and link step need — `llvmdev` only pulls the runtime `libzlib`, so without
+`zlib` here CMake fails with `Could NOT find ZLIB (missing: ZLIB_LIBRARY)`.
 
 ```sh
 conda create -n tvm-build-venv -c conda-forge \
@@ -72,7 +75,9 @@ conda create -n tvm-build-venv -c conda-forge \
     python=3.11 \
     ninja \
     rust \
-    cxx-compiler
+    cxx-compiler \
+    zlib \
+    zstd
 conda activate tvm-build-venv
 # Python build/runtime deps (tvm-ffi + tvm + scikit-build-core stack)
 pip install scikit-build-core cython setuptools-scm numpy ml_dtypes typing_extensions pytest
