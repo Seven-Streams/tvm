@@ -39,6 +39,10 @@ from .stmt import Stmt, Bind, AssertStmt, ForKind, For, While
 # Legacy alias: LetStmt was folded into Bind (which now accepts an optional body)
 LetStmt = Bind
 
+# Legacy aliases: Call and PrimExpr moved into the unified tvm.ir namespace
+from ..ir import Call
+from ..ir.expr import PrimExpr
+
 from .stmt import BufferStore, AllocBuffer, AttrStmt, DeclBuffer
 
 from .stmt import SeqStmt

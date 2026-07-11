@@ -962,7 +962,7 @@ def ptr_byte_offset(data, byte_offset, dtype):
     ``byte_offset`` is always in bytes.  Use this when the source CUDA shape
     needs an explicitly typed local pointer derived from a byte-addressed base.
     """
-    if isinstance(dtype, str):
+    if isinstance(dtype, str | tvm.ir.PrimType):
         dtype = type_annotation(dtype)
     data_type = getattr(data, "ty", None)
     storage_scope = data_type.storage_scope if isinstance(data_type, PointerType) else "global"

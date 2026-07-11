@@ -34,6 +34,8 @@ namespace tirx {
  */
 class TilePrimitiveCallNode : public StmtNode {
  public:
+  // Default ctor so tvm-ffi reflection registers a creator for JSON graph.
+  TilePrimitiveCallNode() : op(ffi::UnsafeInit{}) {}
   TilePrimitiveCallNode(tvm::Op op, ffi::Array<ffi::Any> args,
                         ffi::Map<ffi::String, Buffer> workspace,
                         ffi::Map<ffi::String, ffi::Any> config, ffi::Optional<ffi::String> dispatch,

@@ -29,6 +29,7 @@ vectorized copy loop. Direction-symmetric: covers R2S / S2R / R2G / G2R.
 
 import tvm
 from tvm.arith import Analyzer
+from tvm.ir import PointerType, PrimType
 from tvm.runtime import DataType
 from tvm.script import tirx as T
 from tvm.tirx import Buffer, PrimFunc
@@ -445,21 +446,26 @@ def _flat_coords(outer_atoms, flat_idx: int) -> list[int]:
     return coords
 
 
+# void*: the IR ty and the codegen-printed C type of ``ptr_to`` disagree.
 _POINTER_OFFSET_SRC = (
     "\ntemplate <typename T>\n"
-    "__forceinline__ __device__ T* tvm_builtin_pointer_offset(T* ptr, int offset) {\n"
-    "    return ptr + offset;\n"
+    "__forceinline__ __device__ void* tvm_builtin_pointer_offset(T* ptr, int offset) {\n"
+    "    return (void*)(ptr + offset);\n"
     "}\n"
 )
 
 
 def _ptr_off(base_ptr, off):
+    base_ty = base_ptr.ty
+    scope = base_ty.storage_scope if isinstance(base_ty, PointerType) else ""
     return T.cuda.func_call(
         "tvm_builtin_pointer_offset",
         base_ptr,
         off,
         source_code=_POINTER_OFFSET_SRC,
-        return_type=base_ptr.ty,
+        # Preserve the base pointer's storage scope so ty-based scope/size
+        # queries don't misread the result as a global pointer.
+        return_type=PointerType(PrimType("void"), scope),
     )
 
 

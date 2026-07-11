@@ -1179,15 +1179,19 @@ void CodeGenC::VisitStmt_(const BindNode* op) {
   } else {
     PrintIndent();
     bool is_pointer = op->var->ty.as<PointerTypeNode>();
+    std::ostringstream decl_type;
     if (is_pointer && handle_data_type_.count(op->var.get())) {
-      PrintType(handle_data_type_.at(op->var.get()), stream);
-      stream << "* " << AllocVarID(op->var.get()) << " = (";
-      PrintType(handle_data_type_.at(op->var.get()), stream);
-      stream << "*)" << value << ";\n";
+      PrintType(handle_data_type_.at(op->var.get()), decl_type);
+      decl_type << '*';
     } else {
-      PrintType(op->var->ty, this->stream);
-      this->stream << ' ' << AllocVarID(op->var.get()) << " = " << value << ";\n";
+      PrintType(op->var->ty, decl_type);
     }
+    stream << decl_type.str() << ' ' << AllocVarID(op->var.get()) << " = ";
+    if (is_pointer) {
+      // The value may print with a different pointee type; cast explicitly.
+      stream << '(' << decl_type.str() << ')';
+    }
+    stream << value << ";\n";
   }
 }
 

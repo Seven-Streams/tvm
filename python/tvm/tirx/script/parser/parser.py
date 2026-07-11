@@ -221,20 +221,28 @@ def bind_assign_value(self: Parser, node: doc.expr, var_name: str, value: Any) -
         IRBuilder.name(var_name, value)
         return value
     else:
+        if isinstance(value, tvm.ir.Expr) and (
+            isinstance(value, tvm.tirx.StringImm) or isinstance(value.ty, tvm.ir.PointerType)
+        ):
+            # StringImm / pointer: x = expr -> immutable Bind var. A scalar
+            # local can't hold either, and Bind vars are frame-scoped, so
+            # reassigning a pointer name would silently shadow: reject it.
+            if isinstance(value.ty, tvm.ir.PointerType) and var_name in self.var_table.get():
+                self.report_error(
+                    node,
+                    f"pointer '{var_name}' is bound immutably and cannot be reassigned; "
+                    "use a new name",
+                )
+            ann_var = T.Bind(value)
+            IRBuilder.name(var_name, ann_var)
+            return ann_var
         if not tvm.ir.is_prim_expr(value):
             value = tvm.tirx.const(value)
-        if not isinstance(value, tvm.tirx.StringImm):
-            # x = expr -> scalar (auto-typed from value)
-            scalar = T.local_scalar(dtype=str(value.ty.dtype))
-            IRBuilder.name(var_name, scalar.scalar.buffer)
-            T.buffer_store(scalar.scalar.buffer, value, [0])
-            return scalar.scalar
-        else:
-            # StringImm: x = expr -> immutable Bind var
-            ann_var = tvm.tirx.Var(var_name, value.ty)
-            IRBuilder.name(var_name, ann_var)
-            T.Bind(value, var=ann_var)
-            return ann_var
+        # x = expr -> scalar (auto-typed from value)
+        scalar = T.local_scalar(dtype=str(value.ty.dtype))
+        IRBuilder.name(var_name, scalar.scalar.buffer)
+        T.buffer_store(scalar.scalar.buffer, value, [0])
+        return scalar.scalar
 
 
 def find_decorator_annotation(node: doc.FunctionDef, annotation: str, default: bool = True) -> bool:
@@ -542,6 +550,18 @@ def visit_ann_assign(self: Parser, node: doc.AnnAssign) -> None:
             ann_var = raw_ann.as_var(rhs_dtype=rhs.ty)
         if not isinstance(ann_var, Var):
             self.report_error(node.annotation, "Annotation should resolve to Var")
+        if (
+            isinstance(ann_var.ty, tvm.ir.PointerType)
+            and isinstance(rhs.ty, tvm.ir.PointerType)
+            and rhs.ty != ann_var.ty
+            and isinstance(rhs.ty.element_type, tvm.ir.PrimType)
+            and str(rhs.ty.element_type) in ("", "void")
+            and rhs.ty.storage_scope == ann_var.ty.storage_scope
+        ):
+            # Bind requires value->ty == var->ty: coerce an opaque void*
+            # value (pointer-offset helpers) to the annotated pointer type.
+            # Any other pointer mismatch keeps failing Bind's check loudly.
+            rhs = tvm.tirx.reinterpret(ann_var.ty, rhs)
         self.eval_assign(target=lhs, source=ann_var, bind_value=bind_assign_value)
         T.Bind(rhs, var=ann_var)
     else:

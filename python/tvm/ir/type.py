@@ -82,6 +82,16 @@ class PrimType(Type):
     def __str__(self):
         return str(self.dtype)
 
+    @property
+    def bits(self) -> int:
+        """Number of bits of the underlying scalar dtype (legacy accessor)."""
+        return self.dtype.bits
+
+    @property
+    def lanes(self) -> int:
+        """Number of lanes of the underlying dtype (legacy accessor)."""
+        return self.dtype.lanes
+
     def matches_code(self, *codes) -> bool:
         """Return whether this type has any of the given DLPack dtype codes."""
         type_code = self.dtype.type_code

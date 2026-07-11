@@ -25,6 +25,7 @@ import tvm
 from ..runtime import Object, Scriptable
 from . import _ffi_api, _overload_prim_expr, _tensor_expr_overload
 from .base import Node, Span
+from .type import PrimType
 
 
 @tvm_ffi.register_object("ir.Expr")
@@ -33,6 +34,20 @@ class Expr(Node):
 
     span: Span | None
     ty: "tvm.ir.Type"
+
+    @property
+    def dtype(self) -> tvm_ffi.dtype:
+        """Scalar dtype of a primitive-typed expression (legacy accessor)."""
+        ty = self.ty
+        if isinstance(ty, PrimType):
+            return ty.dtype
+        raise AttributeError(
+            f"'{type(self).__name__}' expression has non-primitive type {ty}; no scalar dtype"
+        )
+
+
+# Legacy alias: pre-unification code imported PrimExpr from tvm.ir.expr
+PrimExpr = Expr
 
 
 def is_prim_expr(value: object) -> bool:

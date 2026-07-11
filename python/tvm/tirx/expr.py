@@ -744,6 +744,11 @@ class StringImm(ConstExpr):
     def __init__(self, value: str, span: Span | None = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.StringImm, value, span)  # type: ignore
 
+    @property
+    def dtype(self) -> tvm_ffi.dtype:
+        """Legacy accessor: pre-unification StringImm carried dtype "handle"."""
+        return tvm_ffi.dtype("handle")
+
     def __eq__(self, other: Expr) -> bool:
         if isinstance(other, ConstExpr):
             return self.value == other.value
