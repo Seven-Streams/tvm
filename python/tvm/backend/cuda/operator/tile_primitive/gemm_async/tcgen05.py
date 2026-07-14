@@ -824,7 +824,17 @@ def gemm_async_tcgen05_impl(op_call: TilePrimitiveCall, sctx: DispatchContext) -
     if not a_is_tmem:
         A_elem_per_16B = 128 // DataType(A_type).bits
 
-    elect_pred = T.ptx.elect_sync() if warp_scope else True
+    # Caller-supplied issue predicate (``Tx.gemm_async(..., pred=...)``): the
+    # kernel elects its own issuing lane, so honor it as the emission guard
+    # instead of the scope-derived default. Without this the config was
+    # silently ignored — under a single-thread scope judgment the guard
+    # folded away and every lane of a warp-wide caller issued the MMA
+    # (grouped_fp8_gemm_contiguous: ~32x duplicated accumulation).
+    _pred_cfg = op_call.config.get("pred", None)
+    if _pred_cfg is not None:
+        elect_pred = _pred_cfg
+    else:
+        elect_pred = T.ptx.elect_sync() if warp_scope else True
 
     _SWIZZLE_TO_LAYOUT = {0: 0, 1: 6, 2: 4, 3: 2, 4: 1}
     _krp = Evaluate(tirx_op.tvm_kernel_replace_point())

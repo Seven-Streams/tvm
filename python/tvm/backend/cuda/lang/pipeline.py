@@ -190,13 +190,19 @@ class TCGen05Bar(MBarrier):
     """
 
     @T.inline
-    def arrive(self, stage, cta_group=1, cta_mask=None):
+    def arrive(self, stage, cta_group=1, cta_mask=None, pred=None):
         # NOTE: this arrive() kwarg set intentionally differs from
         # MBarrier.arrive (hardware necessity, LSP-incompatible by design).
-        if cta_mask is None and cta_group == 1:
+        # ``pred`` passes through to the op's runtime instruction predicate
+        # (``@p tcgen05.commit``).
+        if cta_mask is None and cta_group == 1 and pred is None:
             T.ptx.tcgen05.commit(self.buf.ptr_to([stage]))
+        elif cta_mask is None:
+            T.ptx.tcgen05.commit(self.buf.ptr_to([stage]), cta_group=cta_group, pred=pred)
         else:
-            T.ptx.tcgen05.commit(self.buf.ptr_to([stage]), cta_group=cta_group, cta_mask=cta_mask)
+            T.ptx.tcgen05.commit(
+                self.buf.ptr_to([stage]), cta_group=cta_group, cta_mask=cta_mask, pred=pred
+            )
 
 
 # Barrier-type tags accepted by Pipeline's ``full=`` / ``empty=`` arguments.
