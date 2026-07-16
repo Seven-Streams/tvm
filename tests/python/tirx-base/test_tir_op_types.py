@@ -47,6 +47,10 @@ def test_tir_op_address_of():
     buffer = tirx.decl_buffer((128), "float32")
     expr = tirx.address_of(buffer[0])
     assert expr.op.name == "tirx.address_of"
+    storage = tirx.Var("storage", tvm.ir.PointerType(tvm.ir.PrimType("uint8"), "shared.dyn"))
+    pooled_buffer = tirx.decl_buffer((128), "float32", data=storage, scope="shared.dyn")
+    pooled_address = tirx.address_of(pooled_buffer[0])
+    assert pooled_address.ty == tvm.ir.PointerType(tvm.ir.PrimType("float32"), "shared.dyn")
     scalar_address = tirx.address_of(tirx.Var("value", "uint32"))
     assert scalar_address.ty == tvm.ir.PointerType(tvm.ir.PrimType("uint32"))
 
@@ -116,6 +120,9 @@ def test_tir_op_tvm_access_ptr():
     assert expr.ty == tvm.ir.PointerType(tvm.ir.PrimType("float32"))
     offset_expr = tirx.ptr_byte_offset(buffer.data, 16, "uint8")
     assert offset_expr.ty == tvm.ir.PointerType(tvm.ir.PrimType("uint8"))
+    prim_type = tvm.ir.PrimType("uint8")
+    typed_offset_expr = tirx.ptr_byte_offset(buffer.data, 16, prim_type)
+    assert typed_offset_expr.ty == tvm.ir.PointerType(prim_type)
 
 
 def test_tir_op_tvm_throw_last_error():

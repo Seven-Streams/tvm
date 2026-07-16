@@ -391,33 +391,37 @@ class Buffer(Object, Scriptable):
     def local(self, *shape, layout=None) -> "Buffer":
         """Create a thread-local view of this buffer.
 
-        ``local(...)[k]`` addresses the k-th physical storage element.
-        Multi-dim shapes are row-major reshapes of that order. Pass
-        ``layout=`` for a mediated view.
-
-        When called with no shape arguments, auto-infers a 1D shape from
-        the layout's non-thread component (i.e. ``layout.storage().shard``).
+        With explicit shape arguments, ``local(...)[k]`` addresses the k-th
+        physical storage element and multi-dim shapes are row-major reshapes
+        of that order. With no shape arguments, the 1D shape and mediated
+        iteration order are inferred from ``layout.storage()``. Pass
+        ``layout=`` to override either default.
 
         Parameters
         ----------
         shape : tuple of Expr
-            The shape of the local view for indexing. If omitted, a 1D
-            shape is computed automatically.
+            The shape of the physical-order local view for indexing. If
+            omitted, a 1D storage-order view is computed automatically.
 
         layout : optional
-            Override layout. If None, the default (identity) layout is used.
+            Override layout. If None, explicit shapes use the default
+            (identity) layout and the no-shape form uses ``self.layout.storage()``.
 
         Returns
         -------
         local : DeclBufferFrame
             The corresponding local buffer.
         """
+        inferred_layout = None
         if not shape:
             local_layout = self.layout.storage()
             total = functools.reduce(
                 lambda x, y: x * y, [it.extent for it in local_layout.shard], 1
             )
             shape = (total,)
+            inferred_layout = local_layout
+        if layout is None:
+            layout = inferred_layout if inferred_layout is not None else "default"
         return tvm.tirx.script.builder.decl_buffer(
             shape,
             self.dtype,
@@ -430,7 +434,7 @@ class Buffer(Object, Scriptable):
             self.offset_factor,
             "",
             self.axis_separators,
-            "default" if layout is None else layout,
+            layout,
         )
 
     def permute(self, *dims) -> "Buffer":

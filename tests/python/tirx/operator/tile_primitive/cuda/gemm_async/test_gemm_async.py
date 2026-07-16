@@ -2407,7 +2407,9 @@ def _build_smem_desc_kernel(smem_desc):
         T.ptx.mbarrier.try_wait(tma_mbar.ptr_to([0]), 0)
         T.cuda.cta_sync()
         if tid_in_wg == 0:
-            Tx.gemm_async(tmem[tuple(r_tmem_C)], A_smem[tuple(r_smem_A)], B_smem[tuple(r_smem_B)], dispatch="tcgen05", smem_desc=smem_desc)  # noqa: E501
+            mma_issue: T.uint32
+            mma_issue = T.ptx.elect_sync()
+            Tx.gemm_async(tmem[tuple(r_tmem_C)], A_smem[tuple(r_smem_A)], B_smem[tuple(r_smem_B)], dispatch="tcgen05", smem_desc=smem_desc, pred=mma_issue)  # noqa: E501
             T.ptx.tcgen05.commit(mma_mbar.ptr_to([0]), cta_group=1)
         T.ptx.mbarrier.try_wait(mma_mbar.ptr_to([0]), 0)
         T.cuda.cta_sync()
@@ -2451,6 +2453,7 @@ def test_gemm_smem_desc_hoist_vs_recompute(smem_desc):
         )
     src = mod.mod.imports[0].inspect_source()
     assert "tcgen05.mma" in src, f"mma not emitted; src=\n{src}"
+    assert "@p_issue tcgen05.mma" in src, "gemm_async pred must reach the PTX instruction"
 
     if smem_desc == "hoist":
         assert "smem_desc_make_lo_uniform" in src, "hoist mode must encode a uniform descriptor"

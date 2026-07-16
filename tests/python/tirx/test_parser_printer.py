@@ -1368,9 +1368,9 @@ def test_buffer_local_ir():
     for it in storage.shard:
         expected_total *= int(it.extent)
     assert int(b_local.shape[0]) == expected_total
-    # Layout: default (identity) — local[k] is the k-th physical storage
-    # element, NOT the parent layout's storage-iter view.
-    assert b_local.layout.is_trivial()
+    # The no-shape form preserves the inferred storage-iterator view. Use an
+    # explicit shape (covered below) for a physical-order identity reshape.
+    assert_structural_equal(b_local.layout, storage)
 
     # Round-trip
     code = func.script()
@@ -1413,6 +1413,38 @@ def test_buffer_local_physical_order():
     # Round-trip
     code = func.script()
     assert from_source(code).script() == code
+
+
+def test_pointer_expression_assignment_uses_bind():
+    # fmt: off
+    @T.prim_func
+    def func() -> None:
+        T.device_entry()
+        buf = T.alloc_buffer((4,), "uint32", scope="shared")
+        ptr = buf.ptr_to([1])
+        T.evaluate(T.reinterpret("uint64", ptr))
+    # fmt: on
+
+    binds = []
+    tvm.tirx.stmt_functor.post_order_visit(
+        func.body, lambda node: binds.append(node) if isinstance(node, tvm.tirx.Bind) else None
+    )
+    assert len(binds) == 1
+    assert isinstance(binds[0].var.ty, PointerType)
+    assert_structural_equal(binds[0].var.ty, binds[0].value.ty)
+
+
+def test_pointer_expression_assignment_rejects_reassignment():
+    with pytest.raises(tvm.error.DiagnosticError, match="cannot be reassigned"):
+        # fmt: off
+        @T.prim_func
+        def func() -> None:
+            T.device_entry()
+            buf = T.alloc_buffer((4,), "uint32", scope="shared")
+            ptr = buf.ptr_to([0])
+            ptr = buf.ptr_to([1])
+            T.evaluate(T.reinterpret("uint64", ptr))
+        # fmt: on
 
 
 def test_buffer_permute_ir():

@@ -14,9 +14,11 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import pickle
+
 import pytest
 
-from tvm.ir import Op
+from tvm.ir import Op, assert_structural_equal
 from tvm.tirx.buffer import decl_buffer
 from tvm.tirx.stmt import TilePrimitiveCall
 
@@ -42,6 +44,14 @@ def test_gemm():
     C = decl_buffer((64, 64), "float32", scope="global")
     D = decl_buffer((64, 64), "float32", scope="global")
     _test("gemm", D[:, :], A[:, :], B[:, :], C[:, :], True, False, 1.0, 0.0)
+
+
+def test_tile_primitive_call_pickle_roundtrip():
+    """TilePrimitiveCall reflection must provide a deserialization creator."""
+    A = decl_buffer((64,), "float32", scope="global")
+    call = _test("fill", A[:], 1.0)
+    restored = pickle.loads(pickle.dumps(call))
+    assert_structural_equal(restored, call)
 
 
 def test_buffer_replacer_no_shared_default():

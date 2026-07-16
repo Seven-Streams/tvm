@@ -421,7 +421,9 @@ or hand you a pointer — they emit no runtime op of their own. The common ones:
    * - ``B.view(*shape, layout=…)``
      - reinterpret the same storage under a new shape/layout (no copy)
    * - ``B.local(*shape, layout=…)``
-     - the calling thread's private register slice of a ``local`` buffer
+     - the calling thread's private register slice of a ``local`` buffer;
+       no shape preserves ``B.layout.storage()`` iteration order, while an
+       explicit shape defaults to a physical-order identity reshape
    * - ``B.permute(*dims)``
      - a view with axes permuted (a transposed layout)
    * - ``B.access_ptr(mask, …)``
@@ -465,12 +467,17 @@ sees the 256-element buffer as ``64×4``; ``A.permute(1, 0)`` transposes the axe
     At_ptr[(j * 4) + i]                       // permute: swapped strides
 
 **Registers — ``local``.** Decomposes a thread-axis ``local`` layout into the
-calling thread's flat register bundle (used pervasively by the tile primitives):
+calling thread's register bundle (used pervasively by the tile primitives).
+``R.local()`` infers a 1-D view and preserves the mediated iteration order of
+``R.layout.storage()``. ``R.local(n)`` or ``R.local(d0, d1, ...)`` instead uses
+an identity layout over physical storage order. An explicit ``layout=``
+overrides either default:
 
 .. code-block:: python
 
     R  = T.alloc_buffer((32, 8), "float32", scope="local", layout=TileLayout(S[(32, 8) : (1 @ laneid, 1)]))
-    Rl = R.local(8)          # this lane's 8 registers
+    R_iter = R.local()       # inferred shape, storage-layout iteration order
+    R_phys = R.local(8)      # this lane's 8 registers, physical storage order
 
 .. code-block:: c++
 

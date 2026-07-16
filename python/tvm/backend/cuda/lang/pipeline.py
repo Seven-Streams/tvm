@@ -145,8 +145,9 @@ class MBarrier:
         from tvm.ir import PointerType, PrimType
         from tvm.tirx import Var as TIRVar
 
-        expr = T.reinterpret("handle", T.ptx.map_shared_rank(self.buf.ptr_to([0]), rank))
-        ptr = TIRVar("remote_mbar_ptr", PointerType(PrimType("uint64")))
+        ptr_ty = PointerType(PrimType("uint64"))
+        expr = T.reinterpret(ptr_ty, T.ptx.map_shared_rank(self.buf.ptr_to([0]), rank))
+        ptr = TIRVar("remote_mbar_ptr", ptr_ty)
         T.Bind(expr, var=ptr)
         buf = T.decl_buffer([self.depth], "uint64", data=ptr, scope="shared")
         remote = object.__new__(type(self))
@@ -189,13 +190,15 @@ class TCGen05Bar(MBarrier):
     """
 
     @T.inline
-    def arrive(self, stage, cta_group=1, cta_mask=None):
+    def arrive(self, stage, cta_group=1, cta_mask=None, pred=None):
         # NOTE: this arrive() kwarg set intentionally differs from
         # MBarrier.arrive (hardware necessity, LSP-incompatible by design).
         if cta_mask is None and cta_group == 1:
-            T.ptx.tcgen05.commit(self.buf.ptr_to([stage]))
+            T.ptx.tcgen05.commit(self.buf.ptr_to([stage]), pred=pred)
         else:
-            T.ptx.tcgen05.commit(self.buf.ptr_to([stage]), cta_group=cta_group, cta_mask=cta_mask)
+            T.ptx.tcgen05.commit(
+                self.buf.ptr_to([stage]), cta_group=cta_group, cta_mask=cta_mask, pred=pred
+            )
 
 
 # Barrier-type tags accepted by Pipeline's ``full=`` / ``empty=`` arguments.
