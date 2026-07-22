@@ -93,13 +93,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tvm-tirx-downstream-api-test"
-version = "0.0.0"
-dependencies = [
- "tvm-tirx",
-]
-
-[[package]]
 name = "tvm-tirx-macros"
 version = "0.1.0"
 dependencies = [

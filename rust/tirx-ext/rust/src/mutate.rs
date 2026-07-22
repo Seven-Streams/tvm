@@ -36,7 +36,7 @@
 //!
 //! 1. the pass's **function table** (`mutation_table!`) — a claimed node is
 //!    fully the handler's business (C++ `VisitStmt_` override semantics);
-//! 2. **`TYPE_HOOKS`** — per-type structural rules, the Rust face of the
+//! 2. **[`TYPE_HOOKS`]** — per-type structural rules, the Rust face of the
 //!    `__s_map__` type attr (route A's incremental home; the table ships
 //!    empty — see `docs/mutator-redesign.md` §3.3);
 //! 3. the **default rebuild** over value-position children.
@@ -52,13 +52,13 @@
 //!
 //! Recursion coverage (P1 route B, decided 2026-07-06): the default rebuild
 //! is **guaranteed to match C++ `StmtMutator` only on the control-flow
-//! skeleton** (`SUPPORTED_STMT_KEYS`). Value-position `Stmt`/`PrimExpr`
+//! skeleton** ([`SUPPORTED_STMT_KEYS`]). Value-position `Stmt`/`PrimExpr`
 //! children (and Arrays of them) are recursed; `Map` fields (annotations),
 //! def-position fields (either `SEqHashDef*` flavor, e.g. `loop_var`) and
 //! SEqHash-ignored fields (span) are left untouched. A node **outside the
 //! skeleton whose children changed errors loudly** instead of silently
 //! approximating (SBlock/AllocBuffer/TilePrimitiveCall internals need C++'s
-//! per-type rules — the `TYPE_HOOKS` slot exists to add them one type at a
+//! per-type rules — the [`TYPE_HOOKS`] slot exists to add them one type at a
 //! time); untouched subtrees of any type pass through unchanged, where no
 //! divergence is possible. COW throughout: an untouched subtree is returned
 //! pointer-identically; Python's original tree is never written to.
@@ -581,12 +581,11 @@ impl Engine<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// The Mapper agent
+// The Mapper agent (mirror of visit::Visitor)
 // ---------------------------------------------------------------------------
 
-/// The mapper agent: attach pass state and a function table, then drive with
-/// [`Mapper::map`].  Unlike the stateful visitor, this legacy mapper adapter
-/// still borrows its state through a `RefCell`.
+/// The mapper agent: pass state + function table, then drive with
+/// [`Mapper::map`] — the same builder shape as `visit::Visitor`.
 pub struct Mapper<'s, S> {
     state: Option<&'s RefCell<S>>,
     function_table: Option<FunctionTable<S>>,

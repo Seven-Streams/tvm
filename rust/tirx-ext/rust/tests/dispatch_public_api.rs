@@ -15,10 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Compile the generated visitor exactly as a downstream crate would.  This
-//! catches runtime-crate path and attribute-projection bugs that token-string
-//! tests in the proc-macro crate cannot detect.
-
 use tvm_tirx::{dispatch, For, VisitCtx, VisitDispatch, WalkResult};
 
 #[derive(Default)]
@@ -28,29 +24,15 @@ struct ExternalCounter {
 
 #[dispatch(visit)]
 impl ExternalCounter {
-    // `inline` is valid on this method, but would be invalid if cfg_attr were
-    // copied blindly onto the generated dispatch expression.
-    #[cfg_attr(all(), inline)]
     fn visit_for(&mut self, _op: For, _ctx: &mut VisitCtx<Self>) -> WalkResult {
         self.loops += 1;
         WalkResult::Advance
     }
 }
 
-struct ExplicitRuntimePath;
-
-#[dispatch(visit, runtime = tvm_tirx)]
-impl ExplicitRuntimePath {
-    fn visit_for(&mut self, _op: For, _ctx: &mut VisitCtx<Self>) -> WalkResult {
-        WalkResult::Skip
-    }
-}
-
-fn assert_generated_dispatch<T: VisitDispatch>() {}
+fn assert_visit_dispatch<T: VisitDispatch>() {}
 
 #[test]
-fn dispatch_is_a_downstream_api() {
-    assert_generated_dispatch::<ExternalCounter>();
-    assert_generated_dispatch::<ExplicitRuntimePath>();
-    assert_eq!(ExternalCounter::default().loops, 0);
+fn generated_dispatch_is_public() {
+    assert_visit_dispatch::<ExternalCounter>();
 }

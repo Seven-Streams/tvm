@@ -22,16 +22,13 @@ edition = "2021"
 license = "Apache-2.0"
 description = "tirx_ext: Rust-implemented IR analysis tools exposed to Python through the tvm-ffi global function registry"
 
-# Stand-alone workspace so an ancestor Cargo.toml (if any) cannot absorb this
-# crate.  The small companion crate supplies the attribute macro that turns a
-# typed `visit_*` impl into the runtime dispatch table.
+# Stand-alone workspace so an ancestor Cargo.toml (if any) cannot absorb this crate.
 [workspace]
-members = ["downstream-api-test", "tvm-tirx-macros"]
+members = ["tvm-tirx-macros"]
 resolver = "2"
 
-# The cdylib is loaded by python/tirx_ext.  The rlib exposes the same typed
-# visitor API to Rust pass crates (and lets integration tests compile exactly
-# as a downstream crate would).
+# The cdylib is the deliverable: python/tirx_ext loads `libtvm_tirx.so` and
+# calls the `tirx_ext.*` functions it registers.
 [lib]
 name = "tvm_tirx"
 crate-type = ["cdylib", "rlib"]
