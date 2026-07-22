@@ -159,6 +159,53 @@ def test_step_trip_count():
         assert (a["adds"], a["add_execs"]) == (1, trips), (extent, step)
 
 
+@pytest.mark.parametrize("extent", [0, -1, -3])
+def test_non_positive_extent_has_zero_trips(extent):
+    # A TIR For covers [min, min + extent) with a positive step.  Empty or
+    # reversed ranges therefore have zero executions, never a negative count.
+    loop = _add_loop(extent, step=2)
+    r = tirx_ext.count_loops(loop)
+    assert (r["loops"], r["total_iters"]) == (1, 0)
+
+    a = tirx_ext.count_adds(loop)
+    assert (a["adds"], a["add_execs"]) == (1, 0)
+
+
+def test_for_control_adds_use_enclosing_multiplicity():
+    # The min and annotation are evaluated/configured outside the repeated
+    # body.  Only body_add is charged once per loop trip.
+    vi = tirx.Var("i", "int32")
+    min_add = tirx.Add(_i32(1), _i32(2))
+    annotation_add = tirx.Add(_i32(3), _i32(4))
+    body_add = tirx.Add(_i32(5), _i32(6))
+    loop = tirx.For(
+        vi,
+        min_add,
+        _i32(4),
+        tirx.ForKind.SERIAL,
+        tirx.Evaluate(body_add),
+        annotations={"test.value": annotation_add},
+    )
+
+    a = tirx_ext.count_adds(loop)
+    assert a["adds"] == 3
+    assert a["add_execs"] == 1 + 1 + 4
+
+    # In a nested loop, the inner min is evaluated once per *outer* trip,
+    # while the inner body is evaluated once per outer * inner trip.
+    inner_var = tirx.Var("j", "int32")
+    inner = tirx.For(
+        inner_var,
+        tirx.Add(_i32(7), _i32(8)),
+        _i32(3),
+        tirx.ForKind.SERIAL,
+        tirx.Evaluate(tirx.Add(_i32(9), _i32(10))),
+    )
+    nested = _add_loop(4, body=inner)
+    nested_stats = tirx_ext.count_adds(nested)
+    assert (nested_stats["adds"], nested_stats["add_execs"]) == (2, 4 + 4 * 3)
+
+
 def test_step_nested():
     # outer 0..64 step 2 (32 trips) around inner 0..8 (8 trips).
     inner = _add_loop(8)
@@ -168,20 +215,65 @@ def test_step_nested():
     assert r["total_iters"] == 32 + 32 * 8
 
 
+def test_unclaimed_seq_and_sibling_state_restore():
+    # SeqStmt itself is not claimed by Counter's generated dispatcher, so the
+    # default walker must reach all three For nodes.  The final sibling is not
+    # inside the first outer loop: its five trips must not be multiplied by 2.
+    nested = _add_loop(2, body=_add_loop(3))
+    sibling = _add_loop(5)
+    root = tirx.SeqStmt([nested, sibling])
+    r = tirx_ext.count_loops(root)
+    assert r["loops"] == 3
+    assert r["total_iters"] == 2 + 2 * 3 + 5
+    assert r["innermost"] == 2
+
+    a = tirx_ext.count_adds(root)
+    assert (a["adds"], a["add_execs"]) == (2, 2 * 3 + 5)
+
+
+def test_generated_dispatch_order_advance_and_state_lifecycle():
+    from tirx_ext import _ffi_api as ffi
+
+    # One tree has two For statements and one Evaluate statement.  The
+    # concrete-first visitor runs twice, which also verifies that one Visitor
+    # retains its state across calls.  Both handlers return Advance, so the
+    # nested For and the Evaluate must be reached by default recursion.
+    root = _add_loop(2, body=_add_loop(3))
+    r = ffi._visit_test_dispatch_order(root)
+    assert r["concrete_first_for"] == 4
+    assert r["concrete_first_stmt"] == 2
+
+    # With the base Stmt method declared first, it claims For as well; the
+    # later concrete method is therefore never called.
+    assert r["base_first_for"] == 0
+    assert r["base_first_stmt"] == 3
+
+
+def test_generated_dispatch_visit_children_then_skip():
+    from tirx_ext import _ffi_api as ffi
+
+    r = ffi._visit_test_children(_add_loop(2, body=_add_loop(3)))
+    assert r["pre"] == 2
+    assert r["post"] == 2
+    assert r["active"] == 0
+    assert r["max_active"] == 2
+
+
 def test_bad_step_raises():
-    with pytest.raises(Exception, match="constant"):
-        vi = tirx.Var("i", "int32")
-        loop = tirx.For(
-            vi,
-            _i32(0),
-            _i32(64),
-            tirx.ForKind.SERIAL,
-            tirx.Evaluate(_i32(0)),
-            step=tirx.Var("s", "int32"),
-        )
-        tirx_ext.count_loops(loop)
-    with pytest.raises(Exception, match="positive"):
-        tirx_ext.count_loops(_add_loop(64, step=0))
+    vi = tirx.Var("i", "int32")
+    non_constant = tirx.For(
+        vi,
+        _i32(0),
+        _i32(64),
+        tirx.ForKind.SERIAL,
+        tirx.Evaluate(_i32(0)),
+        step=tirx.Var("s", "int32"),
+    )
+    for analyze in (tirx_ext.count_loops, tirx_ext.count_adds):
+        with pytest.raises(Exception, match="constant"):
+            analyze(non_constant)
+        with pytest.raises(Exception, match="positive"):
+            analyze(_add_loop(64, step=0))
 
 
 def test_while_subtree_not_counted():
@@ -206,6 +298,24 @@ def test_overflow_raises():
         tirx_ext.count_loops(root)
     with pytest.raises(Exception, match="overflow"):
         tirx_ext.count_adds(root)
+
+
+def test_analysis_rejects_custom_visit_interrupt():
+    import tvm_ffi
+    from tvm_ffi.dataclasses import py_class
+
+    @py_class("tirx_ext.testing.InterruptStmt", structural_eq=None)
+    class InterruptStmt(tirx.Stmt):
+        @staticmethod
+        def __s_visit__(_visitor, _value):
+            return tvm_ffi.VisitInterrupt("stop before traversal is complete")
+
+    # Put the hook under a loop so this also proves that an explicitly
+    # recursive handler does not publish the state accumulated before halt.
+    root = _add_loop(4, body=InterruptStmt(None))
+    for analyze in (tirx_ext.count_loops, tirx_ext.count_adds):
+        with pytest.raises(Exception, match="interrupted"):
+            analyze(root)
 
 
 def test_layout_self_check():

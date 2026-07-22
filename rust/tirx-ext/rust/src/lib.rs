@@ -18,8 +18,8 @@
 //! # tirx_ext — `count_loops_v10` packaged as a tvm-ffi extension
 //!
 //! The pip package's Rust side: `rust-draft/tirx-ver3/examples/count_loops_v10.rs`
-//! (the `function_table!` + `Visitor` agent form of the counting pass), turned
-//! from a demo binary into two global functions a Python host calls
+//! (the generated-dispatch + `Visitor` agent form of the counting pass),
+//! turned from a demo binary into two global functions a Python host calls
 //! in-process — the IR crosses as a borrowed `AnyView`, zero serialization:
 //!
 //! * `tirx_ext.count_loops(stmt)` → `Map<String, i64>` with keys `loops`,
@@ -47,6 +47,11 @@
 //! the dynamic linker's soname dedup then binds both sides to one
 //! `libtvm_ffi.so` — a single global function registry in the process.
 
+// Attribute macros expand in the caller's crate.  This self-alias makes the
+// stable `::tvm_tirx::visit` expansion path work both here and in downstream
+// crates using the normal dependency name.
+extern crate self as tvm_tirx;
+
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -67,28 +72,11 @@ pub use node::{
     AddNode, Break, BreakNode, ExprNode, For, ForNode, IfThenElse, IfThenElseNode, IntImmNode,
     PrimExpr, Span, Stmt, StmtNode, Var, VarNode, While, WhileNode,
 };
+pub use tvm_tirx_macros::dispatch;
+pub use visit::{structural_visit, VisitCtx, VisitDispatch, Visitor, WalkResult};
 
 use mutate::MapCtx;
-use visit::{walk, Phase, VisitCtx, VisitValue, WalkResult};
-
-// ---------------------------------------------------------------------------
-// The function_table! macro (from count_loops_v10; the Visitor agent it builds
-// now lives in visit.rs — `visit::Visitor` — mirroring `mutate::Mapper`).
-// ---------------------------------------------------------------------------
-
-/// Build a *compiled* [`visit::FunctionTable`] from a closed
-/// `Type => handler` pair list, right where the table is passed.
-///
-/// The body is a single `Option` combinator chain — "try each in order, first
-/// match wins"; `None` falls through to the default reflected recursion. Each
-/// pair is type-checked (`visit_for` must accept `For`).
-macro_rules! function_table {
-    ( $($ty:ty => $handler:expr),+ $(,)? ) => {
-        visit::FunctionTable(|state, v, visitor| {
-            None$( .or_else(|| v.cast::<$ty>().map(|x| $handler(state, x, visitor))) )+
-        })
-    };
-}
+use visit::VisitValue;
 
 /// The mapper's `function_table!`: the same first-match-wins chain. Each
 /// handler returns `Result` of its node (`Stmt`/`PrimExpr` — original ==
@@ -112,10 +100,24 @@ const ERR_EXTENT: &str = "tirx_ext: loop extent is not a constant ir.IntImm";
 const ERR_STEP: &str = "tirx_ext: loop step is not a constant ir.IntImm";
 const ERR_STEP_POSITIVE: &str = "tirx_ext: loop step must be a positive constant";
 const ERR_OVERFLOW: &str = "tirx_ext: iteration count overflows i64";
+const ERR_INTERRUPTED: &str =
+    "tirx_ext: structural traversal was interrupted before analysis completed";
 
 fn pass_error(msg: &'static str) -> Error {
-    let kind = if msg == ERR_OVERFLOW { RUNTIME_ERROR } else { TYPE_ERROR };
+    let kind = if msg == ERR_OVERFLOW || msg == ERR_INTERRUPTED {
+        RUNTIME_ERROR
+    } else {
+        TYPE_ERROR
+    };
     Error::new(kind, msg, "")
+}
+
+fn require_complete(interrupt: Option<Any>) -> Result<()> {
+    if interrupt.is_some() {
+        Err(pass_error(ERR_INTERRUPTED))
+    } else {
+        Ok(())
+    }
 }
 
 /// Constant trip count of a `For`: `ceildiv(extent, step)`, step defaulting to
@@ -130,11 +132,17 @@ fn for_trip_count(op: &ForNode) -> Result<i64, &'static str> {
     if step < 1 {
         return Err(ERR_STEP_POSITIVE);
     }
-    // Overflow-free ceildiv for step >= 1.
-    Ok(extent.div_euclid(step) + i64::from(extent.rem_euclid(step) != 0))
+    // `For` means `var < min + extent` with a positive step, so a non-positive
+    // extent executes no iterations.  Clamp before ceildiv: Euclidean division
+    // alone would turn values such as `-3 / 2` into a negative trip count.
+    if extent <= 0 {
+        return Ok(0);
+    }
+    // Overflow-free ceildiv for extent > 0 and step >= 1.
+    Ok(extent / step + i64::from(extent % step != 0))
 }
 
-/// Gathered by the table-dispatched visitor (For / If, custom order).
+/// Gathered by the generated stateful visitor (For / If, custom order).
 #[derive(Debug, Default)]
 struct Counter {
     loops: i64,
@@ -144,9 +152,9 @@ struct Counter {
     innermost: i64,
     outer_iter_num: i64,
     is_for_in_body: bool,
-    error: Option<&'static str>,
 }
 
+#[dispatch(visit)]
 impl Counter {
     fn enter_for(&mut self, trips: i64) -> Result<i64, &'static str> {
         self.loops += 1;
@@ -174,6 +182,54 @@ impl Counter {
             .ok_or(ERR_OVERFLOW)?;
         Ok(())
     }
+
+    /// For: extent/step -> state update -> body.  Passing `self` into each
+    /// visit is a checked mutable reborrow; state borrows cannot cross it.
+    fn visit_for(&mut self, op: For, ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        if !ctx.visit(self, &op.extent) {
+            return WalkResult::Interrupt;
+        }
+        if let Some(step) = op.step.get() {
+            if !ctx.visit(self, &step) {
+                return WalkResult::Interrupt;
+            }
+        }
+        let saved = match for_trip_count(&op).and_then(|trips| self.enter_for(trips)) {
+            Ok(saved) => saved,
+            Err(msg) => return ctx.fail(pass_error(msg)),
+        };
+        if !ctx.visit(self, &op.body) {
+            self.exit_for(saved);
+            return WalkResult::Interrupt;
+        }
+        self.exit_for(saved);
+        WalkResult::Skip
+    }
+
+    /// If: condition -> count the branch -> both branch bodies.
+    fn visit_if(&mut self, op: IfThenElse, ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        if !ctx.visit(self, &op.condition) {
+            return WalkResult::Interrupt;
+        }
+        if let Err(msg) = self.count_branch() {
+            return ctx.fail(pass_error(msg));
+        }
+        if !ctx.visit(self, &op.then_case) {
+            return WalkResult::Interrupt;
+        }
+        if let Some(else_case) = op.else_case.get() {
+            if !ctx.visit(self, &else_case) {
+                return WalkResult::Interrupt;
+            }
+        }
+        WalkResult::Skip
+    }
+
+    /// While: skip the whole subtree — its trip count is unknowable, so
+    /// nothing under it (condition included) may contribute to any counter.
+    fn visit_while(&mut self, _op: While, _ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        WalkResult::Skip
+    }
 }
 
 /// Count For/If statements and their executions, `count_loops_v10` style: the
@@ -182,138 +238,104 @@ impl Counter {
 /// step)`); `While` subtrees are excluded entirely (statically unknowable trip
 /// count — counting them would fabricate numbers).
 fn count_loops(root: &Stmt) -> Result<Counter> {
-    /// For: extent/step → state update → body (borrows scoped between visits —
-    /// the FFI re-enters the callback, so no borrow may be held across a visit).
-    fn visit_for(state: &RefCell<Counter>, op: For, visitor: &mut VisitCtx) -> WalkResult {
-        visitor.visit(&op.extent);
-        if let Some(step) = op.step.get() {
-            visitor.visit(&step);
-        }
-        let saved = {
-            let mut c = state.borrow_mut();
-            match for_trip_count(&op).and_then(|trips| c.enter_for(trips)) {
-                Ok(saved) => saved,
-                Err(msg) => {
-                    c.error = Some(msg);
-                    return WalkResult::Interrupt;
-                }
-            }
-        };
-        visitor.visit(&op.body);
-        state.borrow_mut().exit_for(saved);
-        WalkResult::Skip
-    }
-
-    /// If: condition → count the branch → both branch bodies.
-    fn visit_if(state: &RefCell<Counter>, op: IfThenElse, visitor: &mut VisitCtx) -> WalkResult {
-        visitor.visit(&op.condition);
-        {
-            let mut c = state.borrow_mut();
-            if let Err(msg) = c.count_branch() {
-                c.error = Some(msg);
-                return WalkResult::Interrupt;
-            }
-        }
-        visitor.visit(&op.then_case);
-        if let Some(else_case) = op.else_case.get() {
-            visitor.visit(&else_case);
-        }
-        WalkResult::Skip
-    }
-
-    /// While: skip the whole subtree — its trip count is unknowable, so
-    /// nothing under it (condition included) may contribute to any counter.
-    fn visit_while(_state: &RefCell<Counter>, _op: While, _visitor: &mut VisitCtx) -> WalkResult {
-        WalkResult::Skip
-    }
-
-    // The behavior: the function table, compiled from the pair list.
-    let function_table = function_table! {
-        For => visit_for,
-        IfThenElse => visit_if,
-        While => visit_while,
-    };
-
-    // The data: all counters at zero, no enclosing loop yet.
-    let state = RefCell::new(Counter {
+    // The visitor's persistent state: all counters at zero, no enclosing loop
+    // yet. `#[dispatch(visit)]` compiled the typed methods into its dispatcher.
+    let mut counter = Counter {
         outer_iter_num: 1,
         ..Default::default()
-    });
+    };
 
-    visit::Visitor::new()
-        .visit_with_extra_content(&state)
-        .function_table(function_table)
-        .visit(root)?;
-
-    let counter = state.into_inner();
-    if let Some(msg) = counter.error {
-        return Err(pass_error(msg));
-    }
+    require_complete(visit::structural_visit(root, &mut counter)?)?;
     Ok(counter)
 }
 
-/// Gathered by the plain walk (Add is a pure observation). Type tests are
-/// borrow-only (`as_node`) and the cheap phase check runs first.
+/// Gathered by generated stateful dispatch.  Loop control and metadata are
+/// visited at the enclosing execution multiplicity; only the body is visited
+/// after multiplying by this loop's trip count.
 #[derive(Debug, Default)]
 struct AddStats {
     adds: i64,
     add_execs: i64,
-    prod_stack: Vec<i64>,
-    error: Option<&'static str>,
+    outer_iter_num: i64,
 }
 
+#[dispatch(visit)]
 impl AddStats {
-    fn observe(&mut self, v: &VisitValue, phase: Phase) -> WalkResult {
-        if let Some(op) = v.as_node::<ForNode>() {
-            match phase {
-                Phase::Enter => {
-                    let pushed = for_trip_count(op)
-                        .and_then(|trips| self.prod().checked_mul(trips).ok_or(ERR_OVERFLOW));
-                    match pushed {
-                        Ok(total) => self.prod_stack.push(total),
-                        Err(msg) => {
-                            self.error = Some(msg);
-                            return WalkResult::Interrupt;
-                        }
-                    }
-                }
-                Phase::Exit => {
-                    self.prod_stack.pop();
-                }
+    fn count_add(&mut self) -> Result<(), &'static str> {
+        self.adds += 1;
+        self.add_execs = self
+            .add_execs
+            .checked_add(self.outer_iter_num)
+            .ok_or(ERR_OVERFLOW)?;
+        Ok(())
+    }
+
+    /// Visit every non-body field before changing the running product.  This
+    /// keeps an Add in `min`, `extent`, `step`, thread binding, or annotations
+    /// at the enclosing multiplicity instead of charging it once per body trip.
+    fn visit_for(&mut self, op: For, ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        if !ctx.visit(self, &op.loop_var)
+            || !ctx.visit(self, &op.min)
+            || !ctx.visit(self, &op.extent)
+        {
+            return WalkResult::Interrupt;
+        }
+        if let Some(thread_binding) = op.thread_binding.get() {
+            if !ctx.visit(self, &thread_binding) {
+                return WalkResult::Interrupt;
             }
-        } else if v.as_node::<WhileNode>().is_some() {
-            // Unknowable trip count: exclude the whole While subtree.
-            return WalkResult::Skip;
-        } else if phase == Phase::Enter && v.as_node::<AddNode>().is_some() {
-            self.adds += 1;
-            match self.add_execs.checked_add(self.prod()) {
-                Some(total) => self.add_execs = total,
-                None => {
-                    self.error = Some(ERR_OVERFLOW);
-                    return WalkResult::Interrupt;
-                }
+        }
+        if !ctx.visit(self, &op.annotations) {
+            return WalkResult::Interrupt;
+        }
+        if let Some(step) = op.step.get() {
+            if !ctx.visit(self, &step) {
+                return WalkResult::Interrupt;
+            }
+        }
+
+        let saved = self.outer_iter_num;
+        let inner = match for_trip_count(&op)
+            .and_then(|trips| saved.checked_mul(trips).ok_or(ERR_OVERFLOW))
+        {
+            Ok(inner) => inner,
+            Err(msg) => return ctx.fail(pass_error(msg)),
+        };
+        self.outer_iter_num = inner;
+        if !ctx.visit(self, &op.body) {
+            self.outer_iter_num = saved;
+            return WalkResult::Interrupt;
+        }
+        self.outer_iter_num = saved;
+        WalkResult::Skip
+    }
+
+    /// Claim every expression so an Add can be recognized without requiring a
+    /// dedicated owned `Add` wrapper; `Advance` preserves ordinary recursion.
+    fn visit_expr(&mut self, op: PrimExpr, ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        if op.downcast::<AddNode>().is_some() {
+            if let Err(msg) = self.count_add() {
+                return ctx.fail(pass_error(msg));
             }
         }
         WalkResult::Advance
     }
 
-    fn prod(&self) -> i64 {
-        *self.prod_stack.last().expect("prod_stack is seeded with 1")
+    /// Unknowable trip count: exclude the whole While subtree.
+    fn visit_while(&mut self, _op: While, _ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        WalkResult::Skip
     }
 }
 
-/// Count `tirx.Add` nodes and their executions with the plain walk engine.
-/// Same trip-count semantics as [`count_loops`]: `step`-aware, `While`
-/// subtrees excluded.
+/// Count `tirx.Add` nodes and their executions with generated stateful
+/// dispatch. Same trip-count semantics as [`count_loops`]: `step`-aware,
+/// `While` subtrees excluded.
 fn count_adds(root: &Stmt) -> Result<AddStats> {
     let mut stats = AddStats {
-        prod_stack: vec![1],
+        outer_iter_num: 1,
         ..Default::default()
     };
-    walk(root, |v, phase| stats.observe(v, phase))?;
-    if let Some(msg) = stats.error {
-        return Err(pass_error(msg));
-    }
+    require_complete(visit::structural_visit(root, &mut stats)?)?;
     Ok(stats)
 }
 
@@ -471,6 +493,112 @@ fn map_test_handler_error(root: &Stmt) -> Result<Stmt> {
 }
 
 // ---------------------------------------------------------------------------
+// Generated visitor-dispatch probes (underscore-registered for Python tests).
+// ---------------------------------------------------------------------------
+
+/// `For` is also a `Stmt`.  These two visitors pin the generated dispatch
+/// rule: handlers are tried in method declaration order and the first
+/// successful runtime cast wins.
+#[derive(Default)]
+struct ConcreteFirstProbe {
+    for_hits: i64,
+    stmt_hits: i64,
+}
+
+#[dispatch(visit)]
+impl ConcreteFirstProbe {
+    fn visit_for(&mut self, _op: For, _ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        self.for_hits += 1;
+        WalkResult::Advance
+    }
+
+    fn visit_stmt(&mut self, _op: Stmt, _ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        self.stmt_hits += 1;
+        WalkResult::Advance
+    }
+}
+
+#[derive(Default)]
+struct BaseFirstProbe {
+    for_hits: i64,
+    stmt_hits: i64,
+}
+
+#[dispatch(visit)]
+impl BaseFirstProbe {
+    fn visit_stmt(&mut self, _op: Stmt, _ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        self.stmt_hits += 1;
+        WalkResult::Advance
+    }
+
+    fn visit_for(&mut self, _op: For, _ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        self.for_hits += 1;
+        WalkResult::Advance
+    }
+}
+
+fn visit_test_dispatch_order(root: &Stmt) -> Result<Map<FfiString, i64>> {
+    // Reuse one driver for two complete traversals: its visitor state must be
+    // retained between runs and remain available through `into_inner`.
+    let mut concrete_first = visit::Visitor::new(ConcreteFirstProbe::default());
+    require_complete(concrete_first.visit(root)?)?;
+    require_complete(concrete_first.visit(root)?)?;
+    let concrete_first = concrete_first.into_inner();
+
+    let mut base_first = visit::Visitor::new(BaseFirstProbe::default());
+    require_complete(base_first.visit(root)?)?;
+    let base_first = base_first.into_inner();
+
+    Ok(map_of(&[
+        ("concrete_first_for", concrete_first.for_hits),
+        ("concrete_first_stmt", concrete_first.stmt_hits),
+        ("base_first_for", base_first.for_hits),
+        ("base_first_stmt", base_first.stmt_hits),
+    ]))
+}
+
+/// Exercise the custom-recursion half of the generated visitor API.  Calling
+/// `visit_children` visits only the current node's children; returning `Skip`
+/// then prevents a second default traversal of those same children.
+#[derive(Default)]
+struct VisitChildrenProbe {
+    pre: i64,
+    post: i64,
+    active: i64,
+    max_active: i64,
+}
+
+#[dispatch(visit)]
+impl VisitChildrenProbe {
+    fn visit_for(&mut self, _op: For, ctx: &mut VisitCtx<'_, Self>) -> WalkResult {
+        self.pre += 1;
+        self.active += 1;
+        self.max_active = self.max_active.max(self.active);
+
+        if !ctx.visit_children(self) {
+            self.active -= 1;
+            return WalkResult::Interrupt;
+        }
+
+        self.active -= 1;
+        self.post += 1;
+        WalkResult::Skip
+    }
+}
+
+fn visit_test_children(root: &Stmt) -> Result<Map<FfiString, i64>> {
+    let mut visitor = visit::Visitor::new(VisitChildrenProbe::default());
+    require_complete(visitor.visit(root)?)?;
+    let probe = visitor.into_inner();
+    Ok(map_of(&[
+        ("pre", probe.pre),
+        ("post", probe.post),
+        ("active", probe.active),
+        ("max_active", probe.max_active),
+    ]))
+}
+
+// ---------------------------------------------------------------------------
 // FFI exports.
 // ---------------------------------------------------------------------------
 
@@ -556,6 +684,11 @@ pub fn register_globals() -> Result<()> {
     register("tirx_ext._map_test_table_wins", map_test_table_wins)?;
     register("tirx_ext._map_test_map_fields", map_test_map_fields)?;
     register("tirx_ext._map_test_handler_error", map_test_handler_error)?;
+    register(
+        "tirx_ext._visit_test_dispatch_order",
+        visit_test_dispatch_order,
+    )?;
+    register("tirx_ext._visit_test_children", visit_test_children)?;
     register_packed("tirx_ext._check_layouts", |_args| {
         layout::check_layouts().map_err(|msg| Error::new(RUNTIME_ERROR, &msg, ""))?;
         Ok(Any::from(true))

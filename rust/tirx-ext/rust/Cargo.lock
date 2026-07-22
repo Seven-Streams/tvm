@@ -89,6 +89,23 @@ name = "tvm-tirx"
 version = "0.1.0"
 dependencies = [
  "tvm-ffi",
+ "tvm-tirx-macros",
+]
+
+[[package]]
+name = "tvm-tirx-downstream-api-test"
+version = "0.0.0"
+dependencies = [
+ "tvm-tirx",
+]
+
+[[package]]
+name = "tvm-tirx-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
