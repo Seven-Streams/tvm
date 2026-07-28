@@ -18,7 +18,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use proc_macro_crate::{crate_name, FoundCrate};
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::{parse_macro_input, FnArg, ImplItem, ImplItemMethod, ItemImpl, Meta, NestedMeta, Type};
 
 /// Generate `VisitDispatch` from the `visit_*` methods in an inherent impl.
@@ -106,8 +106,29 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
     let self_type = &item_impl.self_ty;
     let (impl_generics, _, where_clause) = item_impl.generics.split_for_impl();
     let impl_cfg_attrs = presence_attrs(&item_impl.attrs)?;
+    let ordering_errors = handlers
+        .iter()
+        .enumerate()
+        .filter(|(_, handler)| matches!(&handler.argument, HandlerArgument::Value))
+        .flat_map(|(index, handler)| {
+            handlers[index + 1..].iter().map(|later| {
+                let span = handler.method.span();
+                let handler_attrs = &handler.cfg_attrs;
+                let later_attrs = &later.cfg_attrs;
+                quote_spanned! {span=>
+                    #(#[#impl_cfg_attrs])*
+                    #(#[#handler_attrs])*
+                    #(#[#later_attrs])*
+                    compile_error!(
+                        "the `&VisitValue` catch-all handler must be last among enabled handlers"
+                    );
+                }
+            })
+        });
 
     Ok(quote! {
+        #(#ordering_errors)*
+
         #(#[#impl_cfg_attrs])*
         impl #impl_generics #tirx::visit::VisitDispatch for #self_type #where_clause {
             #[allow(unreachable_code)]
@@ -133,7 +154,8 @@ fn crate_path(found: FoundCrate) -> TokenStream2 {
     match found {
         FoundCrate::Itself => quote!(crate),
         FoundCrate::Name(name) => {
-            let name = syn::Ident::new(&name, Span::call_site());
+            let name = syn::parse_str::<syn::Ident>(&name)
+                .unwrap_or_else(|_| syn::Ident::new_raw(&name, Span::call_site()));
             quote!(::#name)
         }
     }
@@ -251,6 +273,14 @@ mod tests {
         assert_eq!(
             crate_path(FoundCrate::Name("renamed_tirx".to_string())).to_string(),
             ":: renamed_tirx"
+        );
+    }
+
+    #[test]
+    fn keyword_dependency_uses_a_raw_identifier() {
+        assert_eq!(
+            crate_path(FoundCrate::Name("type".to_string())).to_string(),
+            ":: r#type"
         );
     }
 }
