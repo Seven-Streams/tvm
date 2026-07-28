@@ -72,27 +72,28 @@ use tvm_ffi::any::{Any, AnyView};
 use tvm_ffi::error::{Error, Result, RUNTIME_ERROR};
 use tvm_ffi::function::Function;
 use tvm_ffi::tvm_ffi_sys::{
-    TVMFFIAny, TVMFFIByteArray, TVMFFIErrorMoveFromRaised, TVMFFIFieldInfo, TVMFFIFieldSetter,
-    TVMFFIGetTypeInfo, TVMFFIObject, TVMFFITypeAttrColumn, TVMFFITypeIndex,
+    TVMFFIAny, TVMFFIErrorMoveFromRaised, TVMFFIFieldInfo, TVMFFIFieldSetter, TVMFFIObject,
+    TVMFFITypeIndex,
 };
 
 use crate::node::{ExprNode, Stmt, StmtNode};
 use crate::object_ref::is_instance;
-use crate::reflect::for_each_field;
-use crate::runtime::lookup_type_index;
+use crate::reflect::{
+    for_each_field, FLAG_SEQ_HASH_DEF_NON_RECURSIVE, FLAG_SEQ_HASH_DEF_RECURSIVE,
+    FLAG_SEQ_HASH_IGNORE,
+};
+use crate::runtime::{
+    lookup_type_index, raw_of, raw_of_owned, type_attr_column, type_key_of, view_of, SeqPrefix,
+};
 use crate::visit::VisitValue;
 
-// Field flag bits (include/tvm/ffi/c_api.h, TVMFFIFieldFlagBitMask*).
-const FLAG_SEQ_HASH_IGNORE: i64 = 1 << 3;
-const FLAG_SEQ_HASH_DEF_RECURSIVE: i64 = 1 << 4;
+// include/tvm/ffi/c_api.h, TVMFFIFieldFlagBitMask.
 const FLAG_SETTER_IS_FUNCTION_OBJ: i64 = 1 << 11;
-// tirx headers carry TODOs migrating def fields (Bind.var, AllocBuffer.buffer)
-// from DefRecursive to this flag — treat both as def-position from day one.
-const FLAG_SEQ_HASH_DEF_NON_RECURSIVE: i64 = 1 << 12;
 
 /// Fields the default rebuild must not descend into: span-likes
 /// (SEqHashIgnore) and def-position fields (either def-region flavor) —
-/// the C++ StmtMutator skip set.
+/// the C++ StmtMutator skip set. TIRx headers carry TODOs migrating some
+/// definition fields from Recursive to NonRecursive, so both are skipped.
 const FLAG_SKIP_FIELD: i64 =
     FLAG_SEQ_HASH_IGNORE | FLAG_SEQ_HASH_DEF_RECURSIVE | FLAG_SEQ_HASH_DEF_NON_RECURSIVE;
 
@@ -120,41 +121,6 @@ const UNSUPPORTED_EXPR_KEYS: &[&str] = &["tirx.Reduce"];
 /// Recursion guard: ~3 stack frames per IR level would otherwise turn deep
 /// (generated) IR into an uncatchable stack-overflow SIGSEGV of the host.
 const MAX_DEPTH: u32 = 10_000;
-
-extern "C" {
-    // Present in libtvm_ffi but not yet declared by tvm-ffi-sys.
-    fn TVMFFIGetTypeAttrColumn(attr_name: *const TVMFFIByteArray) -> *const TVMFFITypeAttrColumn;
-}
-
-// ---------------------------------------------------------------------------
-// Raw-cell helpers (single home for the AnyView <-> TVMFFIAny reinterpret)
-// ---------------------------------------------------------------------------
-
-/// Reinterpret a borrowed `AnyView` as its raw cell.
-fn raw_of(view: AnyView) -> TVMFFIAny {
-    unsafe { std::ptr::read(&view as *const AnyView as *const TVMFFIAny) }
-}
-
-/// Reinterpret a borrowed raw cell as an `AnyView` (inverse of [`raw_of`]).
-unsafe fn view_of(raw: &TVMFFIAny) -> AnyView<'_> {
-    std::ptr::read(raw as *const TVMFFIAny as *const AnyView)
-}
-
-/// The raw cell of an owned `Any` (a POD copy; ownership stays with `any`).
-fn raw_of_owned(any: &mut Any) -> TVMFFIAny {
-    unsafe { *Any::as_data_ptr(any) }
-}
-
-fn type_key_of(type_index: i32) -> String {
-    unsafe {
-        let info = TVMFFIGetTypeInfo(type_index);
-        if info.is_null() {
-            format!("<type_index {type_index}>")
-        } else {
-            (*info).type_key.as_str().to_string()
-        }
-    }
-}
 
 /// The detailed error the C side stored in the thread's raised-error slot for
 /// the last failing safe-call (getter/setter), or `fallback` if none — taking
@@ -185,14 +151,13 @@ fn take_raised_error(fallback: &str) -> Error {
 /// a refcount==1 copy sharing every field with the original.
 fn shallow_copy(raw: &TVMFFIAny) -> Result<Any> {
     unsafe {
-        let attr_name = TVMFFIByteArray::from_str(SHALLOW_COPY_ATTR);
         // Looked up per call on purpose: the column's data array can be
         // reallocated when later registrations grow it.
-        let col = TVMFFIGetTypeAttrColumn(&attr_name);
+        let col = type_attr_column(SHALLOW_COPY_ATTR);
         let cell: Option<&TVMFFIAny> = if col.is_null() {
             None
         } else {
-            let c: &TVMFFITypeAttrColumn = &*col;
+            let c = &*col;
             let idx = raw.type_index - c.begin_index;
             if idx >= 0 && idx < c.size {
                 Some(&*c.data.offset(idx as isize))
@@ -242,11 +207,7 @@ unsafe fn set_field(obj: *mut u8, field: &TVMFFIFieldInfo, value: &TVMFFIAny) ->
         ));
     }
     if field.setter.is_null() {
-        return Err(Error::new(
-            RUNTIME_ERROR,
-            "tirx_ext: field has no setter",
-            "",
-        ));
+        return Err(Error::new(RUNTIME_ERROR, "tirx_ext: field has no setter", ""));
     }
     let setter: TVMFFIFieldSetter = std::mem::transmute(field.setter);
     let addr = obj.offset(field.offset as isize) as *mut c_void;
@@ -261,7 +222,7 @@ unsafe fn set_field(obj: *mut u8, field: &TVMFFIFieldInfo, value: &TVMFFIAny) ->
 
 /// The raw object payload pointer of an owned `Any` (which must hold an object).
 fn obj_ptr_of(any: &mut Any) -> *mut u8 {
-    unsafe { (*Any::as_data_ptr(any)).data_union.v_obj as *mut u8 }
+    unsafe { raw_of_owned(any).data_union.v_obj as *mut u8 }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,10 +256,7 @@ const TYPE_HOOKS: &[(&str, TypeHook)] = &[];
 /// Resolve a `(type_key, hook)` table to `(type_index, hook)` via the FFI
 /// type registry (types must already be registered — host imported tvm).
 pub(crate) fn resolve_hooks(table: &[(&str, TypeHook)]) -> Vec<(i32, TypeHook)> {
-    table
-        .iter()
-        .map(|(key, hook)| (lookup_type_index(key), *hook))
-        .collect()
+    table.iter().map(|(key, hook)| (lookup_type_index(key), *hook)).collect()
 }
 
 fn default_hooks() -> &'static [(i32, TypeHook)] {
@@ -311,21 +269,6 @@ fn default_hooks() -> &'static [(i32, TypeHook)] {
 // ---------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------
-
-/// Layout prefix shared by `ArrayObj`/`ListObj`:
-/// `Object (24B) + TVMFFISeqCell { data, size, capacity, deleter }`
-/// (container/seq_base.h) — asserted here and in visit.rs.
-#[repr(C)]
-struct SeqPrefix {
-    header: TVMFFIObject,
-    data: *const TVMFFIAny,
-    size: i64,
-}
-
-const _: () = {
-    assert!(std::mem::offset_of!(SeqPrefix, data) == 24);
-    assert!(std::mem::offset_of!(SeqPrefix, size) == 32);
-};
 
 /// The pass dispatch with its state captured — `S` is erased at the agent
 /// boundary so the engine (and [`TypeHook`]s, which must not see `S`) stay
@@ -448,25 +391,16 @@ impl Engine<'_> {
         let vv = VisitValue::from_raw(*raw);
         // 1) Pass table: a claimed node is fully the handler's business.
         {
-            let mut ctx = MapCtx {
-                engine: self,
-                depth,
-            };
+            let mut ctx = MapCtx { engine: self, depth };
             if let Some(outcome) = (self.dispatch)(&vv, &mut ctx) {
                 return cow_verdict(raw, outcome?);
             }
         }
         // 2) Per-type rules (`__s_map__` layer).
-        if let Some(hook) = self
-            .hooks
-            .iter()
-            .find(|(ti, _)| *ti == raw.type_index)
-            .map(|(_, h)| *h)
+        if let Some(hook) =
+            self.hooks.iter().find(|(ti, _)| *ti == raw.type_index).map(|(_, h)| *h)
         {
-            let mut ctx = MapCtx {
-                engine: self,
-                depth,
-            };
+            let mut ctx = MapCtx { engine: self, depth };
             return cow_verdict(raw, hook(&vv, &mut ctx)?);
         }
         // 3) Unclaimed: default rebuild over value-position children.
@@ -561,7 +495,8 @@ impl Engine<'_> {
             let mut changed = false;
             let mut elems: Vec<Any> = Vec::with_capacity(cells.len());
             for cell in cells {
-                let is_obj = cell.type_index >= TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32;
+                let is_obj =
+                    cell.type_index >= TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32;
                 if is_obj && self.is_ir_family(cell.type_index) {
                     if let Some(mut new_elem) = self.map_raw(cell, depth + 1)? {
                         // Route B: an element replaced BY a SeqStmt would need
@@ -589,9 +524,7 @@ impl Engine<'_> {
                 return Ok(None);
             }
             let views: Vec<AnyView> = elems.iter().map(AnyView::from).collect();
-            Function::get_global("ffi.Array")?
-                .call_packed(&views)
-                .map(Some)
+            Function::get_global("ffi.Array")?.call_packed(&views).map(Some)
         }
     }
 }
@@ -609,10 +542,7 @@ pub struct Mapper<'s, S> {
 
 impl<S> Default for Mapper<'_, S> {
     fn default() -> Self {
-        Self {
-            state: None,
-            function_table: None,
-        }
+        Self { state: None, function_table: None }
     }
 }
 
@@ -642,14 +572,13 @@ impl<'s, S> Mapper<'s, S> {
     /// [`Mapper::map`] with an explicit (pre-resolved) per-type hook table —
     /// crate-only: the production hook set is the compiled [`TYPE_HOOKS`];
     /// this variant exists so lib.rs test globals can pin the dispatch order.
-    pub(crate) fn map_with_hooks(&self, root: &Stmt, hooks: &[(i32, TypeHook)]) -> Result<Stmt> {
-        let state = self
-            .state
-            .expect("Mapper: call visit_with_extra_content first");
-        let table = self
-            .function_table
-            .as_ref()
-            .expect("Mapper: call function_table first");
+    pub(crate) fn map_with_hooks(
+        &self,
+        root: &Stmt,
+        hooks: &[(i32, TypeHook)],
+    ) -> Result<Stmt> {
+        let state = self.state.expect("Mapper: call visit_with_extra_content first");
+        let table = self.function_table.as_ref().expect("Mapper: call function_table first");
         let dispatch = erase_dispatch(state, table.0);
         let engine = Engine {
             dispatch: &dispatch,

@@ -23,9 +23,32 @@
 //! panics below therefore indicate a load-order bug in the host, and they are
 //! converted to `ffi.Error`s by the `catch_unwind` in the exported entry points.
 
+use tvm_ffi::any::{Any, AnyView};
+use tvm_ffi::tvm_ffi_sys::{
+    TVMFFIAny, TVMFFIByteArray, TVMFFIGetTypeInfo, TVMFFIObject, TVMFFITypeAttrColumn,
+    TVMFFITypeKeyToIndex,
+};
+
+extern "C" {
+    // Present in libtvm_ffi but not yet declared by tvm-ffi-sys.
+    fn TVMFFIGetTypeAttrColumn(attr_name: *const TVMFFIByteArray) -> *const TVMFFITypeAttrColumn;
+}
+
+/// Layout prefix shared by C++ `ArrayObj` and `ListObj`.
+#[repr(C)]
+pub(crate) struct SeqPrefix {
+    _header: TVMFFIObject,
+    pub(crate) data: *const TVMFFIAny,
+    pub(crate) size: i64,
+}
+
+const _: () = {
+    assert!(std::mem::offset_of!(SeqPrefix, data) == 24);
+    assert!(std::mem::offset_of!(SeqPrefix, size) == 32);
+};
+
 /// Resolve a C++ type key (e.g. `"tirx.For"`) to its runtime `type_index`.
 pub(crate) fn lookup_type_index(type_key: &str) -> i32 {
-    use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFITypeKeyToIndex};
     unsafe {
         let arg = TVMFFIByteArray::from_str(type_key);
         let mut idx: i32 = 0;
@@ -39,4 +62,34 @@ pub(crate) fn lookup_type_index(type_key: &str) -> i32 {
         }
         idx
     }
+}
+
+pub(crate) fn type_key_of(type_index: i32) -> String {
+    unsafe {
+        let info = TVMFFIGetTypeInfo(type_index);
+        if info.is_null() {
+            format!("<type_index {type_index}>")
+        } else {
+            (*info).type_key.as_str().to_string()
+        }
+    }
+}
+
+pub(crate) fn type_attr_column(attr_name: &str) -> *const TVMFFITypeAttrColumn {
+    unsafe {
+        let attr_name = TVMFFIByteArray::from_str(attr_name);
+        TVMFFIGetTypeAttrColumn(&attr_name)
+    }
+}
+
+pub(crate) fn raw_of(view: AnyView) -> TVMFFIAny {
+    unsafe { std::ptr::read(&view as *const AnyView as *const TVMFFIAny) }
+}
+
+pub(crate) fn raw_of_owned(any: &mut Any) -> TVMFFIAny {
+    unsafe { *Any::as_data_ptr(any) }
+}
+
+pub(crate) unsafe fn view_of(raw: &TVMFFIAny) -> AnyView<'_> {
+    std::ptr::read(raw as *const TVMFFIAny as *const AnyView)
 }

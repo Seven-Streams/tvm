@@ -23,6 +23,10 @@ use std::ops::ControlFlow;
 
 use tvm_ffi::tvm_ffi_sys::{TVMFFIFieldInfo, TVMFFIGetTypeInfo};
 
+pub(crate) const FLAG_SEQ_HASH_IGNORE: i64 = 1 << 3;
+pub(crate) const FLAG_SEQ_HASH_DEF_RECURSIVE: i64 = 1 << 4;
+pub(crate) const FLAG_SEQ_HASH_DEF_NON_RECURSIVE: i64 = 1 << 12;
+
 /// Visit every reflected field of `type_index` and its ancestors in the same
 /// parent-to-child order as C++ `ForEachFieldInfoWithEarlyStop`. The callback's
 /// `ControlFlow::Break` value short-circuits and is returned.

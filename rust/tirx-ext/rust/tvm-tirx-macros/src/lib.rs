@@ -206,7 +206,7 @@ fn parse_handler(method: &ImplItemMethod) -> syn::Result<Handler> {
     let cfg_attrs = method
         .attrs
         .iter()
-        .filter(|attr| attr.path.is_ident("cfg") || attr.path.is_ident("cfg_attr"))
+        .filter(|attr| attr.path.is_ident("cfg"))
         .cloned()
         .collect();
     Ok(Handler {

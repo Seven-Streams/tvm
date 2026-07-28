@@ -72,9 +72,8 @@ pub use node::{
 };
 pub use tvm_tirx_macros::dispatch;
 pub use visit::{
-    structural_visit, structural_visit_ordered, try_walk_with_context, walk, walk_with_context,
-    DefRegionKind, Phase, VisitCtx, VisitDispatch, VisitOrder, VisitOutcome, VisitValue,
-    WalkResult,
+    structural_visit, structural_visit_ordered, walk, walk_with_context, DefRegionKind, Phase,
+    VisitCtx, VisitDispatch, VisitOrder, VisitOutcome, VisitValue, WalkResult,
 };
 
 use mutate::MapCtx;
@@ -103,11 +102,7 @@ const ERR_STEP_POSITIVE: &str = "tirx_ext: loop step must be a positive constant
 const ERR_OVERFLOW: &str = "tirx_ext: iteration count overflows i64";
 
 fn pass_error(msg: &'static str) -> Error {
-    let kind = if msg == ERR_OVERFLOW {
-        RUNTIME_ERROR
-    } else {
-        TYPE_ERROR
-    };
+    let kind = if msg == ERR_OVERFLOW { RUNTIME_ERROR } else { TYPE_ERROR };
     Error::new(kind, msg, "")
 }
 
@@ -456,11 +451,7 @@ fn map_test_map_fields(root: &Stmt) -> Result<Stmt> {
 /// The single error channel: a handler `Err` surfaces as one `ffi.Error`.
 fn map_test_handler_error(root: &Stmt) -> Result<Stmt> {
     fn fail_for(_state: &RefCell<()>, _op: For, _mapper: &mut MapCtx) -> Result<Stmt> {
-        Err(Error::new(
-            RUNTIME_ERROR,
-            "tirx_ext: test handler failure",
-            "",
-        ))
+        Err(Error::new(RUNTIME_ERROR, "tirx_ext: test handler failure", ""))
     }
     let state = RefCell::new(());
     let table = mutation_table! {
@@ -477,10 +468,7 @@ fn map_test_handler_error(root: &Stmt) -> Result<Stmt> {
 // ---------------------------------------------------------------------------
 
 fn map_of(pairs: &[(&str, i64)]) -> Map<FfiString, i64> {
-    pairs
-        .iter()
-        .map(|(k, v)| (FfiString::from(*k), *v))
-        .collect()
+    pairs.iter().map(|(k, v)| (FfiString::from(*k), *v)).collect()
 }
 
 /// Best-effort text of a caught panic payload (panic! with a literal gives
@@ -564,10 +552,7 @@ pub fn register_globals() -> Result<()> {
         ]))
     })?;
     register("tirx_ext.break_for_bodies", break_for_bodies)?;
-    register(
-        "tirx_ext.break_innermost_for_bodies",
-        break_innermost_for_bodies,
-    )?;
+    register("tirx_ext.break_innermost_for_bodies", break_innermost_for_bodies)?;
     register("tirx_ext._map_test_hook_dispatch", map_test_hook_dispatch)?;
     register("tirx_ext._map_test_table_wins", map_test_table_wins)?;
     register("tirx_ext._map_test_map_fields", map_test_map_fields)?;

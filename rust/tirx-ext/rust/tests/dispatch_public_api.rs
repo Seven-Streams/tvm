@@ -20,13 +20,14 @@
 
 use tvm_tirx::{dispatch, ForNode, VisitCtx, VisitDispatch, WalkResult};
 
-#[derive(Default)]
 struct ExternalCounter {
     loops: usize,
 }
 
 #[dispatch(visit)]
 impl ExternalCounter {
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(all(), inline)]
     fn visit_for(&mut self, _op: &ForNode, _ctx: &mut VisitCtx<'_>) -> WalkResult {
         self.loops += 1;
         WalkResult::Advance

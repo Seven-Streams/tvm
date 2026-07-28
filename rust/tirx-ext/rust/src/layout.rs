@@ -27,7 +27,9 @@ use std::ops::ControlFlow;
 
 use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFITypeKeyToIndex};
 
-use crate::node::{AddNode, ExprNode, ForNode, IfThenElseNode, IntImmNode, VarNode, WhileNode};
+use crate::node::{
+    AddNode, ExprNode, ForNode, IfThenElseNode, IntImmNode, VarNode, WhileNode,
+};
 use crate::reflect::for_each_field;
 
 /// The reflected absolute byte offset of `field` in the C++ type `type_key`,

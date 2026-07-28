@@ -40,42 +40,24 @@ use tvm_ffi::any::{Any, AnyView};
 use tvm_ffi::error::{Error, Result, RUNTIME_ERROR};
 use tvm_ffi::function::Function;
 use tvm_ffi::object::ObjectCore;
-use tvm_ffi::tvm_ffi_sys::{
-    TVMFFIAny, TVMFFIByteArray, TVMFFIFieldInfo, TVMFFIGetTypeInfo, TVMFFIObject,
-    TVMFFITypeAttrColumn, TVMFFITypeIndex,
-};
+use tvm_ffi::tvm_ffi_sys::{TVMFFIAny, TVMFFIFieldInfo, TVMFFIGetTypeInfo, TVMFFITypeIndex};
 
 use crate::object_ref::is_instance;
-use crate::reflect::for_each_field;
+use crate::reflect::{
+    for_each_field, FLAG_SEQ_HASH_DEF_NON_RECURSIVE, FLAG_SEQ_HASH_DEF_RECURSIVE,
+    FLAG_SEQ_HASH_IGNORE,
+};
+use crate::runtime::{raw_of, raw_of_owned, type_attr_column, type_key_of, view_of, SeqPrefix};
+
+#[cfg(test)]
+use tvm_ffi::tvm_ffi_sys::TVMFFIByteArray;
 
 // Static type indices added after the pinned tvm-ffi-sys bindings were
 // generated.  They are stable ABI constants in tvm/ffi/c_api.h.
 const TYPE_LIST: i32 = 75;
 const TYPE_DICT: i32 = 76;
 
-const FLAG_SEQ_HASH_IGNORE: i64 = 1 << 3;
-const FLAG_SEQ_HASH_DEF_RECURSIVE: i64 = 1 << 4;
-const FLAG_SEQ_HASH_DEF_NON_RECURSIVE: i64 = 1 << 12;
 const STRUCTURAL_VISIT_ATTR: &str = "__s_visit__";
-
-extern "C" {
-    // Present in libtvm_ffi but not yet declared by the pinned tvm-ffi-sys.
-    fn TVMFFIGetTypeAttrColumn(attr_name: *const TVMFFIByteArray) -> *const TVMFFITypeAttrColumn;
-}
-
-/// Layout prefix shared by C++ `ArrayObj` and `ListObj`:
-/// `Object + TVMFFISeqCell`.
-#[repr(C)]
-struct SeqPrefix {
-    _header: TVMFFIObject,
-    data: *const TVMFFIAny,
-    size: i64,
-}
-
-const _: () = {
-    assert!(std::mem::offset_of!(SeqPrefix, data) == 24);
-    assert!(std::mem::offset_of!(SeqPrefix, size) == 32);
-};
 
 /// What a callback asks the Rust walker to do with the current value.
 pub enum WalkResult {
@@ -100,7 +82,6 @@ impl WalkResult {
 ///
 /// This keeps simple handlers terse while allowing a handler to return
 /// `tvm_ffi::error::Result<WalkResult>` and use `?`.
-#[doc(hidden)]
 pub trait IntoVisitResult {
     fn into_visit_result(self) -> Result<WalkResult>;
 }
@@ -343,16 +324,17 @@ impl<V: VisitDispatch> NativeVisit for DispatchVisitor<'_, V> {
 
 struct CallbackVisitor<F>(F);
 
-impl<F> NativeVisit for CallbackVisitor<F>
+impl<F, O> NativeVisit for CallbackVisitor<F>
 where
-    F: FnMut(&VisitValue, Phase, DefRegionKind) -> Result<WalkResult>,
+    F: FnMut(&VisitValue, Phase, DefRegionKind) -> O,
+    O: IntoVisitResult,
 {
     fn enter(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
-        (self.0)(value, Phase::Enter, ctx.def_region_kind())
+        (self.0)(value, Phase::Enter, ctx.def_region_kind()).into_visit_result()
     }
 
     fn exit(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
-        (self.0)(value, Phase::Exit, ctx.def_region_kind())
+        (self.0)(value, Phase::Exit, ctx.def_region_kind()).into_visit_result()
     }
 }
 
@@ -460,7 +442,7 @@ impl NativeWalker {
                     .collect()
             };
             for (index, mut child) in children.into_iter().enumerate() {
-                let raw = unsafe { *Any::as_data_ptr(&mut child) };
+                let raw = raw_of_owned(&mut child);
                 self.visit_raw(raw, visitor, def_region_kind)
                     .map_err(|halt| {
                         with_error_context(halt, &format!("sequence item [{index}]"))
@@ -524,10 +506,10 @@ impl NativeWalker {
             }
 
             for (index, (mut key, mut map_value)) in entries.into_iter().enumerate() {
-                let key_raw = unsafe { *Any::as_data_ptr(&mut key) };
+                let key_raw = raw_of_owned(&mut key);
                 self.visit_raw(key_raw, visitor, def_region_kind)
                     .map_err(|halt| with_error_context(halt, &format!("dict key [{index}]")))?;
-                let value_raw = unsafe { *Any::as_data_ptr(&mut map_value) };
+                let value_raw = raw_of_owned(&mut map_value);
                 self.visit_raw(value_raw, visitor, def_region_kind)
                     .map_err(|halt| with_error_context(halt, &format!("dict value [{index}]")))?;
             }
@@ -538,10 +520,10 @@ impl NativeWalker {
         for index in 0..size {
             let mut key = iter.call_packed(&[AnyView::from(&0i64)])?;
             let mut map_value = iter.call_packed(&[AnyView::from(&1i64)])?;
-            let key_raw = unsafe { *Any::as_data_ptr(&mut key) };
+            let key_raw = raw_of_owned(&mut key);
             self.visit_raw(key_raw, visitor, def_region_kind)
                 .map_err(|halt| with_error_context(halt, &format!("map key [{index}]")))?;
-            let value_raw = unsafe { *Any::as_data_ptr(&mut map_value) };
+            let value_raw = raw_of_owned(&mut map_value);
             self.visit_raw(value_raw, visitor, def_region_kind)
                 .map_err(|halt| with_error_context(halt, &format!("map value [{index}]")))?;
             if index + 1 != size {
@@ -599,7 +581,7 @@ impl NativeWalker {
                 // A reflection getter returns an owned Any.  Keep it alive
                 // while the recursive walk borrows its raw cell.
                 let mut child = Any::from_raw_ffi_any(child_raw);
-                let borrowed = *Any::as_data_ptr(&mut child);
+                let borrowed = raw_of_owned(&mut child);
                 let child_region = field_def_region(field, def_region_kind);
                 match self.visit_raw(borrowed, visitor, child_region) {
                     Ok(()) => ControlFlow::Continue(()),
@@ -651,40 +633,23 @@ where
 }
 
 /// Native pre/post walk used by analyses that need to observe every raw value.
-pub fn walk<R>(
-    root: &R,
-    callback: impl FnMut(&VisitValue, Phase) -> WalkResult,
-) -> Result<VisitOutcome>
+pub fn walk<R, F, O>(root: &R, mut callback: F) -> Result<VisitOutcome>
 where
     for<'x> AnyView<'x>: From<&'x R>,
+    F: FnMut(&VisitValue, Phase) -> O,
+    O: IntoVisitResult,
 {
-    let mut callback = callback;
     walk_with_context(root, move |value, phase, _def_region_kind| {
         callback(value, phase)
     })
 }
 
 /// Native pre/post walk whose callback also receives definition-region state.
-pub fn walk_with_context<R>(
-    root: &R,
-    callback: impl FnMut(&VisitValue, Phase, DefRegionKind) -> WalkResult,
-) -> Result<VisitOutcome>
+pub fn walk_with_context<R, F, O>(root: &R, callback: F) -> Result<VisitOutcome>
 where
     for<'x> AnyView<'x>: From<&'x R>,
-{
-    let mut callback = callback;
-    try_walk_with_context(root, move |value, phase, def_region_kind| {
-        Ok(callback(value, phase, def_region_kind))
-    })
-}
-
-/// Fallible native pre/post walk with definition-region state.
-pub fn try_walk_with_context<R>(
-    root: &R,
-    callback: impl FnMut(&VisitValue, Phase, DefRegionKind) -> Result<WalkResult>,
-) -> Result<VisitOutcome>
-where
-    for<'x> AnyView<'x>: From<&'x R>,
+    F: FnMut(&VisitValue, Phase, DefRegionKind) -> O,
+    O: IntoVisitResult,
 {
     let walker = NativeWalker;
     let mut callback = CallbackVisitor(callback);
@@ -715,10 +680,9 @@ fn field_def_region(field: &TVMFFIFieldInfo, inherited: DefRegionKind) -> DefReg
 
 fn has_foreign_structural_visit(type_index: i32) -> bool {
     unsafe {
-        let attr_name = TVMFFIByteArray::from_str(STRUCTURAL_VISIT_ATTR);
         // Resolve the column for each query because later type registrations
         // may reallocate its backing array.
-        let column = TVMFFIGetTypeAttrColumn(&attr_name);
+        let column = type_attr_column(STRUCTURAL_VISIT_ATTR);
         if column.is_null() || (*column).data.is_null() {
             return false;
         }
@@ -741,27 +705,8 @@ fn with_error_context(halt: NativeHalt, frame: &str) -> NativeHalt {
     }
 }
 
-fn type_key_of(type_index: i32) -> String {
-    unsafe {
-        let info = TVMFFIGetTypeInfo(type_index);
-        if info.is_null() {
-            format!("<type_index {type_index}>")
-        } else {
-            (*info).type_key.as_str().to_string()
-        }
-    }
-}
-
 fn runtime_error(message: &str) -> Error {
     Error::new(RUNTIME_ERROR, message, "")
-}
-
-fn raw_of(view: AnyView) -> TVMFFIAny {
-    unsafe { std::ptr::read(&view as *const AnyView as *const TVMFFIAny) }
-}
-
-unsafe fn view_of(raw: &TVMFFIAny) -> AnyView<'_> {
-    std::ptr::read(raw as *const TVMFFIAny as *const AnyView)
 }
 
 #[cfg(test)]
@@ -1118,19 +1063,16 @@ mod tests {
         assert_eq!(i64::try_from(payload).unwrap(), 42);
     }
 
-    struct ErrorProbe;
-
-    #[crate::dispatch(visit)]
-    impl ErrorProbe {
-        fn visit_integer(&mut self, _value: i64, _ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
-            Err(runtime_error("handler failed"))
-        }
-    }
-
     #[test]
     fn handler_errors_include_native_visit_path() {
         let root = Array::new(vec![1i64]);
-        let error = match structural_visit(&root, &mut ErrorProbe) {
+        let error = match walk(&root, |value, phase| {
+            if phase == Phase::Enter && value.cast::<i64>().is_some() {
+                Err(runtime_error("handler failed"))
+            } else {
+                Ok(WalkResult::Advance)
+            }
+        }) {
             Err(error) => error,
             Ok(_) => panic!("handler unexpectedly succeeded"),
         };
