@@ -25,6 +25,8 @@ license = "Apache-2.0"
 proc-macro = true
 
 [dependencies]
+# Resolve the public crate path when a downstream Cargo dependency is renamed.
+proc-macro-crate = "3"
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "1", features = ["full"] }

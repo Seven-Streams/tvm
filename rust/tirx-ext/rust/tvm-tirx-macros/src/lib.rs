@@ -16,7 +16,8 @@
 // under the License.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro_crate::{crate_name, FoundCrate};
 use quote::quote;
 use syn::{parse_macro_input, FnArg, ImplItem, ImplItemMethod, ItemImpl, Meta, NestedMeta, Type};
 
@@ -63,18 +64,7 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
             "`dispatch(visit)` found no `visit_*` methods",
         ));
     }
-    if let Some((index, handler)) = handlers
-        .iter()
-        .enumerate()
-        .find(|(_, handler)| matches!(handler.argument, HandlerArgument::Value))
-    {
-        if index + 1 != handlers.len() {
-            return Err(syn::Error::new_spanned(
-                &handler.method,
-                "the `&VisitValue` catch-all handler must be last",
-            ));
-        }
-    }
+    let tirx = resolve_tirx_crate()?;
 
     let links = handlers.iter().map(|handler| {
         let method = &handler.method;
@@ -82,7 +72,7 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
         let invoke = match &handler.argument {
             HandlerArgument::Value => quote! {
                 return Some(
-                    ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
+                    #tirx::visit::IntoVisitResult::into_visit_result(
                         self.#method(value, ctx)
                     )
                 );
@@ -90,7 +80,7 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
             HandlerArgument::BorrowedNode(node_type) => quote! {
                 if let Some(node) = value.as_node::<#node_type>() {
                     return Some(
-                        ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
+                        #tirx::visit::IntoVisitResult::into_visit_result(
                             self.#method(node, ctx)
                         )
                     );
@@ -99,7 +89,7 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
             HandlerArgument::Owned(value_type) => quote! {
                 if let Some(node) = value.cast::<#value_type>() {
                     return Some(
-                        ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
+                        #tirx::visit::IntoVisitResult::into_visit_result(
                             self.#method(node, ctx)
                         )
                     );
@@ -119,18 +109,34 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
 
     Ok(quote! {
         #(#[#impl_cfg_attrs])*
-        impl #impl_generics ::tvm_tirx::visit::VisitDispatch for #self_type #where_clause {
+        impl #impl_generics #tirx::visit::VisitDispatch for #self_type #where_clause {
             #[allow(unreachable_code)]
             fn dispatch_visit(
                 &mut self,
-                value: &::tvm_tirx::visit::VisitValue,
-                ctx: &mut ::tvm_tirx::visit::VisitCtx<'_>,
-            ) -> Option<::tvm_tirx::visit::VisitResult> {
+                value: &#tirx::visit::VisitValue,
+                ctx: &mut #tirx::visit::VisitCtx<'_>,
+            ) -> Option<#tirx::visit::VisitResult> {
                 #(#links)*
                 None
             }
         }
     })
+}
+
+fn resolve_tirx_crate() -> syn::Result<TokenStream2> {
+    crate_name("tvm-tirx")
+        .map(crate_path)
+        .map_err(|error| syn::Error::new(Span::call_site(), error))
+}
+
+fn crate_path(found: FoundCrate) -> TokenStream2 {
+    match found {
+        FoundCrate::Itself => quote!(crate),
+        FoundCrate::Name(name) => {
+            let name = syn::Ident::new(&name, Span::call_site());
+            quote!(::#name)
+        }
+    }
 }
 
 struct Handler {
@@ -234,4 +240,17 @@ fn is_visit_value(value_type: &Type) -> bool {
         .segments
         .last()
         .is_some_and(|segment| segment.ident == "VisitValue")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renamed_dependency_uses_its_imported_name() {
+        assert_eq!(
+            crate_path(FoundCrate::Name("renamed_tirx".to_string())).to_string(),
+            ":: renamed_tirx"
+        );
+    }
 }

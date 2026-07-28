@@ -47,9 +47,6 @@
 //! the dynamic linker's soname dedup then binds both sides to one
 //! `libtvm_ffi.so` — a single global function registry in the process.
 
-// The proc macro uses the public crate path both here and in downstream crates.
-extern crate self as tvm_tirx;
-
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 

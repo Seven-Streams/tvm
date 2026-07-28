@@ -42,6 +42,15 @@ struct CfgAttrCounter;
 
 #[dispatch(visit)]
 impl CfgAttrCounter {
+    #[cfg(any())]
+    fn visit_disabled_catch_all(
+        &mut self,
+        _value: &tvm_tirx::VisitValue,
+        _ctx: &mut VisitCtx<'_>,
+    ) -> WalkResult {
+        WalkResult::Advance
+    }
+
     #[cfg_attr(all(), cfg(any()))]
     fn visit_disabled(&mut self, _op: &ForNode, _ctx: &mut VisitCtx<'_>) -> WalkResult {
         WalkResult::Advance
