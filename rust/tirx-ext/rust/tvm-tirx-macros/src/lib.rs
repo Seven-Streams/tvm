@@ -18,7 +18,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{parse_macro_input, FnArg, ImplItem, ImplItemMethod, ItemImpl, Type};
+use syn::{parse_macro_input, Attribute, FnArg, ImplItem, ImplItemMethod, ItemImpl, Type};
 
 /// Generate `VisitDispatch` from the `visit_*` methods in an inherent impl.
 #[proc_macro_attribute]
@@ -63,32 +63,113 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
             "`dispatch(visit)` found no `visit_*` methods",
         ));
     }
+    if let Some((index, handler)) = handlers
+        .iter()
+        .enumerate()
+        .find(|(_, handler)| matches!(handler.argument, HandlerArgument::Value))
+    {
+        if index + 1 != handlers.len() {
+            return Err(syn::Error::new_spanned(
+                &handler.method,
+                "the `&VisitValue` catch-all handler must be last",
+            ));
+        }
+    }
 
-    let arms = handlers.iter().map(|(method, node_type)| {
+    let has_catch_all = handlers
+        .last()
+        .is_some_and(|handler| matches!(handler.argument, HandlerArgument::Value));
+    let typed_handler_count = handlers.len() - usize::from(has_catch_all);
+    let links = handlers[..typed_handler_count].iter().map(|handler| {
+        let method = &handler.method;
+        let attrs = &handler.cfg_attrs;
+        let invoke = match &handler.argument {
+            HandlerArgument::Value => unreachable!("catch-all is emitted as the tail expression"),
+            HandlerArgument::BorrowedNode(node_type) => quote! {
+                if let Some(node) = value.as_node::<#node_type>() {
+                    return Some(
+                        ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
+                            self.#method(node, ctx)
+                        )
+                    );
+                }
+            },
+            HandlerArgument::Owned(value_type) => quote! {
+                if let Some(node) = value.cast::<#value_type>() {
+                    return Some(
+                        ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
+                            self.#method(node, ctx)
+                        )
+                    );
+                }
+            },
+        };
         quote! {
-            if let Some(node) = value.cast::<#node_type>() {
-                return Some(self.#method(node, ctx));
+            #(#attrs)*
+            {
+                #invoke
             }
         }
     });
+    let tail = if has_catch_all {
+        let handler = handlers.last().unwrap();
+        let method = &handler.method;
+        let attrs = &handler.cfg_attrs;
+        if attrs.is_empty() {
+            quote! {
+                Some(
+                    ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
+                        self.#method(value, ctx)
+                    )
+                )
+            }
+        } else {
+            quote! {
+                #(#attrs)*
+                {
+                    return Some(
+                        ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
+                            self.#method(value, ctx)
+                        )
+                    );
+                }
+                None
+            }
+        }
+    } else {
+        quote!(None)
+    };
     let self_type = &item_impl.self_ty;
     let (impl_generics, _, where_clause) = item_impl.generics.split_for_impl();
 
     Ok(quote! {
         impl #impl_generics ::tvm_tirx::visit::VisitDispatch for #self_type #where_clause {
+            #[allow(unreachable_code)]
             fn dispatch_visit(
                 &mut self,
                 value: &::tvm_tirx::visit::VisitValue,
-                ctx: &mut ::tvm_tirx::visit::VisitCtx<'_, Self>,
-            ) -> Option<::tvm_tirx::visit::WalkResult> {
-                #(#arms)*
-                None
+                ctx: &mut ::tvm_tirx::visit::VisitCtx<'_>,
+            ) -> Option<::tvm_tirx::visit::VisitResult> {
+                #(#links)*
+                #tail
             }
         }
     })
 }
 
-fn parse_handler(method: &ImplItemMethod) -> syn::Result<(syn::Ident, Type)> {
+struct Handler {
+    method: syn::Ident,
+    argument: HandlerArgument,
+    cfg_attrs: Vec<Attribute>,
+}
+
+enum HandlerArgument {
+    Value,
+    BorrowedNode(Type),
+    Owned(Type),
+}
+
+fn parse_handler(method: &ImplItemMethod) -> syn::Result<Handler> {
     let inputs = &method.sig.inputs;
     let receiver_is_mut = matches!(
         inputs.first(),
@@ -106,5 +187,41 @@ fn parse_handler(method: &ImplItemMethod) -> syn::Result<(syn::Ident, Type)> {
         Some(FnArg::Typed(node)) => (*node.ty).clone(),
         _ => unreachable!("the second argument cannot be a receiver"),
     };
-    Ok((method.sig.ident.clone(), node_type))
+    let argument = match &node_type {
+        Type::Reference(reference) if reference.mutability.is_none() => {
+            if is_visit_value(reference.elem.as_ref()) {
+                HandlerArgument::Value
+            } else {
+                HandlerArgument::BorrowedNode((*reference.elem).clone())
+            }
+        }
+        Type::Reference(_) => {
+            return Err(syn::Error::new_spanned(
+                node_type,
+                "visit handler values cannot be mutable references",
+            ));
+        }
+        _ => HandlerArgument::Owned(node_type),
+    };
+    let cfg_attrs = method
+        .attrs
+        .iter()
+        .filter(|attr| attr.path.is_ident("cfg") || attr.path.is_ident("cfg_attr"))
+        .cloned()
+        .collect();
+    Ok(Handler {
+        method: method.sig.ident.clone(),
+        argument,
+        cfg_attrs,
+    })
+}
+
+fn is_visit_value(value_type: &Type) -> bool {
+    let Type::Path(path) = value_type else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "VisitValue")
 }

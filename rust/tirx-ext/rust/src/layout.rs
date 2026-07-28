@@ -27,13 +27,12 @@ use std::ops::ControlFlow;
 
 use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFITypeKeyToIndex};
 
-use crate::node::{
-    AddNode, ExprNode, ForNode, IfThenElseNode, IntImmNode, VarNode, WhileNode,
-};
+use crate::node::{AddNode, ExprNode, ForNode, IfThenElseNode, IntImmNode, VarNode, WhileNode};
 use crate::reflect::for_each_field;
 
 /// The reflected absolute byte offset of `field` in the C++ type `type_key`,
-/// searching the type and then its ancestors (single-inheritance chain).
+/// searching ancestors and then the concrete type in the same parent-to-child
+/// order as C++ `ForEachFieldInfoWithEarlyStop`.
 fn reflect_offset(type_key: &str, field: &str) -> Result<i64, String> {
     unsafe {
         let key = TVMFFIByteArray::from_str(type_key);

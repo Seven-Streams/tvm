@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use tvm_tirx::{dispatch, For, VisitCtx, VisitDispatch, WalkResult};
+use tvm_tirx::{
+    dispatch, DefRegionKind, ForNode, StmtNode, VisitCtx, VisitDispatch, VisitValue, WalkResult,
+};
 
 #[derive(Default)]
 struct ExternalCounter {
@@ -24,8 +26,26 @@ struct ExternalCounter {
 
 #[dispatch(visit)]
 impl ExternalCounter {
-    fn visit_for(&mut self, _op: For, _ctx: &mut VisitCtx<Self>) -> WalkResult {
+    #[cfg(any(unix, windows))]
+    fn visit_for(&mut self, _op: &ForNode, ctx: &mut VisitCtx<'_>) -> WalkResult {
+        let _: DefRegionKind = ctx.def_region_kind();
         self.loops += 1;
+        WalkResult::Advance
+    }
+
+    fn visit_stmt(&mut self, _op: &StmtNode, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+        WalkResult::Advance
+    }
+
+    fn visit_integer(
+        &mut self,
+        _value: i64,
+        _ctx: &mut VisitCtx<'_>,
+    ) -> tvm_ffi::Result<WalkResult> {
+        Ok(WalkResult::Advance)
+    }
+
+    fn visit_any(&mut self, _value: &VisitValue, _ctx: &mut VisitCtx<'_>) -> WalkResult {
         WalkResult::Advance
     }
 }

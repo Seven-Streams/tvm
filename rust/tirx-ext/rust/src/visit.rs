@@ -15,191 +15,168 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Rust binding of tvm-ffi's **structural visit** — a visitor + function table.
+//! Native Rust structural visiting.
 //!
-//! C++ (`tvm/ffi/extra/structural_visit.h`) drives traversal through an ABI
-//! pair: a `StructuralVisitorObj` (an FFI object whose first own field is a
-//! pointer to a `StructuralVisitorVTable`) and that vtable's single `visit`
-//! function pointer, called for every value in the graph. Subclassing =
-//! swapping the vtable. The *default* vtable entry implements the actual
-//! recursion: it dispatches on the registered `kStructuralVisit` type
-//! attribute (arrays, maps) or walks the reflected fields of an object, and
-//! recurses into children through `visitor->vtable_->visit` again.
+//! This module separates the two jobs involved in a visit:
 //!
-//! This module builds a visitor subclass **in Rust** the same way the C++
-//! `StructuralWalkCallbackVisitorObj` template does:
+//! * [`VisitValue`] provides borrowed matching for generated Rust dispatch.
+//! * `NativeWalker` owns recursion through containers and reflected fields.
 //!
-//! * [`StructuralVisitorVTable`] / [`FStructuralVisit`] mirror the C ABI;
-//! * a `#[repr(C)]` [`CallbackVisitor`] extends the C++ object layout
-//!   (`Object` header, `vtable_`, `def_region_mode_`) with Rust-side state
-//!   (the user's pre/post closures);
-//! * its vtable entry [`callback_visit`] runs the `pre` closure, then chains
-//!   to the **default** visit function — harvested at runtime from a
-//!   C++-constructed `ffi.StructuralVisitor` — for the reflected recursion
-//!   into children (which re-enters our vtable), then runs `post`.
-//!
-//! So all reflection/traversal logic stays in libtvm_ffi; Rust only supplies
-//! the per-node callback through the same function table C++ subclasses use.
+//! TVM's runtime object registry is open, so the walker still uses the stable
+//! tvm-ffi reflection ABI for arbitrary registered node types. That ABI is
+//! only the object-description boundary: traversal, control flow, typed
+//! dispatch, visitor state, and definition-region propagation remain in Rust.
+//! A Rust handler may override a type's children by visiting them through
+//! [`VisitCtx`] and returning [`WalkResult::Skip`]. No `ffi.StructuralVisitor`
+//! is constructed and no C++ `DefaultVisit` function is called. A non-container
+//! type with a foreign `__s_visit__` hook must be handled this way; advancing
+//! into its default children is rejected instead of silently substituting
+//! reflection with potentially different semantics.
 
-use std::cell::{Cell, RefCell};
-use std::mem::ManuallyDrop;
+use std::ops::ControlFlow;
 use std::os::raw::c_void;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::AtomicU64;
-use std::sync::OnceLock;
 
 use tvm_ffi::any::{Any, AnyView};
+use tvm_ffi::error::{Error, Result, RUNTIME_ERROR};
 use tvm_ffi::function::Function;
-use tvm_ffi::tvm_ffi_sys::TVMFFIObjectDeleterFlagBitMask::{
-    kTVMFFIObjectDeleterFlagBitMaskStrong, kTVMFFIObjectDeleterFlagBitMaskWeak,
+use tvm_ffi::object::ObjectCore;
+use tvm_ffi::tvm_ffi_sys::{
+    TVMFFIAny, TVMFFIByteArray, TVMFFIFieldInfo, TVMFFIGetTypeInfo, TVMFFIObject,
+    TVMFFITypeAttrColumn, TVMFFITypeIndex,
 };
-use tvm_ffi::tvm_ffi_sys::{TVMFFIAny, TVMFFIObject, TVMFFITypeIndex, COMBINED_REF_COUNT_BOTH_ONE};
 
 use crate::object_ref::is_instance;
-use crate::runtime::{call_packed_global, lookup_type_index};
+use crate::reflect::for_each_field;
 
-// ---------------------------------------------------------------------------
-// ABI mirrors
-// ---------------------------------------------------------------------------
+// Static type indices added after the pinned tvm-ffi-sys bindings were
+// generated.  They are stable ABI constants in tvm/ffi/c_api.h.
+const TYPE_LIST: i32 = 75;
+const TYPE_DICT: i32 = 76;
 
-/// C++ `tvm::ffi::FStructuralVisit`: `TVMFFIAny (*)(StructuralVisitorObj*,
-/// AnyView) noexcept`. Both `AnyView` (a single trivially-copyable
-/// `TVMFFIAny`) and the returned `TVMFFIAny` are 16-byte PODs, so the Itanium
-/// C++ call matches this `extern "C"` signature. The returned `TVMFFIAny`
-/// encodes `Expected<Optional<VisitInterrupt>>`: FFI None to continue, an
-/// owned `ffi.VisitInterrupt` to halt, an owned `ffi.Error` on failure.
-pub type FStructuralVisit =
-    unsafe extern "C" fn(visitor: *mut c_void, value: TVMFFIAny) -> TVMFFIAny;
+const FLAG_SEQ_HASH_IGNORE: i64 = 1 << 3;
+const FLAG_SEQ_HASH_DEF_RECURSIVE: i64 = 1 << 4;
+const FLAG_SEQ_HASH_DEF_NON_RECURSIVE: i64 = 1 << 12;
+const STRUCTURAL_VISIT_ATTR: &str = "__s_visit__";
 
-/// C++ `tvm::ffi::StructuralVisitorVTable` — the function table: one slot.
-#[repr(C)]
-pub struct StructuralVisitorVTable {
-    /// Visit callback (nullable in the ABI, never null on a live visitor).
-    pub visit: Option<FStructuralVisit>,
+extern "C" {
+    // Present in libtvm_ffi but not yet declared by the pinned tvm-ffi-sys.
+    fn TVMFFIGetTypeAttrColumn(attr_name: *const TVMFFIByteArray) -> *const TVMFFITypeAttrColumn;
 }
 
-/// Layout prefix of C++ `StructuralVisitorObj`:
-/// `{ Object (24B); const StructuralVisitorVTable* vtable_ (@24);
-///    TVMFFIDefRegionKind def_region_mode_ (@32) }`.
-/// `def_region_mode_` is written by C++ (`WithDefRegionKind`) during the
-/// reflected walk, hence the `Cell`.
+/// Layout prefix shared by C++ `ArrayObj` and `ListObj`:
+/// `Object + TVMFFISeqCell`.
 #[repr(C)]
-struct VisitorPrefix {
-    header: TVMFFIObject,
-    vtable: *const StructuralVisitorVTable,
-    def_region_mode: Cell<i32>,
+struct SeqPrefix {
+    _header: TVMFFIObject,
+    data: *const TVMFFIAny,
+    size: i64,
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<TVMFFIObject>() == 24);
-    assert!(std::mem::offset_of!(VisitorPrefix, vtable) == 24);
-    assert!(std::mem::offset_of!(VisitorPrefix, def_region_mode) == 32);
-    assert!(std::mem::size_of::<TVMFFIAny>() == 16);
+    assert!(std::mem::offset_of!(SeqPrefix, data) == 24);
+    assert!(std::mem::offset_of!(SeqPrefix, size) == 32);
 };
 
-// ---------------------------------------------------------------------------
-// Harvesting the default (reflected-recursion) visit function
-// ---------------------------------------------------------------------------
-
-/// The default `visit` implementation (C++ `StructuralVisitorObj::DispatchVisit`),
-/// read out of the vtable of a C++-constructed `ffi.StructuralVisitor`. This is
-/// the function that owns all recursion logic — `kStructuralVisit` container
-/// hooks, reflected-field walking, def-region scoping — and calls back into
-/// `visitor->vtable_->visit` (i.e. *our* table) for every child.
-///
-/// OnceLock (not LazyLock) so a panicking harvest — libtvm_ffi not fully set
-/// up yet — leaves the cell uninitialized and retries on the next walk instead
-/// of poisoning every future walk.
-static DEFAULT_VISIT: OnceLock<FStructuralVisit> = OnceLock::new();
-
-fn default_visit_fn() -> FStructuralVisit {
-    *DEFAULT_VISIT.get_or_init(|| unsafe { harvest_default_visit() })
-}
-
-unsafe fn harvest_default_visit() -> FStructuralVisit {
-    let sv_index = lookup_type_index("ffi.StructuralVisitor");
-    let probe = || -> (Any, *const VisitorPrefix) {
-        let mut v = call_packed_global("ffi.StructuralVisitor", &[]);
-        assert_eq!(
-            v.type_index(),
-            sv_index,
-            "ffi.StructuralVisitor() returned an unexpected type"
-        );
-        let raw = Any::as_data_ptr(&mut v);
-        let obj = (*raw).data_union.v_obj as *const VisitorPrefix;
-        (v, obj)
-    };
-    // Two independent instances must agree on the (static, immortal) vtable —
-    // a cheap runtime proof that `vtable_` really lives at offset 24.
-    let (_g1, p1) = probe();
-    let (_g2, p2) = probe();
-    let (vt1, vt2) = ((*p1).vtable, (*p2).vtable);
-    assert!(
-        !vt1.is_null() && vt1 == vt2,
-        "StructuralVisitorObj layout probe failed: vtable_ not at offset 24"
-    );
-    assert_eq!(
-        (*p1).def_region_mode.get(),
-        0,
-        "StructuralVisitorObj layout probe failed: def_region_mode_ not at offset 32"
-    );
-    (*vt1)
-        .visit
-        .expect("default StructuralVisitorVTable has a null visit slot")
-}
-
-// ---------------------------------------------------------------------------
-// The Rust callback visitor (a StructuralVisitorObj "subclass")
-// ---------------------------------------------------------------------------
-
-/// What the callback tells the traversal to do next, mirroring the C++
-/// `WalkResult` actions.
+/// What a callback asks the Rust walker to do with the current value.
 pub enum WalkResult {
-    /// Continue: on [`Phase::Enter`], visit this node's children.
+    /// Continue and visit this value's children.
     Advance,
-    /// On [`Phase::Enter`], skip this node's children (its [`Phase::Exit`]
-    /// call is skipped too). On [`Phase::Exit`] this is the same as `Advance`.
+    /// Continue without visiting this value's children or firing its exit hook.
     Skip,
-    /// Halt the entire traversal with a payload-less `ffi.VisitInterrupt`
-    /// (C++ `WalkResult::Interrupt()`; the payload channel is not bound yet).
+    /// Halt the entire traversal.
     Interrupt,
+    /// Halt the entire traversal and return a payload to the caller.
+    InterruptWith(Any),
 }
 
-/// Whether the callback fires before or after a value's children — pairing
-/// `Enter`/`Exit` of the same node gives scope tracking (e.g. a running
-/// product of enclosing loop extents) that a bare pre-order walk cannot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+impl WalkResult {
+    /// Halt traversal with an FFI-compatible payload.
+    pub fn interrupt_with<T: Into<Any>>(payload: T) -> Self {
+        Self::InterruptWith(payload.into())
+    }
+}
+
+/// Convert either an infallible or fallible typed handler result.
+///
+/// This keeps simple handlers terse while allowing a handler to return
+/// `tvm_ffi::error::Result<WalkResult>` and use `?`.
+pub trait IntoVisitResult {
+    fn into_visit_result(self) -> Result<WalkResult>;
+}
+
+impl IntoVisitResult for WalkResult {
+    fn into_visit_result(self) -> Result<WalkResult> {
+        Ok(self)
+    }
+}
+
+impl IntoVisitResult for Result<WalkResult> {
+    fn into_visit_result(self) -> Result<WalkResult> {
+        self
+    }
+}
+
+/// Whether a callback runs before or after a value's children.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// Before the value's children (the C++ pre-order callback position).
+    /// Before the value's children.
     Enter,
-    /// After the value's children (the C++ post-order callback position).
+    /// After the value's children.
     Exit,
 }
 
-/// A borrowed view of the value currently being visited (any field/element the
-/// reflected walk reaches: objects, ints, strings, FFI None, ...).
+/// Placement of generated typed handlers relative to child traversal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VisitOrder {
+    /// Run the typed handler before the current value's children.
+    #[default]
+    PreOrder,
+    /// Run the typed handler after the current value's children.
+    PostOrder,
+}
+
+/// Definition-region state active at the current value.
+///
+/// Reflected fields marked `SEqHashDefRecursive` or
+/// `SEqHashDefNonRecursive` override the inherited state for that field's
+/// complete recursive visit.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DefRegionKind {
+    /// The value is outside a definition region.
+    #[default]
+    None = 0,
+    /// Definitions apply recursively through the visited value.
+    Recursive = 1,
+    /// Definitions apply to the visited value using non-recursive semantics.
+    NonRecursive = 2,
+}
+
+/// Result of a completed Rust walk.
+///
+/// `Continue(())` means the whole graph was visited. `Break(payload)` means a
+/// handler interrupted it; a payload-less interrupt carries `ffi::None`.
+pub type VisitOutcome = ControlFlow<Any>;
+
+/// Fallible result returned by generated typed dispatch.
+pub type VisitResult = Result<WalkResult>;
+
+/// A borrowed view of a raw tvm-ffi value.
+///
+/// Generated visitors match this value without taking ownership: borrowed
+/// object-node handlers use [`VisitValue::as_node`], while POD or object-ref
+/// value handlers use [`VisitValue::cast`].
 #[repr(transparent)]
 pub struct VisitValue(TVMFFIAny);
 
 impl VisitValue {
-    /// Wrap a raw (borrowed) FFI value — lets the mutator engine reuse this
-    /// module's typed `cast` for its own function-table dispatch.
+    /// Wrap a raw borrowed FFI value.
     #[inline]
     pub(crate) fn from_raw(raw: TVMFFIAny) -> Self {
         VisitValue(raw)
     }
 
-    /// The FFI type index of the value (`0` == FFI None).
-    #[inline]
-    pub fn type_index(&self) -> i32 {
-        self.0.type_index
-    }
-
-    /// Convert the value into an owned reference-class handle `R` (`For`,
-    /// `IfThenElse`, `Stmt`, … — also PODs like `i64`): the typed counterpart
-    /// of C++ `AnyView::as<T>`. Subtypes match; FFI None never matches (the
-    /// underlying check is pointer-style). Costs one refcount increment on
-    /// success, in exchange for a handle that can be stored and cloned.
+    /// Convert the value into an owned typed handle.
     #[inline]
     pub fn cast<R: tvm_ffi::type_traits::AnyCompatible>(&self) -> Option<R> {
         unsafe {
@@ -211,11 +188,21 @@ impl VisitValue {
         }
     }
 
-    /// Borrow the value as node type `N` if it is one (or a subtype). Returns
-    /// `None` for FFI None and non-objects — the pointer-style type test, so
-    /// unset `Optional` fields can never match (unlike a nullable-ref test).
+    /// Runtime type index stored in this value.
     #[inline]
-    pub fn as_node<N: tvm_ffi::object::ObjectCore>(&self) -> Option<&N> {
+    pub fn type_index(&self) -> i32 {
+        self.0.type_index
+    }
+
+    /// Runtime type key, when this is a registered object value.
+    pub fn type_key(&self) -> Option<String> {
+        (self.0.type_index >= TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32)
+            .then(|| type_key_of(self.0.type_index))
+    }
+
+    /// Borrow the value as node type `N` if it is one of that type's instances.
+    #[inline]
+    pub fn as_node<N: ObjectCore>(&self) -> Option<&N> {
         if self.0.type_index < TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32 {
             return None;
         }
@@ -226,429 +213,948 @@ impl VisitValue {
     }
 }
 
-/// Hands the *visitor itself* to a [`structural_visit_manual`] callback, so it
-/// can drive child visits explicitly — the Rust face of calling
-/// `visitor->Visit(child)` / `DefaultVisit(value)` inside a C++
-/// `StructuralVisitorObj` subclass.
-pub struct ManualVisitCtx {
-    visitor: *mut c_void,
-    /// The value the callback is currently visiting.
-    current: TVMFFIAny,
-    /// A halt (owned `ffi.VisitInterrupt` or `ffi.Error`) raised by a manual
-    /// child visit, pending propagation by the trampoline.
-    halted: Option<TVMFFIAny>,
+enum NativeHalt {
+    Interrupt(Any),
+    Error(Error),
 }
 
-impl ManualVisitCtx {
-    /// Visit `child` right now, with full dispatch (the callback fires for the
-    /// whole subtree). Returns `false` when the walk has been halted (a
-    /// deeper callback returned [`WalkResult::Interrupt`], or the FFI side
-    /// failed) — stop doing work and return; the halt propagates automatically.
-    pub fn visit<T>(&mut self, child: &T) -> bool
-    where
-        for<'x> AnyView<'x>: From<&'x T>,
-    {
-        if self.halted.is_some() {
-            return false;
-        }
-        let view = [AnyView::from(child)];
-        let raw = unsafe { std::ptr::read(view.as_ptr() as *const TVMFFIAny) };
-        self.dispatch(raw)
-    }
-
-    /// Run the **default reflected recursion** over the current value's
-    /// children, right now — the equivalent of a C++ subclass calling
-    /// `DefaultVisit(value)` mid-body. Each child re-enters the callback.
-    /// Returns `false` when the walk has been halted.
-    pub fn visit_children(&mut self) -> bool {
-        if self.halted.is_some() {
-            return false;
-        }
-        let me = self.visitor as *const CallbackVisitor;
-        let state = unsafe {
-            active_callback_state(me).expect("manual visit context used outside its callback")
-        };
-        let ret = unsafe { ((*state).default_visit)(self.visitor, self.current) };
-        self.absorb(ret)
-    }
-
-    /// Dispatch `raw` through the visitor's function table.
-    fn dispatch(&mut self, raw: TVMFFIAny) -> bool {
-        let ret = unsafe { callback_visit(self.visitor, raw) };
-        self.absorb(ret)
-    }
-
-    /// Record a halt returned by a child visit; `true` == keep going.
-    fn absorb(&mut self, ret: TVMFFIAny) -> bool {
-        if ret.type_index == TVMFFITypeIndex::kTVMFFINone as i32 {
-            true
-        } else {
-            self.halted = Some(ret);
-            false
-        }
+impl From<Error> for NativeHalt {
+    fn from(error: Error) -> Self {
+        NativeHalt::Error(error)
     }
 }
 
-/// The uniform callback shape both entry points lower to. `Fn` (not `FnMut`)
-/// because [`ManualVisitCtx::visit`] re-enters the callback while an outer call is
-/// still on the stack — re-entrancy needs a shared-ref callable; mutable
-/// callback state goes in `Cell`s (≈ a C++ `const` method with `mutable`
-/// members).
-type DynCallback<'a> = &'a dyn Fn(&VisitValue, Phase, &mut ManualVisitCtx) -> WalkResult;
+type NativeResult = std::result::Result<(), NativeHalt>;
 
-/// The borrowed callback frame of one active driver call.  It lives on the
-/// Rust stack and is reachable only while [`CallbackVisitor::active_state`]
-/// is non-null.
-struct ActiveCallbackState<'a> {
-    callback: DynCallback<'a>,
-    default_visit: FStructuralVisit,
-    panic: Option<Box<dyn std::any::Any + Send + 'static>>,
-}
-
-/// The C++-visible visitor object.  It is heap allocated and follows the
-/// tvm-ffi strong/weak reference-count protocol, so an FFI structural hook may
-/// retain its handle without retaining borrowed Rust callback state.
-#[repr(C)]
-struct CallbackVisitor {
-    prefix: VisitorPrefix,
-    active_state: Cell<*mut c_void>,
-    /// A pre-built payload-less `ffi.VisitInterrupt`, constructed in [`drive`]
-    /// (a caught region) so the extern "C" paths below only ever *clone* it —
-    /// a refcount increment that cannot fail — instead of calling into the FFI
-    /// registry from a frame where a panic would abort the host process.  The
-    /// wrapper permits strong destruction and weak deallocation to be split.
-    interrupt_proto: ManuallyDrop<Any>,
-}
-
-const _: () = assert!(std::mem::offset_of!(CallbackVisitor, prefix) == 0);
-
-unsafe extern "C" fn callback_visitor_deleter(self_ptr: *mut c_void, flags: i32) {
-    let me = self_ptr as *mut CallbackVisitor;
-    if flags & kTVMFFIObjectDeleterFlagBitMaskStrong as i32 != 0 {
-        ManuallyDrop::drop(&mut (*me).interrupt_proto);
-    }
-    if flags & kTVMFFIObjectDeleterFlagBitMaskWeak as i32 != 0 {
-        drop(Box::from_raw(me));
-    }
-}
-
-unsafe fn active_callback_state<'a>(
-    me: *const CallbackVisitor,
-) -> Option<*mut ActiveCallbackState<'a>> {
-    let state = (*me).active_state.get();
-    (!state.is_null()).then_some(state.cast())
-}
-
-/// The single function-table entry of the Rust visitor. Re-entered for every
-/// child (by the default chain and by [`ManualVisitCtx::visit`]); each frame only
-/// takes short-lived reborrows through the raw `me` pointer.
-unsafe extern "C" fn callback_visit(visitor: *mut c_void, value: TVMFFIAny) -> TVMFFIAny {
-    let me = visitor as *mut CallbackVisitor;
-    let Some(state) = active_callback_state(me) else {
-        return make_interrupt_raw(me);
-    };
-    // The C++ walk visitor short-circuits FFI None without invoking callbacks.
-    if value.type_index == TVMFFITypeIndex::kTVMFFINone as i32 {
-        return TVMFFIAny::new();
-    }
-    let view = VisitValue(value);
-    let mut ctx = ManualVisitCtx {
-        visitor,
-        current: value,
-        halted: None,
-    };
-
-    match catch_unwind(AssertUnwindSafe(|| {
-        ((*state).callback)(&view, Phase::Enter, &mut ctx)
-    })) {
-        Ok(flow) => {
-            // A halt raised by a manual child visit outranks the flow verdict.
-            if let Some(halt) = ctx.halted.take() {
-                return halt;
-            }
-            match flow {
-                WalkResult::Advance => {}
-                WalkResult::Skip => return TVMFFIAny::new(),
-                WalkResult::Interrupt => return make_interrupt_raw(me),
-            }
-        }
-        Err(p) => {
-            stash_first_panic(state, p);
-            release_raw_any_opt(ctx.halted.take());
-            return make_interrupt_raw(me);
-        }
-    }
-
-    // Chain to tvm-ffi's default visit: reflected recursion into children.
-    let ret = ((*state).default_visit)(visitor, value);
-    if ret.type_index != TVMFFITypeIndex::kTVMFFINone as i32 {
-        return ret; // owned VisitInterrupt or Error — forward as-is
-    }
-
-    match catch_unwind(AssertUnwindSafe(|| {
-        ((*state).callback)(&view, Phase::Exit, &mut ctx)
-    })) {
-        Ok(flow) => {
-            if let Some(halt) = ctx.halted.take() {
-                return halt;
-            }
-            match flow {
-                WalkResult::Interrupt => make_interrupt_raw(me),
-                _ => TVMFFIAny::new(),
-            }
-        }
-        Err(p) => {
-            stash_first_panic(state, p);
-            release_raw_any_opt(ctx.halted.take());
-            make_interrupt_raw(me)
-        }
-    }
-}
-
-/// Preserve the first panic from a recursively re-entered callback.  A later
-/// payload is destroyed inside another caught Rust region, never by unwinding
-/// through the C ABI frame.
-unsafe fn stash_first_panic(
-    state: *mut ActiveCallbackState<'_>,
-    panic: Box<dyn std::any::Any + Send + 'static>,
-) {
-    if (*state).panic.is_none() {
-        (*state).panic = Some(panic);
-    } else if let Err(destructor_panic) = catch_unwind(AssertUnwindSafe(|| drop(panic))) {
-        std::mem::forget(destructor_panic);
-    }
-}
-
-/// A payload-less `ffi.VisitInterrupt` as an owned raw `TVMFFIAny`: a clone
-/// (refcount inc) of the prototype [`drive`] built up front — infallible, as
-/// required inside the extern "C" callback.
-unsafe fn make_interrupt_raw(me: *const CallbackVisitor) -> TVMFFIAny {
-    Any::into_raw_ffi_any((&*(*me).interrupt_proto).clone())
-}
-
-// ---------------------------------------------------------------------------
-// Entry points
-// ---------------------------------------------------------------------------
-
-/// Structurally visit every value reachable from `root`, in the same order and
-/// with the same coverage as C++ `StructuralWalk` (reflected fields, arrays,
-/// maps; fields marked SEqHash-ignored are skipped).
+/// Typed dispatch implemented by the visitor object itself.
 ///
-/// The callback runs twice per value — [`Phase::Enter`] before its children
-/// and [`Phase::Exit`] after them (`Exit` is skipped when `Enter` returned
-/// [`WalkResult::Skip`]) — and steers the walk via [`WalkResult`].
-///
-/// Returns `Ok(None)` when the walk completed, `Ok(Some(interrupt))` when the
-/// callback returned [`WalkResult::Interrupt`] (the owned `ffi.VisitInterrupt`),
-/// or the FFI error if the C++ side failed. A panic in the callback halts the
-/// walk and resumes unwinding here.
-pub fn walk<R>(
-    root: &R,
-    callback: impl FnMut(&VisitValue, Phase) -> WalkResult,
-) -> Result<Option<Any>, tvm_ffi::error::Error>
-where
-    for<'x> AnyView<'x>: From<&'x R>,
-{
-    // Plain walks never re-enter the callback (they don't use the ctx), so an
-    // `FnMut` is fine — adapt it to the re-entrant `Fn` shape via `RefCell`.
-    let callback = RefCell::new(callback);
-    drive(root, &move |v: &VisitValue,
-                       phase: Phase,
-                       _ctx: &mut ManualVisitCtx| {
-        (callback.borrow_mut())(v, phase)
-    })
-}
-
-/// The *visitor* variant of [`walk`]: the callback also receives a
-/// [`ManualVisitCtx`] and can take **full control of a node's visit order** by
-/// visiting chosen children explicitly and returning [`WalkResult::Skip`].
-/// This mirrors subclassing C++ `StructuralVisitorObj` and calling
-/// `visitor->Visit(child)` from the overridden visit. Because `ctx.visit`
-/// **re-enters** the callback while an outer call is still running, the
-/// callback must be `Fn`; keep its mutable state in `Cell`s/`RefCell`s.
-pub fn structural_visit_manual<R>(
-    root: &R,
-    callback: impl Fn(&VisitValue, Phase, &mut ManualVisitCtx) -> WalkResult,
-) -> Result<Option<Any>, tvm_ffi::error::Error>
-where
-    for<'x> AnyView<'x>: From<&'x R>,
-{
-    drive(root, &callback)
-}
-
-/// Shared driver: allocate a ref-counted FFI visitor around one stack-local
-/// callback frame, run the walk, then translate its ABI result.
-fn drive<R>(root: &R, callback: DynCallback) -> Result<Option<Any>, tvm_ffi::error::Error>
-where
-    for<'x> AnyView<'x>: From<&'x R>,
-{
-    static VTABLE: StructuralVisitorVTable = StructuralVisitorVTable {
-        visit: Some(callback_visit),
-    };
-    let mut state = ActiveCallbackState {
-        callback,
-        default_visit: default_visit_fn(),
-        panic: None,
-    };
-    // Pre-build the interrupt prototype here, where an ffi failure is still a
-    // clean `Err` — the callback clones it instead of calling the registry.
-    let interrupt_proto =
-        Function::get_global("ffi.VisitInterrupt")?.call_packed(&[AnyView::new()])?;
-
-    let vis = Box::new(CallbackVisitor {
-        prefix: VisitorPrefix {
-            header: TVMFFIObject {
-                combined_ref_count: AtomicU64::new(COMBINED_REF_COUNT_BOTH_ONE),
-                type_index: lookup_type_index("ffi.StructuralVisitor"),
-                __padding: 0,
-                deleter: Some(callback_visitor_deleter),
-            },
-            vtable: &VTABLE,
-            def_region_mode: Cell::new(0),
-        },
-        active_state: Cell::new((&mut state as *mut ActiveCallbackState<'_>).cast()),
-        interrupt_proto: ManuallyDrop::new(interrupt_proto),
-    });
-    let visitor = Box::into_raw(vis);
-    // Consume the allocation's initial strong reference.  A hook may retain
-    // another one; after this owner drops such a handle remains valid but inert.
-    let visitor_owner = unsafe { Any::from_raw_ffi_any(borrowed_object_raw(visitor.cast())) };
-
-    // Root as a borrowed AnyView cell (AnyView is layout-identical to
-    // TVMFFIAny — the same cast `Function::call_packed` relies on).
-    let root_view = [AnyView::from(root)];
-    let root_raw = unsafe { std::ptr::read(root_view.as_ptr() as *const TVMFFIAny) };
-
-    let ret = unsafe { callback_visit(visitor.cast(), root_raw) };
-    // No retained handle may observe the borrowed callback frame after this.
-    unsafe { (*visitor).active_state.set(std::ptr::null_mut()) };
-
-    if let Some(p) = state.panic.take() {
-        release_raw_any(ret);
-        drop(visitor_owner);
-        resume_unwind(p);
-    }
-    drop(visitor_owner);
-    if ret.type_index == TVMFFITypeIndex::kTVMFFINone as i32 {
-        return Ok(None);
-    }
-    let any = unsafe { Any::from_raw_ffi_any(ret) };
-    if any.type_index() == TVMFFITypeIndex::kTVMFFIError as i32 {
-        Err(tvm_ffi::error::Error::try_from(any).expect("ffi.Error cast cannot fail"))
-    } else {
-        Ok(Some(any))
-    }
-}
-
-/// Make a non-owning raw Any cell for an object handle owned elsewhere.
-unsafe fn borrowed_object_raw(handle: *mut c_void) -> TVMFFIAny {
-    let object = handle as *mut TVMFFIObject;
-    let mut raw = TVMFFIAny::new();
-    raw.type_index = (*object).type_index;
-    raw.data_union.v_obj = object;
-    raw
-}
-
-/// Drop an owned raw `TVMFFIAny` (releases the strong ref if it holds one).
-fn release_raw_any(raw: TVMFFIAny) {
-    if raw.type_index >= TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32 {
-        drop(unsafe { Any::from_raw_ffi_any(raw) });
-    }
-}
-
-fn release_raw_any_opt(raw: Option<TVMFFIAny>) {
-    if let Some(raw) = raw {
-        release_raw_any(raw);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stateful typed dispatch
-// ---------------------------------------------------------------------------
-
-/// Typed dispatch implemented by the pass object itself.  The dispatch macro
-/// generates this method from its `visit_*` methods in source order.
+/// The dispatch macro tests the impl's `visit_*` methods in source order.
+/// Borrowed node arguments use refcount-free subtype checks, owned
+/// FFI-compatible arguments use exact value casts, and `&VisitValue` is a
+/// catch-all. `None` asks the Rust walker to continue normally.
 pub trait VisitDispatch: Sized {
-    /// `Some` means a typed handler claimed `value`; `None` falls through to
-    /// the default reflected recursion.
-    fn dispatch_visit(
-        &mut self,
-        value: &VisitValue,
-        ctx: &mut VisitCtx<'_, Self>,
-    ) -> Option<WalkResult>;
+    fn dispatch_visit(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>)
+        -> Option<VisitResult>;
 }
 
-/// The typed context passed to a stateful visitor handler.
+/// Recursive traversal access passed to a typed handler.
 ///
-/// It deliberately holds no `&mut V`.  A handler supplies its current
-/// `&mut self` to [`VisitCtx::visit`], making recursive traversal an ordinary
-/// checked mutable reborrow.
-pub struct VisitCtx<'a, V> {
-    raw: &'a mut ManualVisitCtx,
-    active: &'a Cell<*mut V>,
+/// The context contains the walker, not the visitor.  A handler lends its
+/// current `&mut self` back to [`VisitCtx::visit`], so nested traversal is an
+/// ordinary checked Rust reborrow and needs no raw visitor pointer.
+pub struct VisitCtx<'a> {
+    walker: &'a NativeWalker,
+    order: VisitOrder,
+    def_region_kind: DefRegionKind,
+    halted: Option<NativeHalt>,
 }
 
-/// Restore the active reborrow even if conversion of `child` panics before the
-/// nested callback trampoline is entered.
-struct RestoreActive<'a, V> {
-    active: &'a Cell<*mut V>,
-    previous: *mut V,
-}
-
-impl<V> Drop for RestoreActive<'_, V> {
-    fn drop(&mut self) {
-        self.active.set(self.previous);
+impl VisitCtx<'_> {
+    /// Return the definition-region state active at the current node.
+    pub fn def_region_kind(&self) -> DefRegionKind {
+        self.def_region_kind
     }
-}
 
-impl<V> VisitCtx<'_, V> {
     /// Visit `child` immediately with the same typed dispatcher.
-    ///
-    /// The pointer installed in `active` is derived from this call's
-    /// `visitor: &mut V`; the outer handler cannot use its `&mut self` again
-    /// until this reborrow and the nested traversal have returned.
-    pub fn visit<T>(&mut self, visitor: &mut V, child: &T) -> bool
+    pub fn visit<V, T>(&mut self, visitor: &mut V, child: &T) -> bool
     where
+        V: VisitDispatch,
         for<'x> AnyView<'x>: From<&'x T>,
     {
-        let active = self.active;
-        let previous = active.replace(std::ptr::from_mut(visitor));
-        let _restore = RestoreActive { active, previous };
-        self.raw.visit(child)
+        self.visit_with_def_region(visitor, child, self.def_region_kind)
+    }
+
+    /// Visit `child` under an explicitly selected definition-region state.
+    ///
+    /// The override is scoped to this recursive call. The current context is
+    /// unchanged after success, error, or interruption.
+    pub fn visit_with_def_region<V, T>(
+        &mut self,
+        visitor: &mut V,
+        child: &T,
+        def_region_kind: DefRegionKind,
+    ) -> bool
+    where
+        V: VisitDispatch,
+        for<'x> AnyView<'x>: From<&'x T>,
+    {
+        if self.halted.is_some() {
+            return false;
+        }
+        let mut dispatch = DispatchVisitor {
+            visitor,
+            order: self.order,
+        };
+        let result =
+            self.walker
+                .visit_raw(raw_of(AnyView::from(child)), &mut dispatch, def_region_kind);
+        self.absorb(result)
+    }
+
+    fn absorb(&mut self, result: NativeResult) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(halt) => {
+                self.halted = Some(halt);
+                false
+            }
+        }
     }
 }
 
-/// Visit `root` with mutable state and typed handlers stored in `visitor`.
-///
-/// The shared `Cell` is only a lending slot: every pointer placed in it comes
-/// from the top-level exclusive borrow or from a recursive `ctx.visit` reborrow.
-/// The upstream visitor contract forbids overlapping traversals through one
-/// handle; synchronous recursive calls are supported.
-pub fn structural_visit<R, V>(
-    root: &R,
-    visitor: &mut V,
-) -> Result<Option<Any>, tvm_ffi::error::Error>
+trait NativeVisit {
+    fn order(&self) -> VisitOrder {
+        VisitOrder::PreOrder
+    }
+
+    fn enter(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult>;
+
+    fn exit(&mut self, _value: &VisitValue, _ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
+        Ok(WalkResult::Advance)
+    }
+}
+
+struct DispatchVisitor<'a, V> {
+    visitor: &'a mut V,
+    order: VisitOrder,
+}
+
+impl<V: VisitDispatch> NativeVisit for DispatchVisitor<'_, V> {
+    fn order(&self) -> VisitOrder {
+        self.order
+    }
+
+    fn enter(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
+        match self.order {
+            VisitOrder::PreOrder => self
+                .visitor
+                .dispatch_visit(value, ctx)
+                .unwrap_or(Ok(WalkResult::Advance)),
+            VisitOrder::PostOrder => Ok(WalkResult::Advance),
+        }
+    }
+
+    fn exit(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
+        match self.order {
+            VisitOrder::PreOrder => Ok(WalkResult::Advance),
+            VisitOrder::PostOrder => self
+                .visitor
+                .dispatch_visit(value, ctx)
+                .unwrap_or(Ok(WalkResult::Advance)),
+        }
+    }
+}
+
+struct CallbackVisitor<F>(F);
+
+impl<F> NativeVisit for CallbackVisitor<F>
+where
+    F: FnMut(&VisitValue, Phase, DefRegionKind) -> Result<WalkResult>,
+{
+    fn enter(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
+        (self.0)(value, Phase::Enter, ctx.def_region_kind())
+    }
+
+    fn exit(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
+        (self.0)(value, Phase::Exit, ctx.def_region_kind())
+    }
+}
+
+/// Stateless Rust recursion engine.
+struct NativeWalker;
+
+impl NativeWalker {
+    fn visit_raw<V: NativeVisit>(
+        &self,
+        value: TVMFFIAny,
+        visitor: &mut V,
+        def_region_kind: DefRegionKind,
+    ) -> NativeResult {
+        if value.type_index == TVMFFITypeIndex::kTVMFFINone as i32 {
+            return Ok(());
+        }
+
+        let visit_value = VisitValue::from_raw(value);
+        let mut ctx = VisitCtx {
+            walker: self,
+            order: visitor.order(),
+            def_region_kind,
+            halted: None,
+        };
+        let enter = match visitor.enter(&visit_value, &mut ctx) {
+            Ok(flow) => flow,
+            Err(error) => return Err(self.with_value_context(error.into(), value)),
+        };
+        if let Some(halt) = ctx.halted.take() {
+            return Err(self.with_value_context(halt, value));
+        }
+        match enter {
+            WalkResult::Advance => {}
+            WalkResult::Skip => return Ok(()),
+            WalkResult::Interrupt => return Err(NativeHalt::Interrupt(Any::new())),
+            WalkResult::InterruptWith(payload) => return Err(NativeHalt::Interrupt(payload)),
+        }
+
+        if let Err(halt) = self.visit_children_raw(value, visitor, def_region_kind) {
+            return Err(self.with_value_context(halt, value));
+        }
+
+        let exit = match visitor.exit(&visit_value, &mut ctx) {
+            Ok(flow) => flow,
+            Err(error) => return Err(self.with_value_context(error.into(), value)),
+        };
+        if let Some(halt) = ctx.halted.take() {
+            return Err(self.with_value_context(halt, value));
+        }
+        match exit {
+            WalkResult::Interrupt => Err(NativeHalt::Interrupt(Any::new())),
+            WalkResult::InterruptWith(payload) => Err(NativeHalt::Interrupt(payload)),
+            WalkResult::Advance | WalkResult::Skip => Ok(()),
+        }
+    }
+
+    fn visit_children_raw<V: NativeVisit>(
+        &self,
+        value: TVMFFIAny,
+        visitor: &mut V,
+        def_region_kind: DefRegionKind,
+    ) -> NativeResult {
+        match value.type_index {
+            x if x == TVMFFITypeIndex::kTVMFFIArray as i32 || x == TYPE_LIST => {
+                self.visit_sequence(value, visitor, def_region_kind)
+            }
+            x if x == TVMFFITypeIndex::kTVMFFIMap as i32 || x == TYPE_DICT => {
+                self.visit_map(value, visitor, def_region_kind)
+            }
+            x if x < TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32 => Ok(()),
+            _ => self.visit_reflected_fields(value, visitor, def_region_kind),
+        }
+    }
+
+    fn visit_sequence<V: NativeVisit>(
+        &self,
+        value: TVMFFIAny,
+        visitor: &mut V,
+        def_region_kind: DefRegionKind,
+    ) -> NativeResult {
+        let seq = unsafe { &*(value.data_union.v_obj as *const SeqPrefix) };
+        if seq.size < 0 {
+            return Err(runtime_error("native visitor: sequence reports a negative size").into());
+        }
+        if seq.data.is_null() && seq.size != 0 {
+            return Err(runtime_error(
+                "native visitor: non-empty sequence has a null data pointer",
+            )
+            .into());
+        }
+        let size = usize::try_from(seq.size)
+            .map_err(|_| runtime_error("native visitor: sequence size does not fit usize"))?;
+        if size == 0 {
+            return Ok(());
+        }
+
+        if value.type_index == TYPE_LIST {
+            // List storage may be invalidated by a re-entrant callback.  Own a
+            // snapshot before running the first callback.
+            let children: Vec<Any> = {
+                let cells = unsafe { std::slice::from_raw_parts(seq.data, size) };
+                cells
+                    .iter()
+                    .map(|cell| Any::from(unsafe { view_of(cell) }))
+                    .collect()
+            };
+            for (index, mut child) in children.into_iter().enumerate() {
+                let raw = unsafe { *Any::as_data_ptr(&mut child) };
+                self.visit_raw(raw, visitor, def_region_kind)
+                    .map_err(|halt| {
+                        with_error_context(halt, &format!("sequence item [{index}]"))
+                    })?;
+            }
+            return Ok(());
+        }
+
+        // Array is immutable, so its element cells remain stable throughout
+        // recursive callbacks and need no refcounted snapshot.
+        let cells = unsafe { std::slice::from_raw_parts(seq.data, size) };
+        for (index, child) in cells.iter().enumerate() {
+            self.visit_raw(*child, visitor, def_region_kind)
+                .map_err(|halt| with_error_context(halt, &format!("sequence item [{index}]")))?;
+        }
+        Ok(())
+    }
+
+    fn visit_map<V: NativeVisit>(
+        &self,
+        value: TVMFFIAny,
+        visitor: &mut V,
+        def_region_kind: DefRegionKind,
+    ) -> NativeResult {
+        // Map storage is private C++.  The Rust binding itself uses these
+        // public iterator functors; using them here does not invoke structural
+        // visiting or transfer traversal control out of Rust.
+        let is_dict = value.type_index == TYPE_DICT;
+        let (size_name, iter_name) = if is_dict {
+            ("ffi.DictSize", "ffi.DictForwardIterFunctor")
+        } else {
+            ("ffi.MapSize", "ffi.MapForwardIterFunctor")
+        };
+        let size = Function::get_global(size_name)?
+            .call_packed(&[unsafe { view_of(&value) }])
+            .and_then(i64::try_from)?;
+        if size < 0 {
+            return Err(runtime_error("native visitor: map reports a negative size").into());
+        }
+        let size = usize::try_from(size)
+            .map_err(|_| runtime_error("native visitor: map size does not fit usize"))?;
+        if size == 0 {
+            return Ok(());
+        }
+
+        let iter_any =
+            Function::get_global(iter_name)?.call_packed(&[unsafe { view_of(&value) }])?;
+        let iter = Function::try_from(iter_any)?;
+
+        if is_dict {
+            // Dict mutation invalidates its iterator, so snapshot all entries
+            // before dispatching to user code.
+            let mut entries = Vec::with_capacity(size);
+            for index in 0..size {
+                let key = iter.call_packed(&[AnyView::from(&0i64)])?;
+                let map_value = iter.call_packed(&[AnyView::from(&1i64)])?;
+                entries.push((key, map_value));
+                if index + 1 != size {
+                    iter.call_packed(&[AnyView::from(&2i64)])?;
+                }
+            }
+
+            for (index, (mut key, mut map_value)) in entries.into_iter().enumerate() {
+                let key_raw = unsafe { *Any::as_data_ptr(&mut key) };
+                self.visit_raw(key_raw, visitor, def_region_kind)
+                    .map_err(|halt| with_error_context(halt, &format!("dict key [{index}]")))?;
+                let value_raw = unsafe { *Any::as_data_ptr(&mut map_value) };
+                self.visit_raw(value_raw, visitor, def_region_kind)
+                    .map_err(|halt| with_error_context(halt, &format!("dict value [{index}]")))?;
+            }
+            return Ok(());
+        }
+
+        // Map is immutable.  Retain only the current owned key/value pair.
+        for index in 0..size {
+            let mut key = iter.call_packed(&[AnyView::from(&0i64)])?;
+            let mut map_value = iter.call_packed(&[AnyView::from(&1i64)])?;
+            let key_raw = unsafe { *Any::as_data_ptr(&mut key) };
+            self.visit_raw(key_raw, visitor, def_region_kind)
+                .map_err(|halt| with_error_context(halt, &format!("map key [{index}]")))?;
+            let value_raw = unsafe { *Any::as_data_ptr(&mut map_value) };
+            self.visit_raw(value_raw, visitor, def_region_kind)
+                .map_err(|halt| with_error_context(halt, &format!("map value [{index}]")))?;
+            if index + 1 != size {
+                iter.call_packed(&[AnyView::from(&2i64)])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_reflected_fields<V: NativeVisit>(
+        &self,
+        value: TVMFFIAny,
+        visitor: &mut V,
+        def_region_kind: DefRegionKind,
+    ) -> NativeResult {
+        if unsafe { TVMFFIGetTypeInfo(value.type_index) }.is_null() {
+            return Err(runtime_error(&format!(
+                "native visitor: unregistered type index {}",
+                value.type_index
+            ))
+            .into());
+        }
+        if foreign_structural_visit_attr(value.type_index).is_some() {
+            return Err(runtime_error(&format!(
+                "native visitor: type `{}` registers foreign `{STRUCTURAL_VISIT_ATTR}`; \
+                 use a matching pre-order Rust handler, visit its children through `VisitCtx`, \
+                 and return `WalkResult::Skip`",
+                type_key_of(value.type_index)
+            ))
+            .into());
+        }
+
+        let object = unsafe { value.data_union.v_obj } as *mut u8;
+        let halted = unsafe {
+            for_each_field(value.type_index, |field| {
+                if field.flags & FLAG_SEQ_HASH_IGNORE != 0 {
+                    return ControlFlow::Continue(());
+                }
+
+                let Some(getter) = field.getter else {
+                    return ControlFlow::Break(NativeHalt::Error(runtime_error(&format!(
+                        "native visitor: reflected field `{}` has no getter",
+                        field.name.as_str()
+                    ))));
+                };
+                let address = object.offset(field.offset as isize) as *mut c_void;
+                let mut child_raw = TVMFFIAny::new();
+                if getter(address, &mut child_raw) != 0 {
+                    return ControlFlow::Break(with_error_context(
+                        NativeHalt::Error(Error::from_raised()),
+                        &format!("field `{}`", field.name.as_str()),
+                    ));
+                }
+
+                // A reflection getter returns an owned Any.  Keep it alive
+                // while the recursive walk borrows its raw cell.
+                let mut child = Any::from_raw_ffi_any(child_raw);
+                let borrowed = *Any::as_data_ptr(&mut child);
+                let child_region = field_def_region(field, def_region_kind);
+                match self.visit_raw(borrowed, visitor, child_region) {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(halt) => ControlFlow::Break(with_error_context(
+                        halt,
+                        &format!("field `{}`", field.name.as_str()),
+                    )),
+                }
+            })
+        };
+        halted.map_or(Ok(()), Err)
+    }
+
+    fn with_value_context(&self, halt: NativeHalt, value: TVMFFIAny) -> NativeHalt {
+        if value.type_index < TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32 {
+            halt
+        } else {
+            with_error_context(halt, &format!("object `{}`", type_key_of(value.type_index)))
+        }
+    }
+}
+
+/// Visit `root` in pre-order with typed handlers stored in `visitor`.
+pub fn structural_visit<R, V>(root: &R, visitor: &mut V) -> Result<VisitOutcome>
 where
     V: VisitDispatch,
     for<'x> AnyView<'x>: From<&'x R>,
 {
-    let active = Cell::new(std::ptr::from_mut(visitor));
-    structural_visit_manual(root, |value, phase, raw| {
-        if phase == Phase::Exit {
-            return WalkResult::Advance;
+    structural_visit_ordered(root, visitor, VisitOrder::PreOrder)
+}
+
+/// Visit `root` with typed handlers placed according to `order`.
+pub fn structural_visit_ordered<R, V>(
+    root: &R,
+    visitor: &mut V,
+    order: VisitOrder,
+) -> Result<VisitOutcome>
+where
+    V: VisitDispatch,
+    for<'x> AnyView<'x>: From<&'x R>,
+{
+    let walker = NativeWalker;
+    let mut dispatch = DispatchVisitor { visitor, order };
+    finish(walker.visit_raw(
+        raw_of(AnyView::from(root)),
+        &mut dispatch,
+        DefRegionKind::None,
+    ))
+}
+
+/// Native pre/post walk used by analyses that need to observe every raw value.
+pub fn walk<R>(
+    root: &R,
+    callback: impl FnMut(&VisitValue, Phase) -> WalkResult,
+) -> Result<VisitOutcome>
+where
+    for<'x> AnyView<'x>: From<&'x R>,
+{
+    let mut callback = callback;
+    walk_with_context(root, move |value, phase, _def_region_kind| {
+        callback(value, phase)
+    })
+}
+
+/// Native pre/post walk whose callback also receives definition-region state.
+pub fn walk_with_context<R>(
+    root: &R,
+    callback: impl FnMut(&VisitValue, Phase, DefRegionKind) -> WalkResult,
+) -> Result<VisitOutcome>
+where
+    for<'x> AnyView<'x>: From<&'x R>,
+{
+    let mut callback = callback;
+    try_walk_with_context(root, move |value, phase, def_region_kind| {
+        Ok(callback(value, phase, def_region_kind))
+    })
+}
+
+/// Fallible native pre/post walk with definition-region state.
+pub fn try_walk_with_context<R>(
+    root: &R,
+    callback: impl FnMut(&VisitValue, Phase, DefRegionKind) -> Result<WalkResult>,
+) -> Result<VisitOutcome>
+where
+    for<'x> AnyView<'x>: From<&'x R>,
+{
+    let walker = NativeWalker;
+    let mut callback = CallbackVisitor(callback);
+    finish(walker.visit_raw(
+        raw_of(AnyView::from(root)),
+        &mut callback,
+        DefRegionKind::None,
+    ))
+}
+
+fn finish(result: NativeResult) -> Result<VisitOutcome> {
+    match result {
+        Ok(()) => Ok(ControlFlow::Continue(())),
+        Err(NativeHalt::Error(error)) => Err(error),
+        Err(NativeHalt::Interrupt(payload)) => Ok(ControlFlow::Break(payload)),
+    }
+}
+
+fn field_def_region(field: &TVMFFIFieldInfo, inherited: DefRegionKind) -> DefRegionKind {
+    if field.flags & FLAG_SEQ_HASH_DEF_NON_RECURSIVE != 0 {
+        DefRegionKind::NonRecursive
+    } else if field.flags & FLAG_SEQ_HASH_DEF_RECURSIVE != 0 {
+        DefRegionKind::Recursive
+    } else {
+        inherited
+    }
+}
+
+fn foreign_structural_visit_attr(type_index: i32) -> Option<i32> {
+    unsafe {
+        let attr_name = TVMFFIByteArray::from_str(STRUCTURAL_VISIT_ATTR);
+        // Resolve the column for each query because later type registrations
+        // may reallocate its backing array.
+        let column = TVMFFIGetTypeAttrColumn(&attr_name);
+        if column.is_null() || (*column).data.is_null() {
+            return None;
+        }
+        let index = type_index - (*column).begin_index;
+        if index < 0 || index >= (*column).size {
+            return None;
+        }
+        let attr = *(*column).data.offset(index as isize);
+        (attr.type_index != TVMFFITypeIndex::kTVMFFINone as i32).then_some(attr.type_index)
+    }
+}
+
+fn with_error_context(halt: NativeHalt, frame: &str) -> NativeHalt {
+    match halt {
+        NativeHalt::Error(error) => NativeHalt::Error(Error::with_appended_backtrace(
+            error,
+            &format!("[native structural visit] {frame}\n"),
+        )),
+        interrupt => interrupt,
+    }
+}
+
+fn type_key_of(type_index: i32) -> String {
+    unsafe {
+        let info = TVMFFIGetTypeInfo(type_index);
+        if info.is_null() {
+            format!("<type_index {type_index}>")
+        } else {
+            (*info).type_key.as_str().to_string()
+        }
+    }
+}
+
+fn runtime_error(message: &str) -> Error {
+    Error::new(RUNTIME_ERROR, message, "")
+}
+
+fn raw_of(view: AnyView) -> TVMFFIAny {
+    unsafe { std::ptr::read(&view as *const AnyView as *const TVMFFIAny) }
+}
+
+unsafe fn view_of(raw: &TVMFFIAny) -> AnyView<'_> {
+    std::ptr::read(raw as *const TVMFFIAny as *const AnyView)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tvm_ffi::{Array, Map, Shape, String as FfiString};
+
+    extern "C" {
+        fn TVMFFITypeRegisterAttr(
+            type_index: i32,
+            attr_name: *const TVMFFIByteArray,
+            attr_value: *const TVMFFIAny,
+        ) -> i32;
+    }
+
+    struct RegionProbe(Vec<DefRegionKind>);
+
+    impl NativeVisit for RegionProbe {
+        fn enter(&mut self, _value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
+            self.0.push(ctx.def_region_kind());
+            Ok(WalkResult::Advance)
+        }
+    }
+
+    #[test]
+    fn def_region_is_inherited_through_containers() {
+        let root = Array::new(vec![1i64, 2]);
+        let walker = NativeWalker;
+        let mut probe = RegionProbe(Vec::new());
+        assert!(walker
+            .visit_raw(
+                raw_of(AnyView::from(&root)),
+                &mut probe,
+                DefRegionKind::Recursive,
+            )
+            .is_ok());
+        assert_eq!(probe.0, vec![DefRegionKind::Recursive; 3]);
+    }
+
+    #[test]
+    fn reflected_field_flags_override_or_inherit_def_region() {
+        let mut field: TVMFFIFieldInfo = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            field_def_region(&field, DefRegionKind::Recursive),
+            DefRegionKind::Recursive
+        );
+
+        field.flags = FLAG_SEQ_HASH_DEF_NON_RECURSIVE;
+        assert_eq!(
+            field_def_region(&field, DefRegionKind::Recursive),
+            DefRegionKind::NonRecursive
+        );
+
+        field.flags = FLAG_SEQ_HASH_DEF_RECURSIVE;
+        assert_eq!(
+            field_def_region(&field, DefRegionKind::NonRecursive),
+            DefRegionKind::Recursive
+        );
+    }
+
+    #[test]
+    fn plain_walk_uses_native_sequence_fallback() {
+        let root = Array::new(vec![1i64, 2, 3]);
+        let mut integers = 0;
+        assert!(walk(&root, |value, phase| {
+            if phase == Phase::Enter && value.cast::<i64>().is_some() {
+                integers += 1;
+            }
+            WalkResult::Advance
+        })
+        .unwrap()
+        .is_continue());
+        assert_eq!(integers, 3);
+    }
+
+    #[test]
+    fn plain_walk_uses_native_map_fallback() {
+        let root: Map<FfiString, i64> =
+            [(FfiString::from("a"), 1i64), (FfiString::from("b"), 2i64)]
+                .into_iter()
+                .collect();
+        let mut integers = 0;
+        assert!(walk(&root, |value, phase| {
+            if phase == Phase::Enter && value.cast::<i64>().is_some() {
+                integers += 1;
+            }
+            WalkResult::Advance
+        })
+        .unwrap()
+        .is_continue());
+        assert_eq!(integers, 2);
+    }
+
+    struct SkipForeignShape;
+
+    #[crate::dispatch(visit)]
+    impl SkipForeignShape {
+        fn visit_shape(&mut self, _shape: Shape, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+            WalkResult::Skip
+        }
+    }
+
+    #[test]
+    fn foreign_structural_visit_requires_explicit_rust_override() {
+        let hook = Function::get_global("ffi.ArraySize").unwrap();
+        let attr_name = unsafe { TVMFFIByteArray::from_str(STRUCTURAL_VISIT_ATTR) };
+        let attr_value = raw_of(AnyView::from(&hook));
+        assert_eq!(
+            unsafe {
+                TVMFFITypeRegisterAttr(
+                    TVMFFITypeIndex::kTVMFFIShape as i32,
+                    &attr_name,
+                    &attr_value,
+                )
+            },
+            0
+        );
+
+        let root = Shape::from([2i64, 3]);
+        let error = match walk(&root, |_value, _phase| WalkResult::Advance) {
+            Err(error) => error,
+            Ok(_) => panic!("foreign structural visit unexpectedly used reflection"),
+        };
+        assert!(error.message().contains("registers foreign `__s_visit__`"));
+        assert!(error.message().contains("return `WalkResult::Skip`"));
+
+        assert!(structural_visit(&root, &mut SkipForeignShape)
+            .unwrap()
+            .is_continue());
+    }
+
+    #[test]
+    fn mutable_list_is_snapshotted_before_callbacks() {
+        let root = Function::get_global("ffi.List")
+            .unwrap()
+            .call_packed(&[AnyView::from(&1i64), AnyView::from(&2i64)])
+            .unwrap();
+        let captured = root.clone();
+        let append = Function::get_global("ffi.ListAppend").unwrap();
+        let mut appended = false;
+        let mut integers = Vec::new();
+
+        assert!(walk(&root, |value, phase| {
+            if phase == Phase::Enter {
+                if let Some(integer) = value.cast::<i64>() {
+                    integers.push(integer);
+                    if !appended {
+                        append
+                            .call_packed(&[AnyView::from(&captured), AnyView::from(&3i64)])
+                            .unwrap();
+                        appended = true;
+                    }
+                }
+            }
+            WalkResult::Advance
+        })
+        .unwrap()
+        .is_continue());
+
+        assert_eq!(integers, vec![1, 2]);
+        let size = Function::get_global("ffi.ListSize")
+            .unwrap()
+            .call_packed(&[AnyView::from(&root)])
+            .and_then(i64::try_from)
+            .unwrap();
+        assert_eq!(size, 3);
+    }
+
+    #[test]
+    fn mutable_dict_is_snapshotted_before_callbacks() {
+        let root = Function::get_global("ffi.Dict")
+            .unwrap()
+            .call_packed(&[
+                AnyView::from(&FfiString::from("a")),
+                AnyView::from(&1i64),
+                AnyView::from(&FfiString::from("b")),
+                AnyView::from(&2i64),
+            ])
+            .unwrap();
+        let captured = root.clone();
+        let set_item = Function::get_global("ffi.DictSetItem").unwrap();
+        let mut inserted = false;
+        let mut integers = Vec::new();
+
+        assert!(walk(&root, |value, phase| {
+            if phase == Phase::Enter {
+                if let Some(integer) = value.cast::<i64>() {
+                    integers.push(integer);
+                    if !inserted {
+                        set_item
+                            .call_packed(&[
+                                AnyView::from(&captured),
+                                AnyView::from(&FfiString::from("c")),
+                                AnyView::from(&3i64),
+                            ])
+                            .unwrap();
+                        inserted = true;
+                    }
+                }
+            }
+            WalkResult::Advance
+        })
+        .unwrap()
+        .is_continue());
+
+        integers.sort_unstable();
+        assert_eq!(integers, vec![1, 2]);
+        let size = Function::get_global("ffi.DictSize")
+            .unwrap()
+            .call_packed(&[AnyView::from(&root)])
+            .and_then(i64::try_from)
+            .unwrap();
+        assert_eq!(size, 3);
+    }
+
+    #[test]
+    fn interrupt_stops_without_running_remaining_callbacks() {
+        let root = Array::new(vec![1i64, 2, 3]);
+        let mut integers = 0;
+        let outcome = walk(&root, |value, phase| {
+            if phase == Phase::Enter && value.cast::<i64>().is_some() {
+                integers += 1;
+                return WalkResult::Interrupt;
+            }
+            WalkResult::Advance
+        })
+        .unwrap();
+        assert!(outcome.is_break());
+        assert_eq!(integers, 1);
+    }
+
+    #[derive(Default)]
+    struct ManualRegionProbe {
+        seen: Vec<DefRegionKind>,
+    }
+
+    #[crate::dispatch(visit)]
+    impl ManualRegionProbe {
+        fn visit_array(&mut self, array: Array<i64>, ctx: &mut VisitCtx<'_>) -> WalkResult {
+            let overridden = array.get(0).unwrap();
+            if !ctx.visit_with_def_region(self, &overridden, DefRegionKind::NonRecursive) {
+                return WalkResult::Interrupt;
+            }
+            let inherited = array.get(1).unwrap();
+            if !ctx.visit(self, &inherited) {
+                return WalkResult::Interrupt;
+            }
+            WalkResult::Skip
         }
 
-        let flow = {
-            // SAFETY: `active` contains the top-level exclusive borrow or the
-            // currently frozen `VisitCtx::visit` reborrow.  This reference is
-            // scoped to the handler call and ends before default recursion.
-            let visitor = unsafe { &mut *active.get() };
-            let mut ctx = VisitCtx {
-                raw,
-                active: &active,
-            };
-            visitor.dispatch_visit(value, &mut ctx)
+        fn visit_integer(&mut self, _value: i64, ctx: &mut VisitCtx<'_>) -> WalkResult {
+            self.seen.push(ctx.def_region_kind());
+            WalkResult::Advance
+        }
+    }
+
+    #[test]
+    fn manual_child_visit_can_override_def_region() {
+        let root = Array::new(vec![7i64, 8]);
+        let mut probe = ManualRegionProbe::default();
+        assert!(structural_visit(&root, &mut probe).unwrap().is_continue());
+        assert_eq!(
+            probe.seen,
+            vec![DefRegionKind::NonRecursive, DefRegionKind::None]
+        );
+    }
+
+    #[derive(Default)]
+    struct GenericDispatchProbe {
+        integers: Vec<i64>,
+        objects: usize,
+        catch_all: usize,
+    }
+
+    #[crate::dispatch(visit)]
+    impl GenericDispatchProbe {
+        fn visit_integer(&mut self, value: i64, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+            self.integers.push(value);
+            WalkResult::Advance
+        }
+
+        fn visit_object(
+            &mut self,
+            _value: &tvm_ffi::Object,
+            _ctx: &mut VisitCtx<'_>,
+        ) -> WalkResult {
+            self.objects += 1;
+            WalkResult::Advance
+        }
+
+        fn visit_any(&mut self, _value: &VisitValue, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+            self.catch_all += 1;
+            WalkResult::Advance
+        }
+    }
+
+    #[test]
+    fn generated_dispatch_supports_pod_and_ordered_catch_all() {
+        let root = Array::new(vec![1i64, 2]);
+        let mut probe = GenericDispatchProbe::default();
+        assert!(structural_visit(&root, &mut probe).unwrap().is_continue());
+        assert_eq!(probe.integers, vec![1, 2]);
+        assert_eq!(probe.objects, 1);
+
+        let floats = Array::new(vec![1.0f64, 2.0]);
+        assert!(structural_visit(&floats, &mut probe).unwrap().is_continue());
+        assert_eq!(probe.objects, 2);
+        assert_eq!(probe.catch_all, 2);
+    }
+
+    #[derive(Default)]
+    struct OrderProbe {
+        events: Vec<String>,
+    }
+
+    #[crate::dispatch(visit)]
+    impl OrderProbe {
+        fn visit_array(&mut self, _array: Array<i64>, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+            self.events.push("array".to_string());
+            WalkResult::Advance
+        }
+
+        fn visit_integer(&mut self, value: i64, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+            self.events.push(format!("int:{value}"));
+            WalkResult::Advance
+        }
+    }
+
+    #[test]
+    fn typed_dispatch_supports_post_order() {
+        let root = Array::new(vec![1i64, 2]);
+        let mut probe = OrderProbe::default();
+        assert!(
+            structural_visit_ordered(&root, &mut probe, VisitOrder::PostOrder)
+                .unwrap()
+                .is_continue()
+        );
+        assert_eq!(probe.events, vec!["int:1", "int:2", "array"]);
+    }
+
+    #[test]
+    fn interrupt_payload_is_returned_to_the_caller() {
+        let root = Array::new(vec![1i64, 2]);
+        let outcome = walk(&root, |value, phase| {
+            if phase == Phase::Enter && value.cast::<i64>() == Some(1) {
+                return WalkResult::interrupt_with(42i64);
+            }
+            WalkResult::Advance
+        })
+        .unwrap();
+        let ControlFlow::Break(payload) = outcome else {
+            panic!("walk unexpectedly completed");
         };
-        flow.unwrap_or(WalkResult::Advance)
-    })
+        assert_eq!(i64::try_from(payload).unwrap(), 42);
+    }
+
+    struct ErrorProbe;
+
+    #[crate::dispatch(visit)]
+    impl ErrorProbe {
+        fn visit_integer(&mut self, _value: i64, _ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
+            Err(runtime_error("handler failed"))
+        }
+    }
+
+    #[test]
+    fn handler_errors_include_native_visit_path() {
+        let root = Array::new(vec![1i64]);
+        let error = match structural_visit(&root, &mut ErrorProbe) {
+            Err(error) => error,
+            Ok(_) => panic!("handler unexpectedly succeeded"),
+        };
+        assert_eq!(error.message(), "handler failed");
+        assert!(error.backtrace().contains("sequence item [0]"));
+        assert!(error.backtrace().contains("object `ffi.Array`"));
+    }
+
+    #[test]
+    fn raw_walk_context_receives_def_region() {
+        let root = Array::new(vec![1i64]);
+        let mut regions = Vec::new();
+        assert!(walk_with_context(&root, |_value, phase, region| {
+            if phase == Phase::Enter {
+                regions.push(region);
+            }
+            WalkResult::Advance
+        })
+        .unwrap()
+        .is_continue());
+        assert_eq!(regions, vec![DefRegionKind::None; 2]);
+    }
 }

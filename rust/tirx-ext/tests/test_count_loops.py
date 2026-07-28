@@ -89,6 +89,18 @@ def loop_stats_reference(root) -> tuple[int, int]:
     return n_loops, total_iters
 
 
+def add_count_reference(root) -> int:
+    """C++ structural-walk reference for the number of reachable Add nodes."""
+    adds = 0
+
+    def pre(_node: tirx.Add):
+        nonlocal adds
+        adds += 1
+
+    structural_walk(root, (tirx.Add, pre))
+    return adds
+
+
 def test_count_loops_matmul():
     r = tirx_ext.count_loops(build_matmul(64, 64, 64))
     assert r["loops"] == 3
@@ -111,6 +123,68 @@ def test_count_adds():
     r = tirx_ext.count_adds(build_matmul(64, 64, 64))
     assert r["adds"] == 1
     assert r["add_execs"] == 64**3  # executed once per innermost iteration
+
+
+def test_native_default_visit_through_seq_stmt():
+    # Counter has no SeqStmt handler.  Reaching both For nodes therefore
+    # requires the stateful visitor's native reflected fallback plus native
+    # Array traversal; a typed-only dispatcher would report zero.
+    root = tirx.SeqStmt([_add_loop(3), _add_loop(5)])
+    r = tirx_ext.count_loops(root)
+    assert (r["loops"], r["total_iters"]) == (2, 8)
+
+
+def test_native_default_visit_through_annotation_map():
+    # The plain Rust walk must handle Map key/value traversal itself.  Put an
+    # otherwise unreachable Add in annotations so this fails if Map is treated
+    # as an opaque reflected object.
+    body = tirx.Evaluate(_i32(0))
+    vi = tirx.Var("i", "int32")
+    annotated = tirx.For(
+        vi,
+        _i32(0),
+        _i32(1),
+        tirx.ForKind.SERIAL,
+        body,
+        annotations={"native_visit_probe": tirx.Add(_i32(1), _i32(2))},
+    )
+    r = tirx_ext.count_adds(annotated)
+    assert (r["adds"], r["add_execs"]) == (1, 1)
+
+
+def test_native_default_matches_cpp_walk_across_fields_and_containers():
+    annotated = tirx.For(
+        tirx.Var("j", "int32"),
+        _i32(0),
+        _i32(2),
+        tirx.ForKind.SERIAL,
+        tirx.Evaluate(tirx.Add(_i32(3), _i32(4))),
+        annotations={"probe": tirx.Add(_i32(5), _i32(6))},
+    )
+    root = tirx.SeqStmt([_add_loop(3), annotated])
+    assert tirx_ext.count_adds(root)["adds"] == add_count_reference(root) == 3
+
+
+def test_native_def_region_context_reaches_typed_handler():
+    from tirx_ext import _ffi_api
+
+    vi = tirx.Var("i", "int32")
+    root = tirx.For(
+        vi,
+        _i32(0),
+        _i32(1),
+        tirx.ForKind.SERIAL,
+        tirx.Evaluate(vi),
+    )
+    counts = _ffi_api._def_region_stats(root)
+
+    # For.loop_var is SEqHashDefRecursive; the same Var reached through the
+    # Evaluate body is outside the scoped field visit.
+    assert dict(counts.items()) == {
+        "none": 1,
+        "recursive": 1,
+        "non_recursive": 0,
+    }
 
 
 def test_cross_check_with_python_walk():

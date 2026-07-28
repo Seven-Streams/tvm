@@ -23,9 +23,6 @@
 //! panics below therefore indicate a load-order bug in the host, and they are
 //! converted to `ffi.Error`s by the `catch_unwind` in the exported entry points.
 
-use tvm_ffi::any::{Any, AnyView};
-use tvm_ffi::function::Function;
-
 /// Resolve a C++ type key (e.g. `"tirx.For"`) to its runtime `type_index`.
 pub(crate) fn lookup_type_index(type_key: &str) -> i32 {
     use tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFITypeKeyToIndex};
@@ -42,12 +39,4 @@ pub(crate) fn lookup_type_index(type_key: &str) -> i32 {
         }
         idx
     }
-}
-
-/// Call a registered global function with pre-built argument views.
-pub(crate) fn call_packed_global(name: &str, args: &[AnyView]) -> Any {
-    let f = Function::get_global(name)
-        .unwrap_or_else(|e| panic!("tirx_ext: global `{}` not found: {:?}", name, e));
-    f.call_packed(args)
-        .unwrap_or_else(|e| panic!("tirx_ext: call to `{}` failed: {:?}", name, e))
 }

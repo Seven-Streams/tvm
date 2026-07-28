@@ -71,10 +71,13 @@ pub use node::{
     PrimExpr, Span, Stmt, StmtNode, Var, VarNode, While, WhileNode,
 };
 pub use tvm_tirx_macros::dispatch;
-pub use visit::{structural_visit, VisitCtx, VisitDispatch, WalkResult};
+pub use visit::{
+    structural_visit, structural_visit_ordered, try_walk_with_context, walk, walk_with_context,
+    DefRegionKind, IntoVisitResult, Phase, VisitCtx, VisitDispatch, VisitOrder, VisitOutcome,
+    VisitResult, VisitValue, WalkResult,
+};
 
 use mutate::MapCtx;
-use visit::{walk, Phase, VisitValue};
 
 /// The mapper's `function_table!`: the same first-match-wins chain. Each
 /// handler returns `Result` of its node (`Stmt`/`PrimExpr` — original ==
@@ -100,7 +103,11 @@ const ERR_STEP_POSITIVE: &str = "tirx_ext: loop step must be a positive constant
 const ERR_OVERFLOW: &str = "tirx_ext: iteration count overflows i64";
 
 fn pass_error(msg: &'static str) -> Error {
-    let kind = if msg == ERR_OVERFLOW { RUNTIME_ERROR } else { TYPE_ERROR };
+    let kind = if msg == ERR_OVERFLOW {
+        RUNTIME_ERROR
+    } else {
+        TYPE_ERROR
+    };
     Error::new(kind, msg, "")
 }
 
@@ -130,7 +137,6 @@ struct Counter {
     innermost: i64,
     outer_iter_num: i64,
     is_for_in_body: bool,
-    error: Option<&'static str>,
 }
 
 #[dispatch(visit)]
@@ -162,51 +168,44 @@ impl Counter {
         Ok(())
     }
 
-    fn visit_for(&mut self, op: For, ctx: &mut VisitCtx<Self>) -> WalkResult {
+    fn visit_for(&mut self, op: &ForNode, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
         if !ctx.visit(self, &op.extent) {
-            return WalkResult::Interrupt;
+            return Ok(WalkResult::Interrupt);
         }
         if let Some(step) = op.step.get() {
             if !ctx.visit(self, &step) {
-                return WalkResult::Interrupt;
+                return Ok(WalkResult::Interrupt);
             }
         }
 
-        let saved = match for_trip_count(&op).and_then(|trips| self.enter_for(trips)) {
-            Ok(saved) => saved,
-            Err(msg) => {
-                self.error = Some(msg);
-                return WalkResult::Interrupt;
-            }
-        };
+        let saved = for_trip_count(op)
+            .and_then(|trips| self.enter_for(trips))
+            .map_err(pass_error)?;
         if !ctx.visit(self, &op.body) {
             self.exit_for(saved);
-            return WalkResult::Interrupt;
+            return Ok(WalkResult::Interrupt);
         }
         self.exit_for(saved);
-        WalkResult::Skip
+        Ok(WalkResult::Skip)
     }
 
-    fn visit_if(&mut self, op: IfThenElse, ctx: &mut VisitCtx<Self>) -> WalkResult {
+    fn visit_if(&mut self, op: &IfThenElseNode, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
         if !ctx.visit(self, &op.condition) {
-            return WalkResult::Interrupt;
+            return Ok(WalkResult::Interrupt);
         }
-        if let Err(msg) = self.count_branch() {
-            self.error = Some(msg);
-            return WalkResult::Interrupt;
-        }
+        self.count_branch().map_err(pass_error)?;
         if !ctx.visit(self, &op.then_case) {
-            return WalkResult::Interrupt;
+            return Ok(WalkResult::Interrupt);
         }
         if let Some(else_case) = op.else_case.get() {
             if !ctx.visit(self, &else_case) {
-                return WalkResult::Interrupt;
+                return Ok(WalkResult::Interrupt);
             }
         }
-        WalkResult::Skip
+        Ok(WalkResult::Skip)
     }
 
-    fn visit_while(&mut self, _op: While, _ctx: &mut VisitCtx<Self>) -> WalkResult {
+    fn visit_while(&mut self, _op: &WhileNode, _ctx: &mut VisitCtx<'_>) -> WalkResult {
         WalkResult::Skip
     }
 }
@@ -221,12 +220,57 @@ fn count_loops(root: &Stmt) -> Result<Counter> {
         outer_iter_num: 1,
         ..Default::default()
     };
-    structural_visit(root, &mut counter)?;
-
-    if let Some(msg) = counter.error {
-        return Err(pass_error(msg));
-    }
+    let _ = structural_visit(root, &mut counter)?;
     Ok(counter)
+}
+
+/// Test probe for the Rust-native definition-region context.
+#[derive(Default)]
+struct DefRegionStats {
+    none: i64,
+    recursive: i64,
+    non_recursive: i64,
+}
+
+#[dispatch(visit)]
+impl DefRegionStats {
+    fn visit_var(&mut self, _op: &VarNode, ctx: &mut VisitCtx<'_>) -> WalkResult {
+        match ctx.def_region_kind() {
+            DefRegionKind::None => self.none += 1,
+            DefRegionKind::Recursive => self.recursive += 1,
+            DefRegionKind::NonRecursive => self.non_recursive += 1,
+        }
+        WalkResult::Advance
+    }
+}
+
+fn def_region_stats(root: &Stmt) -> Result<DefRegionStats> {
+    let mut stats = DefRegionStats::default();
+    let _ = structural_visit(root, &mut stats)?;
+
+    // Exercise the raw callback API over the same real TIRx field flags and
+    // ensure it observes exactly the same definition-region contexts.
+    let mut raw = DefRegionStats::default();
+    let _ = walk_with_context(root, |value, phase, region| {
+        if phase == Phase::Enter && value.as_node::<VarNode>().is_some() {
+            match region {
+                DefRegionKind::None => raw.none += 1,
+                DefRegionKind::Recursive => raw.recursive += 1,
+                DefRegionKind::NonRecursive => raw.non_recursive += 1,
+            }
+        }
+        WalkResult::Advance
+    })?;
+    if (stats.none, stats.recursive, stats.non_recursive)
+        != (raw.none, raw.recursive, raw.non_recursive)
+    {
+        return Err(Error::new(
+            RUNTIME_ERROR,
+            "typed and raw native visitors disagree on definition-region propagation",
+            "",
+        ));
+    }
+    Ok(stats)
 }
 
 /// Gathered by the plain walk (Add is a pure observation). Type tests are
@@ -287,7 +331,7 @@ fn count_adds(root: &Stmt) -> Result<AddStats> {
         prod_stack: vec![1],
         ..Default::default()
     };
-    walk(root, |v, phase| stats.observe(v, phase))?;
+    let _ = walk(root, |v, phase| stats.observe(v, phase))?;
     if let Some(msg) = stats.error {
         return Err(pass_error(msg));
     }
@@ -435,7 +479,11 @@ fn map_test_map_fields(root: &Stmt) -> Result<Stmt> {
 /// The single error channel: a handler `Err` surfaces as one `ffi.Error`.
 fn map_test_handler_error(root: &Stmt) -> Result<Stmt> {
     fn fail_for(_state: &RefCell<()>, _op: For, _mapper: &mut MapCtx) -> Result<Stmt> {
-        Err(Error::new(RUNTIME_ERROR, "tirx_ext: test handler failure", ""))
+        Err(Error::new(
+            RUNTIME_ERROR,
+            "tirx_ext: test handler failure",
+            "",
+        ))
     }
     let state = RefCell::new(());
     let table = mutation_table! {
@@ -452,7 +500,10 @@ fn map_test_handler_error(root: &Stmt) -> Result<Stmt> {
 // ---------------------------------------------------------------------------
 
 fn map_of(pairs: &[(&str, i64)]) -> Map<FfiString, i64> {
-    pairs.iter().map(|(k, v)| (FfiString::from(*k), *v)).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (FfiString::from(*k), *v))
+        .collect()
 }
 
 /// Best-effort text of a caught panic payload (panic! with a literal gives
@@ -527,8 +578,19 @@ pub fn register_globals() -> Result<()> {
         let s = count_adds(root)?;
         Ok(map_of(&[("adds", s.adds), ("add_execs", s.add_execs)]))
     })?;
+    register("tirx_ext._def_region_stats", |root| {
+        let s = def_region_stats(root)?;
+        Ok(map_of(&[
+            ("none", s.none),
+            ("recursive", s.recursive),
+            ("non_recursive", s.non_recursive),
+        ]))
+    })?;
     register("tirx_ext.break_for_bodies", break_for_bodies)?;
-    register("tirx_ext.break_innermost_for_bodies", break_innermost_for_bodies)?;
+    register(
+        "tirx_ext.break_innermost_for_bodies",
+        break_innermost_for_bodies,
+    )?;
     register("tirx_ext._map_test_hook_dispatch", map_test_hook_dispatch)?;
     register("tirx_ext._map_test_table_wins", map_test_table_wins)?;
     register("tirx_ext._map_test_map_fields", map_test_map_fields)?;

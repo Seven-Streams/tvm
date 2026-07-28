@@ -23,8 +23,8 @@ use std::ops::ControlFlow;
 
 use tvm_ffi::tvm_ffi_sys::{TVMFFIFieldInfo, TVMFFIGetTypeInfo};
 
-/// Visit every reflected field of `type_index` and then of its ancestors
-/// (single-inheritance chain, derived type first). The callback's
+/// Visit every reflected field of `type_index` and its ancestors in the same
+/// parent-to-child order as C++ `ForEachFieldInfoWithEarlyStop`. The callback's
 /// `ControlFlow::Break` value short-circuits and is returned.
 ///
 /// # Safety
@@ -33,25 +33,36 @@ pub(crate) unsafe fn for_each_field<B>(
     type_index: i32,
     mut f: impl FnMut(&'static TVMFFIFieldInfo) -> ControlFlow<B>,
 ) -> Option<B> {
-    let mut info = TVMFFIGetTypeInfo(type_index);
-    while !info.is_null() {
-        // Zero-field types have fields == NULL; skip the level safely.
-        if !(*info).fields.is_null() {
-            let fields =
-                std::slice::from_raw_parts((*info).fields, (*info).num_fields as usize);
-            for field in fields {
-                // The C reflection tables are immortal once registered.
-                let field: &'static TVMFFIFieldInfo = &*(field as *const TVMFFIFieldInfo);
-                if let ControlFlow::Break(b) = f(field) {
-                    return Some(b);
-                }
-            }
+    let info = TVMFFIGetTypeInfo(type_index);
+    if info.is_null() {
+        return None;
+    }
+
+    // Ancestor slot 0 is the root Object.  C++ starts at slot 1, walks toward
+    // the immediate parent, then visits the concrete type's own fields.
+    for depth in 1..(*info).type_depth {
+        let ancestor = *(*info).type_acenstors.offset(depth as isize);
+        if let Some(b) = visit_level(ancestor, &mut f) {
+            return Some(b);
         }
-        let depth = (*info).type_depth;
-        if depth == 0 {
-            break;
+    }
+    visit_level(info, &mut f)
+}
+
+unsafe fn visit_level<B>(
+    info: *const tvm_ffi::tvm_ffi_sys::TVMFFITypeInfo,
+    f: &mut impl FnMut(&'static TVMFFIFieldInfo) -> ControlFlow<B>,
+) -> Option<B> {
+    if info.is_null() || (*info).fields.is_null() {
+        return None;
+    }
+    let fields = std::slice::from_raw_parts((*info).fields, (*info).num_fields as usize);
+    for field in fields {
+        // The C reflection tables are immortal once registered.
+        let field: &'static TVMFFIFieldInfo = &*(field as *const TVMFFIFieldInfo);
+        if let ControlFlow::Break(b) = f(field) {
+            return Some(b);
         }
-        info = *(*info).type_acenstors.offset((depth - 1) as isize);
     }
     None
 }

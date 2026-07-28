@@ -242,7 +242,11 @@ unsafe fn set_field(obj: *mut u8, field: &TVMFFIFieldInfo, value: &TVMFFIAny) ->
         ));
     }
     if field.setter.is_null() {
-        return Err(Error::new(RUNTIME_ERROR, "tirx_ext: field has no setter", ""));
+        return Err(Error::new(
+            RUNTIME_ERROR,
+            "tirx_ext: field has no setter",
+            "",
+        ));
     }
     let setter: TVMFFIFieldSetter = std::mem::transmute(field.setter);
     let addr = obj.offset(field.offset as isize) as *mut c_void;
@@ -291,7 +295,10 @@ const TYPE_HOOKS: &[(&str, TypeHook)] = &[];
 /// Resolve a `(type_key, hook)` table to `(type_index, hook)` via the FFI
 /// type registry (types must already be registered — host imported tvm).
 pub(crate) fn resolve_hooks(table: &[(&str, TypeHook)]) -> Vec<(i32, TypeHook)> {
-    table.iter().map(|(key, hook)| (lookup_type_index(key), *hook)).collect()
+    table
+        .iter()
+        .map(|(key, hook)| (lookup_type_index(key), *hook))
+        .collect()
 }
 
 fn default_hooks() -> &'static [(i32, TypeHook)] {
@@ -307,8 +314,7 @@ fn default_hooks() -> &'static [(i32, TypeHook)] {
 
 /// Layout prefix shared by `ArrayObj`/`ListObj`:
 /// `Object (24B) + TVMFFISeqCell { data, size, capacity, deleter }`
-/// (container/seq_base.h) — asserted here the same way visit.rs pins the
-/// `StructuralVisitorObj` prefix.
+/// (container/seq_base.h) — asserted here and in visit.rs.
 #[repr(C)]
 struct SeqPrefix {
     header: TVMFFIObject,
@@ -442,16 +448,25 @@ impl Engine<'_> {
         let vv = VisitValue::from_raw(*raw);
         // 1) Pass table: a claimed node is fully the handler's business.
         {
-            let mut ctx = MapCtx { engine: self, depth };
+            let mut ctx = MapCtx {
+                engine: self,
+                depth,
+            };
             if let Some(outcome) = (self.dispatch)(&vv, &mut ctx) {
                 return cow_verdict(raw, outcome?);
             }
         }
         // 2) Per-type rules (`__s_map__` layer).
-        if let Some(hook) =
-            self.hooks.iter().find(|(ti, _)| *ti == raw.type_index).map(|(_, h)| *h)
+        if let Some(hook) = self
+            .hooks
+            .iter()
+            .find(|(ti, _)| *ti == raw.type_index)
+            .map(|(_, h)| *h)
         {
-            let mut ctx = MapCtx { engine: self, depth };
+            let mut ctx = MapCtx {
+                engine: self,
+                depth,
+            };
             return cow_verdict(raw, hook(&vv, &mut ctx)?);
         }
         // 3) Unclaimed: default rebuild over value-position children.
@@ -546,8 +561,7 @@ impl Engine<'_> {
             let mut changed = false;
             let mut elems: Vec<Any> = Vec::with_capacity(cells.len());
             for cell in cells {
-                let is_obj =
-                    cell.type_index >= TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32;
+                let is_obj = cell.type_index >= TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32;
                 if is_obj && self.is_ir_family(cell.type_index) {
                     if let Some(mut new_elem) = self.map_raw(cell, depth + 1)? {
                         // Route B: an element replaced BY a SeqStmt would need
@@ -575,7 +589,9 @@ impl Engine<'_> {
                 return Ok(None);
             }
             let views: Vec<AnyView> = elems.iter().map(AnyView::from).collect();
-            Function::get_global("ffi.Array")?.call_packed(&views).map(Some)
+            Function::get_global("ffi.Array")?
+                .call_packed(&views)
+                .map(Some)
         }
     }
 }
@@ -593,7 +609,10 @@ pub struct Mapper<'s, S> {
 
 impl<S> Default for Mapper<'_, S> {
     fn default() -> Self {
-        Self { state: None, function_table: None }
+        Self {
+            state: None,
+            function_table: None,
+        }
     }
 }
 
@@ -623,13 +642,14 @@ impl<'s, S> Mapper<'s, S> {
     /// [`Mapper::map`] with an explicit (pre-resolved) per-type hook table —
     /// crate-only: the production hook set is the compiled [`TYPE_HOOKS`];
     /// this variant exists so lib.rs test globals can pin the dispatch order.
-    pub(crate) fn map_with_hooks(
-        &self,
-        root: &Stmt,
-        hooks: &[(i32, TypeHook)],
-    ) -> Result<Stmt> {
-        let state = self.state.expect("Mapper: call visit_with_extra_content first");
-        let table = self.function_table.as_ref().expect("Mapper: call function_table first");
+    pub(crate) fn map_with_hooks(&self, root: &Stmt, hooks: &[(i32, TypeHook)]) -> Result<Stmt> {
+        let state = self
+            .state
+            .expect("Mapper: call visit_with_extra_content first");
+        let table = self
+            .function_table
+            .as_ref()
+            .expect("Mapper: call function_table first");
         let dispatch = erase_dispatch(state, table.0);
         let engine = Engine {
             dispatch: &dispatch,

@@ -50,7 +50,7 @@ visitor struct owns its mutable state, so handlers use ordinary `&mut self`
 instead of a separate `RefCell` and hand-written function table:
 
 ```rust
-use tvm_tirx::{dispatch, structural_visit, For, VisitCtx, WalkResult};
+use tvm_tirx::{dispatch, structural_visit, ForNode, VisitCtx, WalkResult};
 
 #[derive(Default)]
 struct Counter {
@@ -59,7 +59,7 @@ struct Counter {
 
 #[dispatch(visit)]
 impl Counter {
-    fn visit_for(&mut self, op: For, ctx: &mut VisitCtx<Self>) -> WalkResult {
+    fn visit_for(&mut self, op: &ForNode, ctx: &mut VisitCtx<'_>) -> WalkResult {
         self.loops += 1;
         ctx.visit(self, &op.body);
         WalkResult::Skip
@@ -67,18 +67,49 @@ impl Counter {
 }
 
 let mut counter = Counter::default();
-structural_visit(&root, &mut counter)?;
+let _ = structural_visit(&root, &mut counter)?;
 ```
 
-Handlers are tried in source order, and the first matching node type wins.
-`Advance` asks the generic walker to recurse through the current node.
+Typed handlers are tested in source order. Borrowed node arguments such as
+`&ForNode` and `&StmtNode` use refcount-free runtime subtype checks; owned
+FFI-compatible arguments handle POD values or object references, and a final
+`&VisitValue` handler is a catch-all. A handler may return either `WalkResult`
+or `tvm_ffi::error::Result<WalkResult>`.
+
+`Advance` asks the native Rust walker to recurse through the current node.
 `ctx.visit(self, child)` visits a selected child immediately; return `Skip`
 afterwards to prevent the generic walker from visiting that child again.
-`Interrupt` stops the whole traversal.
+`ctx.visit_with_def_region(...)` does the same under an explicit, scoped
+definition region. `Interrupt` stops the whole traversal, while
+`WalkResult::interrupt_with(value)` returns a payload in
+`ControlFlow::Break(value)`.
 
-The generated API currently covers visitors.  The mapper keeps its existing
-explicit state/function-table API.  This minimal macro expects the dependency
-name `tvm_tirx` and does not project `cfg` attributes from handlers.
+The default traversal is implemented by a separate Rust walker: it reads
+reflected fields and container contents through the stable tvm-ffi ABI and
+re-enters the Rust dispatcher for every child. It does not construct an
+`ffi.StructuralVisitor` or call C++ `DefaultVisit`. Unknown registered object
+types remain walkable through reflection and can have a Rust-native override
+when the pass supplies a borrowed `ObjectCore` binding and manually visits the
+desired children before returning `Skip`.
+
+Definition-region state is native too. `ctx.def_region_kind()` returns
+`None`, `Recursive`, or `NonRecursive`; reflected field flags override the
+inherited value for that field's subtree, while containers and
+`ctx.visit(self, child)` preserve the current value. `walk_with_context`
+exposes the same region to raw callbacks.
+
+Array/List/Map/Dict have native Rust traversal paths. Foreign `__s_visit__`
+functions are never invoked because their ABI requires a C++
+`ffi.StructuralVisitor`. A matching pre-order Rust handler must visit the
+intended children through `VisitCtx` and return `Skip`; otherwise traversal
+returns an error instead of silently substituting reflected fields with
+potentially different semantics.
+
+`structural_visit_ordered` supports both pre-order and post-order typed
+callbacks. Traversal errors accumulate native object/field/container path
+frames. The generated API currently covers visitors; the mapper keeps its
+existing explicit state/function-table API. The macro expects the dependency
+name `tvm_tirx` and projects `cfg`/`cfg_attr` from handlers.
 
 ## Development (in-repo)
 
