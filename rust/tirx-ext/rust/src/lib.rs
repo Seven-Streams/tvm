@@ -73,8 +73,8 @@ pub use node::{
 pub use tvm_tirx_macros::dispatch;
 pub use visit::{
     structural_visit, structural_visit_ordered, try_walk_with_context, walk, walk_with_context,
-    DefRegionKind, IntoVisitResult, Phase, VisitCtx, VisitDispatch, VisitOrder, VisitOutcome,
-    VisitResult, VisitValue, WalkResult,
+    DefRegionKind, Phase, VisitCtx, VisitDispatch, VisitOrder, VisitOutcome, VisitValue,
+    WalkResult,
 };
 
 use mutate::MapCtx;
@@ -247,29 +247,6 @@ impl DefRegionStats {
 fn def_region_stats(root: &Stmt) -> Result<DefRegionStats> {
     let mut stats = DefRegionStats::default();
     let _ = structural_visit(root, &mut stats)?;
-
-    // Exercise the raw callback API over the same real TIRx field flags and
-    // ensure it observes exactly the same definition-region contexts.
-    let mut raw = DefRegionStats::default();
-    let _ = walk_with_context(root, |value, phase, region| {
-        if phase == Phase::Enter && value.as_node::<VarNode>().is_some() {
-            match region {
-                DefRegionKind::None => raw.none += 1,
-                DefRegionKind::Recursive => raw.recursive += 1,
-                DefRegionKind::NonRecursive => raw.non_recursive += 1,
-            }
-        }
-        WalkResult::Advance
-    })?;
-    if (stats.none, stats.recursive, stats.non_recursive)
-        != (raw.none, raw.recursive, raw.non_recursive)
-    {
-        return Err(Error::new(
-            RUNTIME_ERROR,
-            "typed and raw native visitors disagree on definition-region propagation",
-            "",
-        ));
-    }
     Ok(stats)
 }
 

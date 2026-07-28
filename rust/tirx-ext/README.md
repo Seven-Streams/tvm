@@ -108,8 +108,7 @@ potentially different semantics.
 `structural_visit_ordered` supports both pre-order and post-order typed
 callbacks. Traversal errors accumulate native object/field/container path
 frames. The generated API currently covers visitors; the mapper keeps its
-existing explicit state/function-table API. The macro expects the dependency
-name `tvm_tirx` and projects `cfg`/`cfg_attr` from handlers.
+existing explicit state/function-table API.
 
 ## Development (in-repo)
 

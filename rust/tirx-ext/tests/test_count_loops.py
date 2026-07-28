@@ -125,7 +125,7 @@ def test_count_adds():
     assert r["add_execs"] == 64**3  # executed once per innermost iteration
 
 
-def test_native_default_visit_through_seq_stmt():
+def test_native_fallback_through_seq_stmt():
     # Counter has no SeqStmt handler.  Reaching both For nodes therefore
     # requires the stateful visitor's native reflected fallback plus native
     # Array traversal; a typed-only dispatcher would report zero.
@@ -134,7 +134,7 @@ def test_native_default_visit_through_seq_stmt():
     assert (r["loops"], r["total_iters"]) == (2, 8)
 
 
-def test_native_default_visit_through_annotation_map():
+def test_native_fallback_through_annotation_map():
     # The plain Rust walk must handle Map key/value traversal itself.  Put an
     # otherwise unreachable Add in annotations so this fails if Map is treated
     # as an opaque reflected object.
@@ -152,7 +152,7 @@ def test_native_default_visit_through_annotation_map():
     assert (r["adds"], r["add_execs"]) == (1, 1)
 
 
-def test_native_default_matches_cpp_walk_across_fields_and_containers():
+def test_native_fallback_matches_cpp_walk_across_fields_and_containers():
     annotated = tirx.For(
         tirx.Var("j", "int32"),
         _i32(0),

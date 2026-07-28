@@ -24,11 +24,8 @@ description = "tirx_ext: Rust-implemented IR analysis tools exposed to Python th
 
 # Stand-alone workspace so an ancestor Cargo.toml (if any) cannot absorb this crate.
 [workspace]
-members = ["tvm-tirx-macros"]
-resolver = "2"
 
-# The cdylib is the deliverable: python/tirx_ext loads `libtvm_tirx.so` and
-# calls the `tirx_ext.*` functions it registers.
+# Python loads the cdylib; the rlib exposes the native visitor to Rust users.
 [lib]
 name = "tvm_tirx"
 crate-type = ["cdylib", "rlib"]

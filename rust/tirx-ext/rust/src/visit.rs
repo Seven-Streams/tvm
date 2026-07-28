@@ -100,6 +100,7 @@ impl WalkResult {
 ///
 /// This keeps simple handlers terse while allowing a handler to return
 /// `tvm_ffi::error::Result<WalkResult>` and use `?`.
+#[doc(hidden)]
 pub trait IntoVisitResult {
     fn into_visit_result(self) -> Result<WalkResult>;
 }
@@ -159,6 +160,7 @@ pub enum DefRegionKind {
 pub type VisitOutcome = ControlFlow<Any>;
 
 /// Fallible result returned by generated typed dispatch.
+#[doc(hidden)]
 pub type VisitResult = Result<WalkResult>;
 
 /// A borrowed view of a raw tvm-ffi value.
@@ -192,12 +194,6 @@ impl VisitValue {
     #[inline]
     pub fn type_index(&self) -> i32 {
         self.0.type_index
-    }
-
-    /// Runtime type key, when this is a registered object value.
-    pub fn type_key(&self) -> Option<String> {
-        (self.0.type_index >= TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32)
-            .then(|| type_key_of(self.0.type_index))
     }
 
     /// Borrow the value as node type `N` if it is one of that type's instances.
@@ -568,7 +564,7 @@ impl NativeWalker {
             ))
             .into());
         }
-        if foreign_structural_visit_attr(value.type_index).is_some() {
+        if has_foreign_structural_visit(value.type_index) {
             return Err(runtime_error(&format!(
                 "native visitor: type `{}` registers foreign `{STRUCTURAL_VISIT_ATTR}`; \
                  use a matching pre-order Rust handler, visit its children through `VisitCtx`, \
@@ -717,21 +713,21 @@ fn field_def_region(field: &TVMFFIFieldInfo, inherited: DefRegionKind) -> DefReg
     }
 }
 
-fn foreign_structural_visit_attr(type_index: i32) -> Option<i32> {
+fn has_foreign_structural_visit(type_index: i32) -> bool {
     unsafe {
         let attr_name = TVMFFIByteArray::from_str(STRUCTURAL_VISIT_ATTR);
         // Resolve the column for each query because later type registrations
         // may reallocate its backing array.
         let column = TVMFFIGetTypeAttrColumn(&attr_name);
         if column.is_null() || (*column).data.is_null() {
-            return None;
+            return false;
         }
         let index = type_index - (*column).begin_index;
         if index < 0 || index >= (*column).size {
-            return None;
+            return false;
         }
         let attr = *(*column).data.offset(index as isize);
-        (attr.type_index != TVMFFITypeIndex::kTVMFFINone as i32).then_some(attr.type_index)
+        attr.type_index != TVMFFITypeIndex::kTVMFFINone as i32
     }
 }
 
