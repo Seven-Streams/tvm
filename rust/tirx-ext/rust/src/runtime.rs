@@ -23,6 +23,8 @@
 //! panics below therefore indicate a load-order bug in the host, and they are
 //! converted to `ffi.Error`s by the `catch_unwind` in the exported entry points.
 
+use std::ptr::NonNull;
+
 use tvm_ffi::any::{Any, AnyView};
 use tvm_ffi::tvm_ffi_sys::{
     TVMFFIAny, TVMFFIByteArray, TVMFFIGetTypeInfo, TVMFFIObject, TVMFFITypeAttrColumn,
@@ -46,6 +48,25 @@ const _: () = {
     assert!(std::mem::offset_of!(SeqPrefix, data) == 24);
     assert!(std::mem::offset_of!(SeqPrefix, size) == 32);
 };
+
+/// Stable registry-owned type-attribute column.
+#[derive(Clone, Copy)]
+pub(crate) struct TypeAttrColumn(NonNull<TVMFFITypeAttrColumn>);
+
+impl TypeAttrColumn {
+    /// Copy one borrowed cell; ownership remains with the registry.
+    pub(crate) fn get(self, type_index: i32) -> Option<TVMFFIAny> {
+        unsafe {
+            let column = self.0.as_ref();
+            let index = type_index - column.begin_index;
+            if index < 0 || index >= column.size || column.data.is_null() {
+                None
+            } else {
+                Some(*column.data.offset(index as isize))
+            }
+        }
+    }
+}
 
 /// Resolve a C++ type key (e.g. `"tirx.For"`) to its runtime `type_index`.
 pub(crate) fn lookup_type_index(type_key: &str) -> i32 {
@@ -75,18 +96,16 @@ pub(crate) fn type_key_of(type_index: i32) -> String {
     }
 }
 
-/// Copy a borrowed type-attribute cell; the registry keeps object ownership.
-pub(crate) fn type_attr_of(type_index: i32, attr_name: &str) -> Option<TVMFFIAny> {
+pub(crate) fn type_attr_column(attr_name: &str) -> Option<TypeAttrColumn> {
     unsafe {
         let attr_name = TVMFFIByteArray::from_str(attr_name);
-        let column = TVMFFIGetTypeAttrColumn(&attr_name).as_ref()?;
-        let index = type_index - column.begin_index;
-        if index < 0 || index >= column.size || column.data.is_null() {
-            None
-        } else {
-            Some(*column.data.offset(index as isize))
-        }
+        NonNull::new(TVMFFIGetTypeAttrColumn(&attr_name).cast_mut()).map(TypeAttrColumn)
     }
+}
+
+/// Copy a borrowed type-attribute cell; the registry keeps object ownership.
+pub(crate) fn type_attr_of(type_index: i32, attr_name: &str) -> Option<TVMFFIAny> {
+    type_attr_column(attr_name)?.get(type_index)
 }
 
 pub(crate) fn raw_of(view: AnyView) -> TVMFFIAny {

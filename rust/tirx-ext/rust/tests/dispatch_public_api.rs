@@ -38,12 +38,39 @@ fn assert_visit_dispatch<T: VisitDispatch>() {}
 
 const _: fn() = assert_visit_dispatch::<ExternalCounter>;
 
+struct CfgAttrCounter;
+
+#[dispatch(visit)]
+impl CfgAttrCounter {
+    #[cfg_attr(all(), cfg(any()))]
+    fn visit_disabled(&mut self, _op: &ForNode, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+        WalkResult::Advance
+    }
+
+    fn visit_for(&mut self, _op: &ForNode, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+        WalkResult::Advance
+    }
+}
+
+const _: fn() = assert_visit_dispatch::<CfgAttrCounter>;
+
 struct DisabledCounter;
 const _: usize = std::mem::size_of::<DisabledCounter>();
 
 #[dispatch(visit)]
 #[cfg(any())]
 impl DisabledCounter {
+    fn visit_for(&mut self, _op: &ForNode, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+        WalkResult::Advance
+    }
+}
+
+struct CfgAttrDisabledCounter;
+const _: usize = std::mem::size_of::<CfgAttrDisabledCounter>();
+
+#[dispatch(visit)]
+#[cfg_attr(all(), cfg(any()))]
+impl CfgAttrDisabledCounter {
     fn visit_for(&mut self, _op: &ForNode, _ctx: &mut VisitCtx<'_>) -> WalkResult {
         WalkResult::Advance
     }

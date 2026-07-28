@@ -37,7 +37,7 @@ use std::ops::ControlFlow;
 use std::os::raw::c_void;
 
 use tvm_ffi::any::{Any, AnyView};
-use tvm_ffi::error::{Error, Result, RUNTIME_ERROR};
+use tvm_ffi::error::{Error, Result, RUNTIME_ERROR, TYPE_ERROR};
 use tvm_ffi::function::Function;
 use tvm_ffi::object::ObjectCore;
 use tvm_ffi::tvm_ffi_sys::{TVMFFIAny, TVMFFIFieldInfo, TVMFFIGetTypeInfo, TVMFFITypeIndex};
@@ -47,7 +47,9 @@ use crate::reflect::{
     for_each_field, FLAG_SEQ_HASH_DEF_NON_RECURSIVE, FLAG_SEQ_HASH_DEF_RECURSIVE,
     FLAG_SEQ_HASH_IGNORE,
 };
-use crate::runtime::{raw_of, raw_of_owned, type_attr_of, type_key_of, view_of, SeqPrefix};
+use crate::runtime::{
+    raw_of, raw_of_owned, type_attr_column, type_key_of, view_of, SeqPrefix, TypeAttrColumn,
+};
 
 #[cfg(test)]
 use tvm_ffi::tvm_ffi_sys::TVMFFIByteArray;
@@ -339,9 +341,17 @@ where
 }
 
 /// Stateless Rust recursion engine.
-struct NativeWalker;
+struct NativeWalker {
+    structural_visit: Option<TypeAttrColumn>,
+}
 
 impl NativeWalker {
+    fn new() -> Self {
+        Self {
+            structural_visit: type_attr_column(STRUCTURAL_VISIT_ATTR),
+        }
+    }
+
     fn visit_raw<V: NativeVisit>(
         &self,
         value: TVMFFIAny,
@@ -361,10 +371,10 @@ impl NativeWalker {
         };
         let enter = match visitor.enter(&visit_value, &mut ctx) {
             Ok(flow) => flow,
-            Err(error) => return Err(self.with_value_context(error.into(), value)),
+            Err(error) => return Err(Self::with_value_context(error.into(), value)),
         };
         if let Some(halt) = ctx.halted.take() {
-            return Err(self.with_value_context(halt, value));
+            return Err(Self::with_value_context(halt, value));
         }
         match enter {
             WalkResult::Advance => {}
@@ -374,15 +384,15 @@ impl NativeWalker {
         }
 
         if let Err(halt) = self.visit_children_raw(value, visitor, def_region_kind) {
-            return Err(self.with_value_context(halt, value));
+            return Err(Self::with_value_context(halt, value));
         }
 
         let exit = match visitor.exit(&visit_value, &mut ctx) {
             Ok(flow) => flow,
-            Err(error) => return Err(self.with_value_context(error.into(), value)),
+            Err(error) => return Err(Self::with_value_context(error.into(), value)),
         };
         if let Some(halt) = ctx.halted.take() {
-            return Err(self.with_value_context(halt, value));
+            return Err(Self::with_value_context(halt, value));
         }
         match exit {
             WalkResult::Interrupt => Err(NativeHalt::Interrupt(Any::new())),
@@ -399,13 +409,19 @@ impl NativeWalker {
     ) -> NativeResult {
         match value.type_index {
             x if x == TVMFFITypeIndex::kTVMFFIArray as i32 || x == TYPE_LIST => {
-                self.visit_sequence(value, visitor, def_region_kind)
+                return self.visit_sequence(value, visitor, def_region_kind);
             }
             x if x == TVMFFITypeIndex::kTVMFFIMap as i32 || x == TYPE_DICT => {
-                self.visit_map(value, visitor, def_region_kind)
+                return self.visit_map(value, visitor, def_region_kind);
             }
-            x if x < TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32 => Ok(()),
-            _ => self.visit_reflected_fields(value, visitor, def_region_kind),
+            _ => {}
+        }
+
+        self.reject_foreign_structural_visit(value.type_index)?;
+        if value.type_index < TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32 {
+            Ok(())
+        } else {
+            self.visit_reflected_fields(value, visitor, def_region_kind)
         }
     }
 
@@ -546,56 +562,87 @@ impl NativeWalker {
             ))
             .into());
         }
-        if has_foreign_structural_visit(value.type_index) {
-            return Err(runtime_error(&format!(
-                "native visitor: type `{}` registers foreign `{STRUCTURAL_VISIT_ATTR}`; \
-                 use a matching pre-order Rust handler, visit its children through `VisitCtx`, \
-                 and return `WalkResult::Skip`",
-                type_key_of(value.type_index)
-            ))
-            .into());
-        }
-
         let object = unsafe { value.data_union.v_obj } as *mut u8;
         let halted = unsafe {
             for_each_field(value.type_index, |field| {
-                if field.flags & FLAG_SEQ_HASH_IGNORE != 0 {
-                    return ControlFlow::Continue(());
-                }
-
-                let Some(getter) = field.getter else {
-                    return ControlFlow::Break(NativeHalt::Error(runtime_error(&format!(
-                        "native visitor: reflected field `{}` has no getter",
-                        field.name.as_str()
-                    ))));
-                };
-                let address = object.offset(field.offset as isize) as *mut c_void;
-                let mut child_raw = TVMFFIAny::new();
-                if getter(address, &mut child_raw) != 0 {
-                    return ControlFlow::Break(with_error_context(
-                        NativeHalt::Error(Error::from_raised()),
-                        &format!("field `{}`", field.name.as_str()),
-                    ));
-                }
-
-                // A reflection getter returns an owned Any.  Keep it alive
-                // while the recursive walk borrows its raw cell.
-                let mut child = Any::from_raw_ffi_any(child_raw);
-                let borrowed = raw_of_owned(&mut child);
-                let child_region = field_def_region(field, def_region_kind);
-                match self.visit_raw(borrowed, visitor, child_region) {
+                match self.visit_reflected_field(object, field, visitor, def_region_kind) {
                     Ok(()) => ControlFlow::Continue(()),
-                    Err(halt) => ControlFlow::Break(with_error_context(
-                        halt,
-                        &format!("field `{}`", field.name.as_str()),
-                    )),
+                    Err(halt) => ControlFlow::Break(halt),
                 }
             })
         };
         halted.map_or(Ok(()), Err)
     }
 
-    fn with_value_context(&self, halt: NativeHalt, value: TVMFFIAny) -> NativeHalt {
+    unsafe fn visit_reflected_field<V: NativeVisit>(
+        &self,
+        object: *mut u8,
+        field: &TVMFFIFieldInfo,
+        visitor: &mut V,
+        inherited_region: DefRegionKind,
+    ) -> NativeResult {
+        if field.flags & FLAG_SEQ_HASH_IGNORE != 0 {
+            return Ok(());
+        }
+
+        let Some(getter) = field.getter else {
+            return Err(NativeHalt::Error(runtime_error(&format!(
+                "native visitor: reflected field `{}` has no getter",
+                field.name.as_str()
+            ))));
+        };
+        let address = object.offset(field.offset as isize) as *mut c_void;
+        let mut child_raw = TVMFFIAny::new();
+        if getter(address, &mut child_raw) != 0 {
+            return Err(with_error_context(
+                NativeHalt::Error(Error::from_raised()),
+                &format!("field `{}`", field.name.as_str()),
+            ));
+        }
+
+        // A reflection getter returns an owned Any. Keep it alive while the
+        // recursive walk borrows its raw cell.
+        let mut child = Any::from_raw_ffi_any(child_raw);
+        let borrowed = raw_of_owned(&mut child);
+        let child_region = field_def_region(field, inherited_region);
+        self.visit_raw(borrowed, visitor, child_region)
+            .map_err(|halt| with_error_context(halt, &format!("field `{}`", field.name.as_str())))
+    }
+
+    fn reject_foreign_structural_visit(&self, type_index: i32) -> Result<()> {
+        let Some(attr) = self
+            .structural_visit
+            .and_then(|column| column.get(type_index))
+        else {
+            return Ok(());
+        };
+        match attr.type_index {
+            x if x == TVMFFITypeIndex::kTVMFFINone as i32 => Ok(()),
+            x if x == TVMFFITypeIndex::kTVMFFIOpaquePtr as i32
+                || x == TVMFFITypeIndex::kTVMFFIFunction as i32 =>
+            {
+                let value_type = if type_index < TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32 {
+                    format!("type index {type_index}")
+                } else {
+                    format!("type `{}`", type_key_of(type_index))
+                };
+                Err(runtime_error(&format!(
+                    "native visitor: {value_type} registers foreign `{STRUCTURAL_VISIT_ATTR}`; \
+                     use a matching pre-order Rust handler, visit its children through \
+                     `VisitCtx`, and return `WalkResult::Skip`"
+                )))
+            }
+            _ => Err(Error::new(
+                TYPE_ERROR,
+                &format!(
+                    "{STRUCTURAL_VISIT_ATTR} must be an opaque function pointer or ffi.Function"
+                ),
+                "",
+            )),
+        }
+    }
+
+    fn with_value_context(halt: NativeHalt, value: TVMFFIAny) -> NativeHalt {
         if value.type_index < TVMFFITypeIndex::kTVMFFIStaticObjectBegin as i32 {
             halt
         } else {
@@ -623,7 +670,7 @@ where
     V: VisitDispatch,
     for<'x> AnyView<'x>: From<&'x R>,
 {
-    let walker = NativeWalker;
+    let walker = NativeWalker::new();
     let mut dispatch = DispatchVisitor { visitor, order };
     finish(walker.visit_raw(
         raw_of(AnyView::from(root)),
@@ -651,7 +698,7 @@ where
     F: FnMut(&VisitValue, Phase, DefRegionKind) -> O,
     O: IntoVisitResult,
 {
-    let walker = NativeWalker;
+    let walker = NativeWalker::new();
     let mut callback = CallbackVisitor(callback);
     finish(walker.visit_raw(
         raw_of(AnyView::from(root)),
@@ -676,11 +723,6 @@ fn field_def_region(field: &TVMFFIFieldInfo, inherited: DefRegionKind) -> DefReg
     } else {
         inherited
     }
-}
-
-fn has_foreign_structural_visit(type_index: i32) -> bool {
-    type_attr_of(type_index, STRUCTURAL_VISIT_ATTR)
-        .is_some_and(|attr| attr.type_index != TVMFFITypeIndex::kTVMFFINone as i32)
 }
 
 fn with_error_context(halt: NativeHalt, frame: &str) -> NativeHalt {
@@ -719,10 +761,27 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TypedRegionProbe(Vec<DefRegionKind>);
+
+    #[crate::dispatch(visit)]
+    impl TypedRegionProbe {
+        fn visit_integer(&mut self, _value: i64, ctx: &mut VisitCtx<'_>) -> WalkResult {
+            self.0.push(ctx.def_region_kind());
+            WalkResult::Advance
+        }
+    }
+
+    unsafe extern "C" fn clone_any_field(field: *mut c_void, result: *mut TVMFFIAny) -> i32 {
+        let value = &*(field as *const Any);
+        *result = Any::into_raw_ffi_any(value.clone());
+        0
+    }
+
     #[test]
     fn def_region_is_inherited_through_containers() {
         let root = Array::new(vec![1i64, 2]);
-        let walker = NativeWalker;
+        let walker = NativeWalker::new();
         let mut probe = RegionProbe(Vec::new());
         assert!(walker
             .visit_raw(
@@ -735,23 +794,40 @@ mod tests {
     }
 
     #[test]
-    fn reflected_field_flags_override_or_inherit_def_region() {
+    fn reflected_field_def_region_reaches_typed_handler_and_restores() {
+        let walker = NativeWalker::new();
+        let mut probe = TypedRegionProbe::default();
+        let mut dispatch = DispatchVisitor {
+            visitor: &mut probe,
+            order: VisitOrder::PreOrder,
+        };
+        let mut value = Any::from(7i64);
         let mut field: TVMFFIFieldInfo = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            field_def_region(&field, DefRegionKind::Recursive),
-            DefRegionKind::Recursive
-        );
+        field.name = unsafe { TVMFFIByteArray::from_str("value") };
+        field.getter = Some(clone_any_field);
+        let object = (&mut value as *mut Any).cast::<u8>();
 
-        field.flags = FLAG_SEQ_HASH_DEF_NON_RECURSIVE;
+        for flags in [
+            FLAG_SEQ_HASH_DEF_RECURSIVE,
+            0,
+            FLAG_SEQ_HASH_DEF_NON_RECURSIVE,
+            FLAG_SEQ_HASH_DEF_NON_RECURSIVE | FLAG_SEQ_HASH_DEF_RECURSIVE,
+            FLAG_SEQ_HASH_IGNORE,
+        ] {
+            field.flags = flags;
+            assert!(unsafe {
+                walker.visit_reflected_field(object, &field, &mut dispatch, DefRegionKind::None)
+            }
+            .is_ok());
+        }
         assert_eq!(
-            field_def_region(&field, DefRegionKind::Recursive),
-            DefRegionKind::NonRecursive
-        );
-
-        field.flags = FLAG_SEQ_HASH_DEF_RECURSIVE;
-        assert_eq!(
-            field_def_region(&field, DefRegionKind::NonRecursive),
-            DefRegionKind::Recursive
+            probe.0,
+            vec![
+                DefRegionKind::Recursive,
+                DefRegionKind::None,
+                DefRegionKind::NonRecursive,
+                DefRegionKind::NonRecursive,
+            ]
         );
     }
 

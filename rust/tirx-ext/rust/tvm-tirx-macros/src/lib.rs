@@ -18,7 +18,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{parse_macro_input, Attribute, FnArg, ImplItem, ImplItemMethod, ItemImpl, Type};
+use syn::{parse_macro_input, FnArg, ImplItem, ImplItemMethod, ItemImpl, Meta, NestedMeta, Type};
 
 /// Generate `VisitDispatch` from the `visit_*` methods in an inherent impl.
 #[proc_macro_attribute]
@@ -107,7 +107,7 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
             },
         };
         quote! {
-            #(#attrs)*
+            #(#[#attrs])*
             {
                 #invoke
             }
@@ -115,10 +115,10 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
     });
     let self_type = &item_impl.self_ty;
     let (impl_generics, _, where_clause) = item_impl.generics.split_for_impl();
-    let impl_cfg_attrs = direct_cfg_attrs(&item_impl.attrs);
+    let impl_cfg_attrs = presence_attrs(&item_impl.attrs)?;
 
     Ok(quote! {
-        #(#impl_cfg_attrs)*
+        #(#[#impl_cfg_attrs])*
         impl #impl_generics ::tvm_tirx::visit::VisitDispatch for #self_type #where_clause {
             #[allow(unreachable_code)]
             fn dispatch_visit(
@@ -136,7 +136,7 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
 struct Handler {
     method: syn::Ident,
     argument: HandlerArgument,
-    cfg_attrs: Vec<Attribute>,
+    cfg_attrs: Vec<Meta>,
 }
 
 enum HandlerArgument {
@@ -179,7 +179,7 @@ fn parse_handler(method: &ImplItemMethod) -> syn::Result<Handler> {
         }
         _ => HandlerArgument::Owned(node_type),
     };
-    let cfg_attrs = direct_cfg_attrs(&method.attrs);
+    let cfg_attrs = presence_attrs(&method.attrs)?;
     Ok(Handler {
         method: method.sig.ident.clone(),
         argument,
@@ -187,12 +187,43 @@ fn parse_handler(method: &ImplItemMethod) -> syn::Result<Handler> {
     })
 }
 
-fn direct_cfg_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
+fn presence_attrs(attrs: &[syn::Attribute]) -> syn::Result<Vec<Meta>> {
     attrs
         .iter()
-        .filter(|attr| attr.path.is_ident("cfg"))
-        .cloned()
+        .filter(|attr| attr.path.is_ident("cfg") || attr.path.is_ident("cfg_attr"))
+        .map(|attr| attr.parse_meta().map(presence_meta))
+        .filter_map(Result::transpose)
         .collect()
+}
+
+fn presence_meta(meta: Meta) -> Option<Meta> {
+    if meta.path().is_ident("cfg") {
+        return Some(meta);
+    }
+    let Meta::List(mut list) = meta else {
+        return None;
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return None;
+    }
+
+    let mut items = list.nested.into_iter();
+    let condition = items.next()?;
+    let mut retained = syn::punctuated::Punctuated::new();
+    retained.push(condition);
+    for item in items {
+        if let NestedMeta::Meta(meta) = item {
+            if let Some(meta) = presence_meta(meta) {
+                retained.push(NestedMeta::Meta(meta));
+            }
+        }
+    }
+    if retained.len() == 1 {
+        None
+    } else {
+        list.nested = retained;
+        Some(Meta::List(list))
+    }
 }
 
 fn is_visit_value(value_type: &Type) -> bool {
