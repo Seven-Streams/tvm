@@ -37,3 +37,14 @@ impl ExternalCounter {
 fn assert_visit_dispatch<T: VisitDispatch>() {}
 
 const _: fn() = assert_visit_dispatch::<ExternalCounter>;
+
+struct DisabledCounter;
+const _: usize = std::mem::size_of::<DisabledCounter>();
+
+#[dispatch(visit)]
+#[cfg(any())]
+impl DisabledCounter {
+    fn visit_for(&mut self, _op: &ForNode, _ctx: &mut VisitCtx<'_>) -> WalkResult {
+        WalkResult::Advance
+    }
+}

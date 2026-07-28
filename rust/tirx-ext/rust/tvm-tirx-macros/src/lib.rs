@@ -76,15 +76,17 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
         }
     }
 
-    let has_catch_all = handlers
-        .last()
-        .is_some_and(|handler| matches!(handler.argument, HandlerArgument::Value));
-    let typed_handler_count = handlers.len() - usize::from(has_catch_all);
-    let links = handlers[..typed_handler_count].iter().map(|handler| {
+    let links = handlers.iter().map(|handler| {
         let method = &handler.method;
         let attrs = &handler.cfg_attrs;
         let invoke = match &handler.argument {
-            HandlerArgument::Value => unreachable!("catch-all is emitted as the tail expression"),
+            HandlerArgument::Value => quote! {
+                return Some(
+                    ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
+                        self.#method(value, ctx)
+                    )
+                );
+            },
             HandlerArgument::BorrowedNode(node_type) => quote! {
                 if let Some(node) = value.as_node::<#node_type>() {
                     return Some(
@@ -111,38 +113,12 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
             }
         }
     });
-    let tail = if has_catch_all {
-        let handler = handlers.last().unwrap();
-        let method = &handler.method;
-        let attrs = &handler.cfg_attrs;
-        if attrs.is_empty() {
-            quote! {
-                Some(
-                    ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
-                        self.#method(value, ctx)
-                    )
-                )
-            }
-        } else {
-            quote! {
-                #(#attrs)*
-                {
-                    return Some(
-                        ::tvm_tirx::visit::IntoVisitResult::into_visit_result(
-                            self.#method(value, ctx)
-                        )
-                    );
-                }
-                None
-            }
-        }
-    } else {
-        quote!(None)
-    };
     let self_type = &item_impl.self_ty;
     let (impl_generics, _, where_clause) = item_impl.generics.split_for_impl();
+    let impl_cfg_attrs = direct_cfg_attrs(&item_impl.attrs);
 
     Ok(quote! {
+        #(#impl_cfg_attrs)*
         impl #impl_generics ::tvm_tirx::visit::VisitDispatch for #self_type #where_clause {
             #[allow(unreachable_code)]
             fn dispatch_visit(
@@ -151,7 +127,7 @@ fn expand(mode: &syn::Ident, item_impl: &ItemImpl) -> syn::Result<TokenStream2> 
                 ctx: &mut ::tvm_tirx::visit::VisitCtx<'_>,
             ) -> Option<::tvm_tirx::visit::VisitResult> {
                 #(#links)*
-                #tail
+                None
             }
         }
     })
@@ -203,17 +179,20 @@ fn parse_handler(method: &ImplItemMethod) -> syn::Result<Handler> {
         }
         _ => HandlerArgument::Owned(node_type),
     };
-    let cfg_attrs = method
-        .attrs
-        .iter()
-        .filter(|attr| attr.path.is_ident("cfg"))
-        .cloned()
-        .collect();
+    let cfg_attrs = direct_cfg_attrs(&method.attrs);
     Ok(Handler {
         method: method.sig.ident.clone(),
         argument,
         cfg_attrs,
     })
+}
+
+fn direct_cfg_attrs(attrs: &[Attribute]) -> Vec<Attribute> {
+    attrs
+        .iter()
+        .filter(|attr| attr.path.is_ident("cfg"))
+        .cloned()
+        .collect()
 }
 
 fn is_visit_value(value_type: &Type) -> bool {

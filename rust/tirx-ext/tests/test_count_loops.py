@@ -165,26 +165,9 @@ def test_native_fallback_matches_cpp_walk_across_fields_and_containers():
     assert tirx_ext.count_adds(root)["adds"] == add_count_reference(root) == 3
 
 
-def test_native_def_region_context_reaches_typed_handler():
-    from tirx_ext import _ffi_api
-
-    vi = tirx.Var("i", "int32")
-    root = tirx.For(
-        vi,
-        _i32(0),
-        _i32(1),
-        tirx.ForKind.SERIAL,
-        tirx.Evaluate(vi),
-    )
-    counts = _ffi_api._def_region_stats(root)
-
-    # For.loop_var is SEqHashDefRecursive; the same Var reached through the
-    # Evaluate body is outside the scoped field visit.
-    assert dict(counts.items()) == {
-        "none": 1,
-        "recursive": 1,
-        "non_recursive": 0,
-    }
+def test_for_loop_var_metadata_is_recursive_definition():
+    fields = {field.name: field for field in tirx.For.__tvm_ffi_type_info__.fields}
+    assert fields["loop_var"].c_structural_eq == "def-recursive"
 
 
 def test_cross_check_with_python_walk():

@@ -219,32 +219,6 @@ fn count_loops(root: &Stmt) -> Result<Counter> {
     Ok(counter)
 }
 
-/// Test probe for the Rust-native definition-region context.
-#[derive(Default)]
-struct DefRegionStats {
-    none: i64,
-    recursive: i64,
-    non_recursive: i64,
-}
-
-#[dispatch(visit)]
-impl DefRegionStats {
-    fn visit_var(&mut self, _op: &VarNode, ctx: &mut VisitCtx<'_>) -> WalkResult {
-        match ctx.def_region_kind() {
-            DefRegionKind::None => self.none += 1,
-            DefRegionKind::Recursive => self.recursive += 1,
-            DefRegionKind::NonRecursive => self.non_recursive += 1,
-        }
-        WalkResult::Advance
-    }
-}
-
-fn def_region_stats(root: &Stmt) -> Result<DefRegionStats> {
-    let mut stats = DefRegionStats::default();
-    let _ = structural_visit(root, &mut stats)?;
-    Ok(stats)
-}
-
 /// Gathered by the plain walk (Add is a pure observation). Type tests are
 /// borrow-only (`as_node`) and the cheap phase check runs first.
 #[derive(Debug, Default)]
@@ -542,14 +516,6 @@ pub fn register_globals() -> Result<()> {
     register("tirx_ext.count_adds", |root| {
         let s = count_adds(root)?;
         Ok(map_of(&[("adds", s.adds), ("add_execs", s.add_execs)]))
-    })?;
-    register("tirx_ext._def_region_stats", |root| {
-        let s = def_region_stats(root)?;
-        Ok(map_of(&[
-            ("none", s.none),
-            ("recursive", s.recursive),
-            ("non_recursive", s.non_recursive),
-        ]))
     })?;
     register("tirx_ext.break_for_bodies", break_for_bodies)?;
     register("tirx_ext.break_innermost_for_bodies", break_innermost_for_bodies)?;

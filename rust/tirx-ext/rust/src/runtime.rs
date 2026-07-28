@@ -75,10 +75,17 @@ pub(crate) fn type_key_of(type_index: i32) -> String {
     }
 }
 
-pub(crate) fn type_attr_column(attr_name: &str) -> *const TVMFFITypeAttrColumn {
+/// Copy a borrowed type-attribute cell; the registry keeps object ownership.
+pub(crate) fn type_attr_of(type_index: i32, attr_name: &str) -> Option<TVMFFIAny> {
     unsafe {
         let attr_name = TVMFFIByteArray::from_str(attr_name);
-        TVMFFIGetTypeAttrColumn(&attr_name)
+        let column = TVMFFIGetTypeAttrColumn(&attr_name).as_ref()?;
+        let index = type_index - column.begin_index;
+        if index < 0 || index >= column.size || column.data.is_null() {
+            None
+        } else {
+            Some(*column.data.offset(index as isize))
+        }
     }
 }
 

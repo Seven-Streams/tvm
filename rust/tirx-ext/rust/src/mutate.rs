@@ -83,7 +83,7 @@ use crate::reflect::{
     FLAG_SEQ_HASH_IGNORE,
 };
 use crate::runtime::{
-    lookup_type_index, raw_of, raw_of_owned, type_attr_column, type_key_of, view_of, SeqPrefix,
+    lookup_type_index, raw_of, raw_of_owned, type_attr_of, type_key_of, view_of, SeqPrefix,
 };
 use crate::visit::VisitValue;
 
@@ -150,50 +150,35 @@ fn take_raised_error(fallback: &str) -> Error {
 /// Clone the node behind `raw` via its `__ffi_shallow_copy__` type attr:
 /// a refcount==1 copy sharing every field with the original.
 fn shallow_copy(raw: &TVMFFIAny) -> Result<Any> {
-    unsafe {
-        // Looked up per call on purpose: the column's data array can be
-        // reallocated when later registrations grow it.
-        let col = type_attr_column(SHALLOW_COPY_ATTR);
-        let cell: Option<&TVMFFIAny> = if col.is_null() {
-            None
-        } else {
-            let c = &*col;
-            let idx = raw.type_index - c.begin_index;
-            if idx >= 0 && idx < c.size {
-                Some(&*c.data.offset(idx as isize))
-            } else {
-                None
-            }
-        };
-        let copy_fn = cell
-            .and_then(|c| view_of(c).try_as::<Function>())
-            .ok_or_else(|| {
-                Error::new(
-                    RUNTIME_ERROR,
-                    &format!(
-                        "tirx_ext: type `{}` registers no {SHALLOW_COPY_ATTR} — cannot rebuild",
-                        type_key_of(raw.type_index)
-                    ),
-                    "",
-                )
-            })?;
-        let mut copy = copy_fn.call_packed(&[view_of(raw)])?;
-        // Trust but verify: the attr registry is open, a custom hook could
-        // return anything — a wild write through a non-object would follow.
-        let copy_raw = raw_of_owned(&mut copy);
-        if copy_raw.type_index != raw.type_index {
-            return Err(Error::new(
+    let copy_fn = type_attr_of(raw.type_index, SHALLOW_COPY_ATTR)
+        .as_ref()
+        .and_then(|cell| unsafe { view_of(cell) }.try_as::<Function>())
+        .ok_or_else(|| {
+            Error::new(
                 RUNTIME_ERROR,
                 &format!(
-                    "tirx_ext: {SHALLOW_COPY_ATTR} of `{}` returned a `{}`",
-                    type_key_of(raw.type_index),
-                    type_key_of(copy_raw.type_index)
+                    "tirx_ext: type `{}` registers no {SHALLOW_COPY_ATTR} — cannot rebuild",
+                    type_key_of(raw.type_index)
                 ),
                 "",
-            ));
-        }
-        Ok(copy)
+            )
+        })?;
+    let mut copy = copy_fn.call_packed(&[unsafe { view_of(raw) }])?;
+    // Trust but verify: the attr registry is open, a custom hook could
+    // return anything — a wild write through a non-object would follow.
+    let copy_raw = raw_of_owned(&mut copy);
+    if copy_raw.type_index != raw.type_index {
+        return Err(Error::new(
+            RUNTIME_ERROR,
+            &format!(
+                "tirx_ext: {SHALLOW_COPY_ATTR} of `{}` returned a `{}`",
+                type_key_of(raw.type_index),
+                type_key_of(copy_raw.type_index)
+            ),
+            "",
+        ));
     }
+    Ok(copy)
 }
 
 /// Write `value` into the field described by `field` on the (uniquely owned)

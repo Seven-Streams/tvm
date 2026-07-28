@@ -47,7 +47,7 @@ use crate::reflect::{
     for_each_field, FLAG_SEQ_HASH_DEF_NON_RECURSIVE, FLAG_SEQ_HASH_DEF_RECURSIVE,
     FLAG_SEQ_HASH_IGNORE,
 };
-use crate::runtime::{raw_of, raw_of_owned, type_attr_column, type_key_of, view_of, SeqPrefix};
+use crate::runtime::{raw_of, raw_of_owned, type_attr_of, type_key_of, view_of, SeqPrefix};
 
 #[cfg(test)]
 use tvm_ffi::tvm_ffi_sys::TVMFFIByteArray;
@@ -679,20 +679,8 @@ fn field_def_region(field: &TVMFFIFieldInfo, inherited: DefRegionKind) -> DefReg
 }
 
 fn has_foreign_structural_visit(type_index: i32) -> bool {
-    unsafe {
-        // Resolve the column for each query because later type registrations
-        // may reallocate its backing array.
-        let column = type_attr_column(STRUCTURAL_VISIT_ATTR);
-        if column.is_null() || (*column).data.is_null() {
-            return false;
-        }
-        let index = type_index - (*column).begin_index;
-        if index < 0 || index >= (*column).size {
-            return false;
-        }
-        let attr = *(*column).data.offset(index as isize);
-        attr.type_index != TVMFFITypeIndex::kTVMFFINone as i32
-    }
+    type_attr_of(type_index, STRUCTURAL_VISIT_ATTR)
+        .is_some_and(|attr| attr.type_index != TVMFFITypeIndex::kTVMFFINone as i32)
 }
 
 fn with_error_context(halt: NativeHalt, frame: &str) -> NativeHalt {
