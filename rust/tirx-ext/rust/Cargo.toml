@@ -19,6 +19,7 @@
 name = "tvm-tirx"
 version = "0.1.0"
 edition = "2021"
+autotests = false
 license = "Apache-2.0"
 description = "tirx_ext: Rust-implemented IR analysis tools exposed to Python through the tvm-ffi global function registry"
 
@@ -34,3 +35,7 @@ crate-type = ["cdylib", "rlib"]
 # Official apache/tvm-ffi via the tir submodule (pinned to upstream main).
 tvm-ffi = { path = "../../../3rdparty/tvm-ffi/rust/tvm-ffi" }
 tvm-tirx-macros = { path = "tvm-tirx-macros" }
+
+[[test]]
+name = "dispatch_public_api"
+path = "tests/dispatch_public_api.rs"
