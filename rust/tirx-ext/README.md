@@ -70,6 +70,16 @@ let mut counter = Counter::default();
 let _ = structural_visit(&root, &mut counter)?;
 ```
 
+The same stateful dispatcher can be used as a tvm-ffi-style structural walk
+with explicit callback order:
+
+```rust
+use tvm_tirx::{structural_walk, WalkOrder};
+
+let mut walker = Counter::default();
+let _ = structural_walk(&root, &mut walker, WalkOrder::PreOrder)?;
+```
+
 Typed handlers are tested in source order. Borrowed node arguments such as
 `&ForNode` and `&StmtNode` use refcount-free runtime subtype checks; owned
 FFI-compatible arguments handle POD values or object references, and a final
@@ -105,9 +115,9 @@ intended children through `VisitCtx` and return `Skip`; otherwise traversal
 returns an error instead of silently substituting reflected fields with
 potentially different semantics.
 
-`structural_visit_ordered` supports both pre-order and post-order typed
-callbacks. Traversal errors accumulate native object/field/container path
-frames. The generated API currently covers visitors; the mapper keeps its
+`structural_walk` supports both pre-order and post-order typed callbacks.
+Traversal errors accumulate native object/field/container path frames. The
+generated dispatch is shared by visitors and walkers; the mapper keeps its
 existing explicit state/function-table API.
 
 ## Development (in-repo)

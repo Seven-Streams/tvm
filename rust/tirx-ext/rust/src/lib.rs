@@ -69,8 +69,8 @@ pub use node::{
 };
 pub use tvm_tirx_macros::dispatch;
 pub use visit::{
-    structural_visit, structural_visit_ordered, walk, walk_with_context, DefRegionKind, Phase,
-    VisitCtx, VisitDispatch, VisitOrder, VisitOutcome, VisitValue, WalkResult,
+    structural_visit, structural_walk, walk, walk_with_context, DefRegionKind, Phase, VisitCtx,
+    VisitDispatch, VisitOutcome, VisitValue, WalkOrder, WalkResult,
 };
 
 use mutate::MapCtx;

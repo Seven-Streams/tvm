@@ -265,22 +265,5 @@ fn is_visit_value(value_type: &Type) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn renamed_dependency_uses_its_imported_name() {
-        assert_eq!(
-            crate_path(FoundCrate::Name("renamed_tirx".to_string())).to_string(),
-            ":: renamed_tirx"
-        );
-    }
-
-    #[test]
-    fn keyword_dependency_uses_a_raw_identifier() {
-        assert_eq!(
-            crate_path(FoundCrate::Name("type".to_string())).to_string(),
-            ":: r#type"
-        );
-    }
-}
+#[path = "../tests/crate_path.rs"]
+mod tests;
