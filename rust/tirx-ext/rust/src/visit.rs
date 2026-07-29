@@ -109,9 +109,9 @@ pub enum Phase {
     Exit,
 }
 
-/// Placement of generated typed handlers relative to child traversal.
+/// Callback order for [`structural_walk`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum VisitOrder {
+pub enum WalkOrder {
     /// Run the typed handler before the current value's children.
     #[default]
     PreOrder,
@@ -223,7 +223,7 @@ pub trait VisitDispatch: Sized {
 /// ordinary checked Rust reborrow and needs no raw visitor pointer.
 pub struct VisitCtx<'a> {
     walker: &'a NativeWalker,
-    order: VisitOrder,
+    order: WalkOrder,
     def_region_kind: DefRegionKind,
     halted: Option<NativeHalt>,
 }
@@ -282,8 +282,8 @@ impl VisitCtx<'_> {
 }
 
 trait NativeVisit {
-    fn order(&self) -> VisitOrder {
-        VisitOrder::PreOrder
+    fn order(&self) -> WalkOrder {
+        WalkOrder::PreOrder
     }
 
     fn enter(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult>;
@@ -295,28 +295,28 @@ trait NativeVisit {
 
 struct DispatchVisitor<'a, V> {
     visitor: &'a mut V,
-    order: VisitOrder,
+    order: WalkOrder,
 }
 
 impl<V: VisitDispatch> NativeVisit for DispatchVisitor<'_, V> {
-    fn order(&self) -> VisitOrder {
+    fn order(&self) -> WalkOrder {
         self.order
     }
 
     fn enter(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
         match self.order {
-            VisitOrder::PreOrder => self
+            WalkOrder::PreOrder => self
                 .visitor
                 .dispatch_visit(value, ctx)
                 .unwrap_or(Ok(WalkResult::Advance)),
-            VisitOrder::PostOrder => Ok(WalkResult::Advance),
+            WalkOrder::PostOrder => Ok(WalkResult::Advance),
         }
     }
 
     fn exit(&mut self, value: &VisitValue, ctx: &mut VisitCtx<'_>) -> Result<WalkResult> {
         match self.order {
-            VisitOrder::PreOrder => Ok(WalkResult::Advance),
-            VisitOrder::PostOrder => self
+            WalkOrder::PreOrder => Ok(WalkResult::Advance),
+            WalkOrder::PostOrder => self
                 .visitor
                 .dispatch_visit(value, ctx)
                 .unwrap_or(Ok(WalkResult::Advance)),
@@ -657,22 +657,25 @@ where
     V: VisitDispatch,
     for<'x> AnyView<'x>: From<&'x R>,
 {
-    structural_visit_ordered(root, visitor, VisitOrder::PreOrder)
+    structural_walk(root, visitor, WalkOrder::PreOrder)
 }
 
-/// Visit `root` with typed handlers placed according to `order`.
-pub fn structural_visit_ordered<R, V>(
-    root: &R,
-    visitor: &mut V,
-    order: VisitOrder,
-) -> Result<VisitOutcome>
+/// Walk `root` with typed handlers and state stored in `walker`.
+///
+/// `walker` may use [`crate::dispatch`] exactly like a visitor. Each matching
+/// handler runs once, before or after the value's children according to
+/// `order`.
+pub fn structural_walk<R, W>(root: &R, walker: &mut W, order: WalkOrder) -> Result<VisitOutcome>
 where
-    V: VisitDispatch,
+    W: VisitDispatch,
     for<'x> AnyView<'x>: From<&'x R>,
 {
-    let walker = NativeWalker::new();
-    let mut dispatch = DispatchVisitor { visitor, order };
-    finish(walker.visit_raw(
+    let native_walker = NativeWalker::new();
+    let mut dispatch = DispatchVisitor {
+        visitor: walker,
+        order,
+    };
+    finish(native_walker.visit_raw(
         raw_of(AnyView::from(root)),
         &mut dispatch,
         DefRegionKind::None,
@@ -799,7 +802,7 @@ mod tests {
         let mut probe = TypedRegionProbe::default();
         let mut dispatch = DispatchVisitor {
             visitor: &mut probe,
-            order: VisitOrder::PreOrder,
+            order: WalkOrder::PreOrder,
         };
         let mut value = Any::from(7i64);
         let mut field: TVMFFIFieldInfo = unsafe { std::mem::zeroed() };
@@ -1100,14 +1103,12 @@ mod tests {
     }
 
     #[test]
-    fn typed_dispatch_supports_post_order() {
+    fn stateful_structural_walk_supports_post_order() {
         let root = Array::new(vec![1i64, 2]);
         let mut probe = OrderProbe::default();
-        assert!(
-            structural_visit_ordered(&root, &mut probe, VisitOrder::PostOrder)
-                .unwrap()
-                .is_continue()
-        );
+        assert!(structural_walk(&root, &mut probe, WalkOrder::PostOrder)
+            .unwrap()
+            .is_continue());
         assert_eq!(probe.events, vec!["int:1", "int:2", "array"]);
     }
 
