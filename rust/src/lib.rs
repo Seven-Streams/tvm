@@ -23,5 +23,6 @@
 //! single hand patch (see `ffi_compat`); see README.md for the regeneration
 //! recipe.
 
+pub mod analysis;
 pub mod ffi_compat;
 pub mod generated;
