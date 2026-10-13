@@ -32,6 +32,7 @@
 //! ```
 
 pub mod ir;
+pub mod prim;
 pub mod runtime;
 pub mod target;
 
