@@ -33,5 +33,6 @@
 
 pub mod ir;
 pub mod runtime;
+pub mod target;
 
 pub use tvm_ffi;
