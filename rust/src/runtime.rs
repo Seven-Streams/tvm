@@ -38,7 +38,7 @@ struct FfiEnumObj {
 }
 // tvm-ffi-stubgen(end)
 
-// `ir.PtrType.memory_scope` refers to this type.
+// `ir.PtrType.storage_scope` refers to this type.
 // tvm-ffi-stubgen(begin): object/runtime.MemoryScope
 /// Opaque: parent 'ffi.Enum' is opaque (no-mirror). Fields are read through the C ABI getters.
 #[repr(C)]

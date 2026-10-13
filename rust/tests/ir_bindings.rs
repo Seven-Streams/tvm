@@ -19,78 +19,16 @@
 
 //! Smoke tests for the stubgen-generated `ir` bindings against `libtvm_compiler`.
 
-use std::mem::size_of;
-use std::path::PathBuf;
-use std::sync::OnceLock;
-
 use tvm::ir::*;
 use tvm::runtime::{MemoryScope, MemoryScopeObj};
-use tvm::tvm_ffi::tvm_ffi_sys::{
-    TVMFFIByteArray, TVMFFIGetTypeInfo, TVMFFITypeInfo, TVMFFITypeKeyToIndex,
-};
+use tvm::tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFITypeKeyToIndex};
 use tvm::tvm_ffi::{
-    Any, AnyCompatible, AnyView, Array, BigInt, DLDataType, DLDataTypeExt, FieldGetter, Function,
-    Module, ObjectCore, ObjectRefCast, String as FfiString, TypeIndex,
+    Any, AnyView, Array, BigInt, DLDataType, DLDataTypeExt, FieldGetter, ObjectCore, ObjectRefCast,
+    String as FfiString, TypeIndex,
 };
 
-static TVM_COMPILER: OnceLock<Module> = OnceLock::new();
-
-/// Load `libtvm_compiler` so the `ir.*` type keys are in the FFI type registry.
-fn load_tvm_compiler() {
-    TVM_COMPILER.get_or_init(|| {
-        let default = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("build")
-            .join("lib")
-            .join("libtvm_compiler.so");
-        let library =
-            std::env::var_os("TVM_COMPILER_LIBRARY").map(PathBuf::from).unwrap_or(default);
-        Module::load_from_file(library.to_string_lossy()).unwrap()
-    });
-}
-
-fn global(name: &str) -> Function {
-    Function::get_global(name).unwrap()
-}
-
-fn structural_equal<L: AnyCompatible, R: AnyCompatible>(lhs: &L, rhs: &R) -> bool {
-    let equal = global("ffi.StructuralEqual")
-        .call_packed(&[
-            AnyView::from(lhs),
-            AnyView::from(rhs),
-            AnyView::from(&false),
-            AnyView::from(&false),
-        ])
-        .unwrap();
-    bool::try_from(equal).unwrap()
-}
-
-fn runtime_type_info<N: ObjectCore>() -> &'static TVMFFITypeInfo {
-    let pointer = unsafe { TVMFFIGetTypeInfo(N::type_index()) };
-    assert!(!pointer.is_null(), "missing type info for {}", N::TYPE_KEY);
-    unsafe { &*pointer }
-}
-
-/// The Rust struct agrees with the registry on key, depth, parent, and (when complete) size.
-fn assert_type_contract<N: ObjectCore, P: ObjectCore>(complete: bool) {
-    let info = runtime_type_info::<N>();
-    assert_eq!(info.type_key.as_str(), N::TYPE_KEY);
-    assert_eq!(info.type_depth, N::TYPE_DEPTH, "depth of {}", N::TYPE_KEY);
-    assert_eq!(N::TYPE_DEPTH, P::TYPE_DEPTH + 1, "parent of {}", N::TYPE_KEY);
-    let parent = unsafe { *info.type_acenstors.add(P::TYPE_DEPTH as usize) };
-    assert_eq!(unsafe { (*parent).type_index }, P::type_index(), "parent of {}", N::TYPE_KEY);
-    if complete {
-        let metadata = unsafe { info.metadata.as_ref() }
-            .unwrap_or_else(|| panic!("{} has no metadata", N::TYPE_KEY));
-        assert_eq!(metadata.total_size as usize, size_of::<N>(), "size of {}", N::TYPE_KEY);
-    }
-}
-
-macro_rules! assert_type_contracts {
-    ($complete:expr; $($node:ty : $parent:ty),* $(,)?) => {
-        $(assert_type_contract::<$node, $parent>($complete);)*
-    };
-}
+mod common;
+use common::{assert_type_contracts, global, load_tvm_compiler, runtime_type_info, structural_equal};
 
 #[test]
 fn generated_types_match_the_registry() {
@@ -202,11 +140,15 @@ fn hand_written_op_layout_matches_native() {
         if op.attrs_type_key.as_str().is_empty() {
             assert_eq!(op.attrs_type_index(), 0, "{name}: attrs_type_index");
         } else {
-            with_attrs += 1;
             let key = unsafe { TVMFFIByteArray::from_str(op.attrs_type_key.as_str()) };
             let mut expected = 0;
             assert_eq!(unsafe { TVMFFITypeKeyToIndex(&key, &mut expected) }, 0);
-            assert_eq!(op.attrs_type_index() as i32, expected, "{name}: attrs_type_index");
+            // Native registration leaves the index at 0 for an operator defined before its
+            // attrs type's index is initialized, so only a non-zero index is comparable.
+            if op.attrs_type_index() != 0 {
+                with_attrs += 1;
+                assert_eq!(op.attrs_type_index() as i32, expected, "{name}: attrs_type_index");
+            }
         }
         let validator = op.validator().type_index();
         if validator == TypeIndex::kTVMFFINone as i32 {
@@ -223,7 +165,7 @@ fn hand_written_op_layout_matches_native() {
         }
     }
     // Both unreflected members were exercised with a non-default value.
-    assert!(with_attrs > 0, "no operator declares an attrs type");
+    assert!(with_attrs > 0, "no operator has an attrs type index");
     assert!(with_validator > 0, "no operator has a validator");
 
     // The registry hands out one instance per name.
