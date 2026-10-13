@@ -35,5 +35,11 @@ pub mod ir;
 pub mod prim;
 pub mod runtime;
 pub mod target;
+// `tvm-ffi-stubgen` writes the struct literal of a generated `new` on one line, however wide.
+// rustfmt would rewrap the long ones and `tvm-ffi-stubgen --check` would then report the
+// blocks as stale, so rustfmt leaves this module tree alone.
+#[rustfmt::skip]
+pub mod tirx;
+pub mod transform;
 
 pub use tvm_ffi;
