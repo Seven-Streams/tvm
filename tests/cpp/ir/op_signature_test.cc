@@ -151,4 +151,21 @@ TEST(OpSignature, DefaultsAndRepeatedRegistration) {
   EXPECT_THROW(manual.op().Validate(manual_call.get()), ffi::Error);
 }
 
+// No other translation unit sees this type, so nothing initializes its cached runtime type
+// index before the static-init block below registers the operator.
+struct StaticInitAttrs : public AttrsNode {
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("test.op_signature.StaticInitAttrs", StaticInitAttrs,
+                                    AttrsNode);
+};
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  OpDef("test.op_signature.static_init").signature(sig::call_attrs<StaticInitAttrs>());
+}
+
+TEST(OpSignature, CallAttrsInStaticInitBlock) {
+  Op op = Op::Get("test.op_signature.static_init");
+  EXPECT_EQ(op->attrs_type_key, StaticInitAttrs::_type_key);
+  EXPECT_EQ(op->attrs_type_index, StaticInitAttrs::RuntimeTypeIndex());
+}
+
 }  // namespace tvm

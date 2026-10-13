@@ -412,7 +412,8 @@ struct call_attrs : SignatureTrait {
   static constexpr size_t kCallAttrsCount = 1;
 
   void CollectMetadata(OpNode* op) const {
-    uint32_t index = T::RuntimeTypeIndex();
+    // Static-init blocks may run before the cached runtime type index is initialized.
+    uint32_t index = T::_GetOrAllocRuntimeTypeIndex();
     op->attrs_type_key = T::_type_key;
     op->attrs_type_index = index;
   }
