@@ -28,17 +28,17 @@
 //! handlers.
 
 use tvm_ffi::{
-    match_any, Any, MutContextPolicy, MutateContext, MutateValue, ObjectRefCast, ObjectRefCore,
-    Result, String, UnchangedOr,
+    match_any, Any, MutContextPolicy, MutateContext, MutateValue, ObjectRefCore, Result, String,
+    UnchangedOr,
 };
 
 use super::side_effect::{side_effect, PURE};
-use super::util::{int32_dtype, int_imm, prim_dtype, prim_type, same_option, unknown_loc, ContextExt};
+use super::util::{int32_dtype, int_imm, prim_dtype, prim_type, unknown_loc, ContextExt};
 use crate::ir::{
-    AssertStmt, Bind, Call, Evaluate, Expr, For, If, IntImm, Op, PrimType, Range, RegionStmt,
-    SeqStmt, StringImm, Type, Var,
+    AssertStmt, Bind, Call, Evaluate, Expr, For, If, Op, PrimType, Range, RegionStmt, SeqStmt,
+    StringImm, Type, Var,
 };
-use crate::prim::{And, BitwiseAnd, FloorDiv, Let, Select, EQ, GE, GT, LE, LT};
+use crate::prim::{And, BitwiseAnd, FloorDivObj, Let, Select, EQ, GE, GT, LE, LT};
 use crate::sym::{Analyzer, ConstraintContext};
 
 /// The members C++ `StmtExprMutatorWithAnalyzer` adds: the analyzer and the stack of scoped
@@ -173,14 +173,7 @@ fn descend_for<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: For) -> Res
             ctx.base().assume_facts(&binary("prim._OpGT", &extent, &zero)?)?;
             ctx.mutate_as(&op.body)
         })?;
-        if min.same_as(&op.min)
-            && extent.same_as(&op.extent)
-            && same_option(&step, &op.step)
-            && body.same_as(&op.body)
-        {
-            return Ok(op);
-        }
-        Ok(op.with(|node| {
+        Ok(op.update(|node| {
             node.min = min;
             node.extent = extent;
             node.body = body;
@@ -195,10 +188,7 @@ fn descend_bind<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Bind) -> R
     if is_prim_expr(&value) && side_effect(&value)? <= PURE {
         ctx.base().analyzer.bind(&op.var, &value)?;
     }
-    if value.same_as(&op.value) {
-        return Ok(op);
-    }
-    Ok(op.with_value(value))
+    Ok(op.update(|node| node.value = value))
 }
 
 /// Each arm assumes the condition it runs under; a constant condition selects its arm.
@@ -238,14 +228,8 @@ fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Resul
                 None => Evaluate::new(unknown_loc()?, int_imm(int32_dtype(), 0)?.into()).into(),
             });
         }
-        if condition.same_as(&op.condition)
-            && then_case.same_as(&op.then_case)
-            && same_option(&else_case, &op.else_case)
-        {
-            return Ok(op.into());
-        }
         Ok(op
-            .with(|node| {
+            .update(|node| {
                 node.condition = condition;
                 node.then_case = then_case;
                 node.else_case = else_case;
@@ -309,10 +293,7 @@ fn descend_assert<S: AnalyzerState>(
     if side_effect(&condition)? <= PURE {
         ctx.base().assume(&condition)?;
     }
-    if condition.same_as(&op.condition) {
-        return Ok(op);
-    }
-    Ok(op.with_condition(condition))
+    Ok(op.update(|node| node.condition = condition))
 }
 
 /// `if_then_else(c, t, f)`: `t` under `c`, `f` under `!c`; a constant `c` selects its value.
@@ -426,7 +407,12 @@ impl Compare {
 const DL_INT: u8 = 0;
 const DL_BOOL: u8 = 6;
 
-fn floordiv_facts(div: &FloorDiv, k: &IntImm, kind: Compare, out: &mut Vec<Expr>) -> Result<()> {
+fn floordiv_facts(
+    div: &FloorDivObj,
+    k: &crate::ir::IntImmObj,
+    kind: Compare,
+    out: &mut Vec<Expr>,
+) -> Result<()> {
     let Some(divisor) = div.b.as_node::<crate::ir::IntImmObj>() else { return Ok(()) };
     // `ffi::BigInt` arithmetic in C++; i128 covers every value an `int64` IntImm can hold.
     let (Some(divisor), Some(k)) = (divisor.value.to_i64(), k.value.to_i64()) else {
@@ -460,10 +446,10 @@ fn floordiv_facts(div: &FloorDiv, k: &IntImm, kind: Compare, out: &mut Vec<Expr>
 
 fn compare_facts(lhs: &Expr, rhs: &Expr, kind: Compare, out: &mut Vec<Expr>) -> Result<()> {
     for (div, k, kind) in [(lhs, rhs, kind), (rhs, lhs, kind.flip())] {
-        if let (Ok(div), Ok(k)) =
-            (div.clone().try_cast::<FloorDiv>(), k.clone().try_cast::<IntImm>())
+        if let (Some(div), Some(k)) =
+            (div.as_node::<FloorDivObj>(), k.as_node::<crate::ir::IntImmObj>())
         {
-            floordiv_facts(&div, &k, kind, out)?;
+            floordiv_facts(div, k, kind, out)?;
         }
     }
     Ok(())

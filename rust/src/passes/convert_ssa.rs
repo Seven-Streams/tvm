@@ -31,7 +31,8 @@ use tvm_ffi::{
     ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, WalkOrder, WalkResult,
 };
 
-use super::util::{module_pass, same_option, unknown_loc, MutatorExt};
+use super::util::{module_pass, unknown_loc, MutatorExt};
+use crate::SameField;
 use crate::ir::{
     Bind, BaseFunc, Expr, For, FuncType, GlobalVar, If, IRModule, RegionStmt, SeqStmt, Type, Var,
     While,
@@ -94,7 +95,7 @@ impl ConvertSsa {
             .transpose()?;
         if condition.same_as(&op.condition)
             && then_case.same_as(&op.then_case)
-            && same_option(&else_case, &op.else_case)
+            && else_case.same_field(&op.else_case)
         {
             return Ok(op);
         }
@@ -113,7 +114,7 @@ impl ConvertSsa {
         })?;
         let results: Array<Var> =
             m.mutate_with(self, &op.result_vars, DefRegionKind::Simple)?.try_into()?;
-        Ok(op.with(|node| {
+        Ok(op.update(|node| {
             node.args = args;
             node.body_params = params;
             node.attrs = attrs;
@@ -199,7 +200,7 @@ impl ConvertSsa {
                 Some(body) => Some(structural_mutate(body.clone(), &mut *this)?.try_into()?),
                 None => None,
             };
-            if params_same && same_option(&body, &func.body) {
+            if params_same && body.same_field(&func.body) {
                 return Ok(func);
             }
             let params = Array::new(params);

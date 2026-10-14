@@ -1099,7 +1099,7 @@ struct SeqCell {
 
 impl<T: tvm_ffi::type_traits::AnyCompatible> OpAttrMap<T> {
     /// `OpAttrMap::get(op, None)`: the value registered for `op`, if any.
-    pub fn get(&self, op: &Op) -> Result<Option<T>> {
+    pub fn get(&self, op: &OpObj) -> Result<Option<T>> {
         // SAFETY: `column` is an `ffi.List` (checked by `Op::attr_map`) that `self` keeps alive.
         // The cell is read on every lookup because growth may move the element buffer.
         let cell = unsafe {

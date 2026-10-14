@@ -110,10 +110,7 @@ impl StmtSimplifier {
             self.base.analyzer.bind(&op.var, &value)?;
             self.non_inlined_bindings.insert(ObjectIdentity::of(&op.var), value.clone());
         }
-        if value.same_as(&op.value) {
-            return Ok(op.into());
-        }
-        Ok(op.with_value(value).into())
+        Ok(op.update(|node| node.value = value).into())
     }
 
     /// A branch whose condition is provable keeps only the arm that runs.

@@ -134,7 +134,7 @@ impl CallSubstitutor<'_> {
         let body = ctx.mutate(self, &region.body);
         self.under_device_scope = previous;
         let body: SeqStmt = body?.try_into()?;
-        Ok(Any::from(region.with(|node| {
+        Ok(Any::from(region.update(|node| {
             node.args = args;
             node.body = body;
         })))

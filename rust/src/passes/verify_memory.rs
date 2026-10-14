@@ -29,9 +29,9 @@ use tvm_ffi::{
 };
 
 use super::util::{get_attr, module_pass};
-use crate::ir::{Bind, Call, Expr, Op, RegionStmt, StringImm, TensorLoad, TensorStore, Var};
+use crate::ir::{Bind, Call, CallObj, Expr, Op, RegionStmt, StringImm, TensorLoad, TensorStore, Var};
 use crate::target::Target;
-use crate::tirx::{Function, TensorType};
+use crate::tirx::{Function, TensorTypeObj};
 use crate::transform::Pass;
 
 // DLDeviceType values of the GPU devices the C++ pass checks.
@@ -62,7 +62,7 @@ struct MemoryAccessVerifier<'a> {
 /// `as_or_throw<TensorVar>().var()`: the expression must be a Var of tensor type.
 fn tensor_var(expr: &Expr) -> Result<Var> {
     match expr.clone().try_cast::<Var>() {
-        Ok(var) if var.ty.clone().try_cast::<TensorType>().is_ok() => Ok(var),
+        Ok(var) if var.ty.as_node::<TensorTypeObj>().is_some() => Ok(var),
         _ => Err(Error::new(TYPE_ERROR, "expected a tensor variable", "")),
     }
 }
@@ -72,7 +72,7 @@ impl MemoryAccessVerifier<'_> {
         let params: Vec<Var> = self.func.params.iter().collect();
         if params
             .iter()
-            .any(|param| param.ty.clone().try_cast::<TensorType>().is_ok() && param.same_as(var))
+            .any(|param| param.ty.as_node::<TensorTypeObj>().is_some() && param.same_as(var))
         {
             return true;
         }
@@ -82,7 +82,7 @@ impl MemoryAccessVerifier<'_> {
                 return true;
             }
             let Some(value) = self.defs.get(&ObjectIdentity::of(&current)) else { return false };
-            let Ok(call) = value.clone().try_cast::<Call>() else { return false };
+            let Some(call) = value.as_node::<CallObj>() else { return false };
             if !call.op.same_as(&self.ops.abi_field_get) {
                 return false;
             }

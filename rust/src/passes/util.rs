@@ -21,7 +21,7 @@
 
 use tvm_ffi::{
     Any, AnyView, Array, DLDataType, DLDataTypeCode, Function as FfiFunction, Map, MutateContext,
-    MutateDispatch, Mutator, ObjectRefCast, ObjectRefCore, RValueRef, Result, String,
+    MutateDispatch, Mutator, ObjectRefCore, RValueRef, Result, String,
 };
 
 use crate::ir::{BaseFunc, DictAttrs, GlobalVar, IRModule, IntImm, Location, PrimType, SeqStmt, Stmt};
@@ -139,16 +139,9 @@ pub fn make_const(dtype: DLDataType, value: i64) -> Result<crate::ir::Expr> {
 
 /// The dtype of a PrimExpr (`expr.ty()`); an error for any other expression.
 pub fn prim_dtype(expr: &crate::ir::Expr) -> Result<DLDataType> {
-    let ty: PrimType = expr.ty.clone().try_cast()?;
-    Ok(ty.dtype)
-}
-
-/// `same_as` for optional fields: both absent, or both the same object.
-pub fn same_option<T: ObjectRefCore>(lhs: &Option<T>, rhs: &Option<T>) -> bool {
-    match (lhs, rhs) {
-        (Some(lhs), Some(rhs)) => lhs.same_as(rhs),
-        (None, None) => true,
-        _ => false,
+    match expr.ty.as_node::<crate::ir::PrimTypeObj>() {
+        Some(ty) => Ok(ty.dtype),
+        None => Err(tvm_ffi::Error::new(tvm_ffi::TYPE_ERROR, "expected a PrimType expression", "")),
     }
 }
 

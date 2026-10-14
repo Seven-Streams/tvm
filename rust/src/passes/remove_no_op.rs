@@ -33,8 +33,8 @@ use super::util::{
     function_pass, int32, int_imm, make_const, prim_dtype, seq_stmt_from, unknown_loc, MutatorExt,
 };
 use crate::ir::{
-    CallObj, Evaluate, EvaluateObj, Expr, For, If, IntImmObj, IntSet, Op, PrimTypeObj, SeqStmt,
-    SeqStmtObj, Stmt, TensorLoadObj, TensorStore, Var,
+    CallObj, Evaluate, EvaluateObj, Expr, For, ForObj, If, IfObj, IntImmObj, IntSet, Op,
+    PrimTypeObj, SeqStmt, SeqStmtObj, Stmt, TensorLoadObj, TensorStore, Var,
 };
 use crate::sym::{neg_inf, pos_inf, Analyzer};
 use crate::tirx::transform::RemoveNoOpConfig;
@@ -60,19 +60,21 @@ impl NoOpRemover {
     /// A branch whose arms do nothing; an empty arm is dropped, negating the condition if needed.
     fn mutate_if(&mut self, op: If, m: &mut Mutator) -> Result<Stmt> {
         let stmt: Stmt = m.default_mutate_as(self, &Stmt::from(op))?;
-        let Ok(op) = stmt.clone().try_cast::<If>() else { return Ok(stmt) };
+        let Some(op) = stmt.as_node::<IfObj>() else { return Ok(stmt) };
         let then_is_no_op = is_no_op(&op.then_case);
         let else_is_no_op = op.else_case.as_ref().is_none_or(is_no_op);
-        Ok(match (then_is_no_op, else_is_no_op, &op.else_case) {
-            (true, true, _) => evaluate(&op.condition)?,
-            (false, true, Some(_)) => {
-                If::new(unknown_loc()?, op.condition.clone(), op.then_case.clone(), None).into()
-            }
-            (true, false, Some(else_case)) => {
-                If::new(unknown_loc()?, logical_not(&op.condition)?, else_case.clone(), None).into()
-            }
-            _ => stmt,
-        })
+        let rewritten = match (then_is_no_op, else_is_no_op, &op.else_case) {
+            (true, true, _) => Some(evaluate(&op.condition)?),
+            (false, true, Some(_)) => Some(
+                If::new(unknown_loc()?, op.condition.clone(), op.then_case.clone(), None).into(),
+            ),
+            (true, false, Some(else_case)) => Some(
+                If::new(unknown_loc()?, logical_not(&op.condition)?, else_case.clone(), None)
+                    .into(),
+            ),
+            _ => None,
+        };
+        Ok(rewritten.unwrap_or(stmt))
     }
 
     /// A loop that provably runs zero times, or whose body does nothing.
@@ -89,7 +91,13 @@ impl NoOpRemover {
         let stmt = m.default_mutate_as(self, &Stmt::from(op));
         self.loop_ranges.remove(&key);
         let stmt: Stmt = stmt?;
-        let result: For = stmt.clone().try_cast()?;
+        let Some(result) = stmt.as_node::<ForObj>() else {
+            return Err(tvm_ffi::Error::new(
+                tvm_ffi::TYPE_ERROR,
+                "a mutated For is no longer a For",
+                "",
+            ));
+        };
         if is_const_int(&result.extent, 0) {
             return evaluate_zero();
         }

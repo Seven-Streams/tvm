@@ -233,6 +233,29 @@ def test_lower_intrin_branches():
     assert tvm_ffi.structural_equal(native, rust, map_free_vars=True)
 
 
+def test_call_attrs_are_left_alone():
+    """The engine's default recursion follows the native structural hooks, which skip Call.attrs
+    like C++ StmtExprMutator: a floordiv in attrs stays while the one in args is lowered."""
+    tvm.ir._ffi_api.RegisterOp("test.parity.call_attrs", "")
+    op = tvm.ir.Op.get("test.parity.call_attrs")
+
+    def module():
+        x, y = tvm.tirx.Var("x", "int32"), tvm.tirx.Var("y", "int32")
+        div = tvm.tirx.floordiv(x, y)
+        call = tvm.ir.Call(op, [div], attrs={"k": div}, ty=tvm.ir.PrimType("int32"))
+        func = tvm.tirx.Function([x, y], tvm.ir.Evaluate(call)).with_attr(
+            {"target": tvm.target.Target("cuda"), "global_symbol": "main"}
+        )
+        return tvm.IRModule({"main": func})
+
+    native = tvm.tirx.transform.LowerIntrin()(module())
+    rust = tvm_ffi.get_global_func("rust.tirx.transform.LowerIntrin")()(module())
+    call = rust["main"].body.seq[0].value
+    assert not isinstance(call.args[0], tvm.tirx.FloorDiv)
+    assert isinstance(call.attrs["k"], tvm.tirx.FloorDiv)
+    assert tvm_ffi.structural_equal(native, rust, map_free_vars=True)
+
+
 def _remove_no_op_module():
     """Every RemoveNoOp rewrite: empty and provably empty loops, no-op branches on either side,
     pure evaluates, and stores of the value already in place."""

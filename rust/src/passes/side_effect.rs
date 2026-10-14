@@ -21,9 +21,9 @@
 
 use std::cell::OnceCell;
 
-use tvm_ffi::{dispatch, structural_walk, ObjectRefCast, Result, WalkOrder, WalkResult};
+use tvm_ffi::{dispatch, structural_walk, ObjectRefCore, Result, WalkOrder, WalkResult};
 
-use crate::ir::{Call, Op, OpAttrMap, TensorLoad, Type};
+use crate::ir::{Call, Op, OpAttrMap, OpObj, TensorLoad, Type};
 
 // `CallEffectKind` (include/tvm/ir/expr.h).
 pub const PURE: i64 = 1;
@@ -37,7 +37,7 @@ thread_local! {
 }
 
 /// The registered `TCallEffectKind` of `op`, if any.
-fn call_effect_kind(op: &Op) -> Result<Option<i64>> {
+fn call_effect_kind(op: &OpObj) -> Result<Option<i64>> {
     CALL_EFFECT_KIND.with(|cell| {
         if cell.get().is_none() {
             let _ = cell.set(Op::attr_map("TCallEffectKind")?);
@@ -57,9 +57,9 @@ struct EffectWalker {
 #[dispatch(walk)]
 impl EffectWalker {
     fn walk_call(&mut self, call: Call) -> Result<WalkResult> {
-        let effect = match call.op.clone().try_cast::<Op>() {
-            Ok(op) => call_effect_kind(&op)?.unwrap_or(OPAQUE),
-            Err(_) => OPAQUE,
+        let effect = match call.op.as_node::<OpObj>() {
+            Some(op) => call_effect_kind(op)?.unwrap_or(OPAQUE),
+            None => OPAQUE,
         };
         self.kind = self.kind.max(effect.min(UPDATE_STATE));
         Ok(if self.kind == UPDATE_STATE { WalkResult::Interrupt } else { WalkResult::Advance })

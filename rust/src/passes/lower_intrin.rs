@@ -22,8 +22,7 @@
 //! division and modulo to truncating forms, and fuse multiply-add.
 
 use tvm_ffi::{
-    dispatch, Mutator, Any, DLDataType, Function as FfiFunction, ObjectRefCast, ObjectRefCore,
-    Result, String,
+    dispatch, Mutator, Any, DLDataType, Function as FfiFunction, ObjectRefCore, Result, String,
 };
 
 use super::analyzer::{binary, AnalyzerBase, AnalyzerScope, AnalyzerState};
@@ -31,7 +30,7 @@ use super::util::{
     function_pass, get_attr, int_imm, make_const, prim_dtype, prim_type, seq_stmt_from,
     unknown_loc, MutatorExt,
 };
-use crate::ir::{Call, Expr, IntImmObj, Op, OpAttrMap, PrimTypeObj, Stmt, Type, Var};
+use crate::ir::{Call, Expr, IntImmObj, Op, OpAttrMap, OpObj, PrimTypeObj, Stmt, Type, Var};
 use crate::prim::{
     Add, BroadcastObj, CastObj, FloorDiv, FloorDivObj, FloorMod, FloorModObj, Max, MulObj, EQ, NE,
 };
@@ -94,13 +93,13 @@ impl LoweringRules {
 
     /// The first rule that rewrites `call`, if any.
     fn apply(&self, call: &Call) -> Result<Option<Expr>> {
-        let Ok(op) = call.op.clone().try_cast::<Op>() else { return Ok(None) };
+        let Some(op) = call.op.as_node::<OpObj>() else { return Ok(None) };
         if call.ty.as_node::<PrimTypeObj>().is_none() {
             return Ok(None);
         }
         let expr: Expr = call.clone().into();
         for column in &self.columns {
-            let Some(rule) = column.get(&op)? else { continue };
+            let Some(rule) = column.get(op)? else { continue };
             let lowered: Expr = rule.call_tuple((expr.clone(),))?.try_into()?;
             if !lowered.same_as(&expr) {
                 return Ok(Some(lowered));
