@@ -173,6 +173,44 @@ class Op(Expr):
         """
         return _ffi_api.ListOpNames()
 
+    @staticmethod
+    def list_attr_names():
+        """List registered attribute column names in unspecified order.
+
+        Returns
+        -------
+        list[str]
+            The attribute column names, such as ``"FInferType"``.
+        """
+        return _ffi_api.ListOpAttrNames()
+
+    @staticmethod
+    def get_attr_column(attr_name):
+        """Get a live attribute column of the operator registry.
+
+        The column is the storage that C++ ``OpAttrMap`` reads: entry ``op.index``
+        holds the attribute of ``op``. Unset entries are None, and the column may
+        be shorter than the number of operators. Later registrations, removals and
+        growth are visible through the returned object, so it can be cached.
+        Treat it as read-only and register values with :py:meth:`set_attr`.
+
+        Parameters
+        ----------
+        attr_name : str
+            Attribute column name.
+
+        Returns
+        -------
+        list
+            The live column.
+
+        Raises
+        ------
+        InternalError
+            If no operator has registered the column.
+        """
+        return _ffi_api.GetOpAttrColumn(attr_name)
+
     def set_attr(self, attr_name, value, override=False):
         """Set an operator attribute.
 

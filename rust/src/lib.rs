@@ -30,16 +30,32 @@
 //! ```bash
 //! tvm-ffi-stubgen rust/src --target rust --dlls build/lib/libtvm_compiler.so
 //! ```
+//!
+//! The blocks are formatted the way rustfmt formats them, so `cargo fmt --check` and
+//! `tvm-ffi-stubgen --check` agree. That needs the generator of tvm-ffi `abcc398` or later, the
+//! `3rdparty/tvm-ffi` this tree pins.
 
 pub mod ir;
+pub mod passes;
 pub mod prim;
 pub mod runtime;
+pub mod sym;
 pub mod target;
-// `tvm-ffi-stubgen` writes the struct literal of a generated `new` on one line, however wide.
-// rustfmt would rewrap the long ones and `tvm-ffi-stubgen --check` would then report the
-// blocks as stale, so rustfmt leaves this module tree alone.
-#[rustfmt::skip]
 pub mod tirx;
 pub mod transform;
 
 pub use tvm_ffi;
+
+/// Entry point for a host process that loads this crate as a shared library: registers every
+/// Rust pass as `rust.tirx.transform.<Name>`. Returns 0 on success; on failure prints the
+/// error and returns -1.
+#[no_mangle]
+pub extern "C" fn tvm_rust_register_passes() -> i32 {
+    match passes::register_globals() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("tvm_rust_register_passes: {error}");
+            -1
+        }
+    }
+}

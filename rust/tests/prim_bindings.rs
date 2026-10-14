@@ -137,7 +137,7 @@ fn other_nodes_round_trip() {
 
     // `Cast` keeps its target type in the inherited `ty`.
     let cast: Cast = global("prim.Cast")
-        .call_tuple((prim_type("float32"), o.x.clone(), loc()))
+        .call_tuple((o.x.clone(), prim_type("float32"), loc()))
         .unwrap()
         .try_into()
         .unwrap();

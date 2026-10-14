@@ -18,3 +18,4 @@
 # Cargo build output
 /target/
 /Cargo.lock
+/tests/corpus/data/

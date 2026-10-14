@@ -50,10 +50,8 @@ fn generated_types_match_the_registry() {
         tirx::TensorMapTypeObj: TypeObj, tirx::TensorTypeObj: TypeObj,
         TCGen05InstrDescriptorAttrsObj: AttrsObj, TCGen05InstrDescriptorBlockScaledAttrsObj: AttrsObj,
         TensorMapEncodeTiledAttrObj: AttrsObj,
-        AsyncAttrsObj: AttrsObj, MathAttrsObj: AttrsObj, MemoryAttrsObj: AttrsObj,
-        ScopeAttrsObj: AttrsObj, TMAAttrsObj: AttrsObj, TcCopyAttrsObj: AttrsObj,
-        TcMmaAttrsObj: AttrsObj, TrnAttrsObj: AttrsObj,
-        RemoveNoOpConfigObj: Object, StmtSimplifyConfigObj: Object, UnrollLoopConfigObj: Object,
+        ScopeAttrsObj: AttrsObj, TrnAttrsObj: AttrsObj,
+        RemoveNoOpConfigObj: Object, UnrollLoopConfigObj: Object,
         PassInfoObj: Object,
     );
     // Opaque bindings embed only their parent; the native object is larger.
@@ -187,76 +185,8 @@ fn rust_allocated_data_objects_are_read_by_native_getters() {
         l2_promotion = 4i64, oob_fill = 5i64, force_cu_dtype = 6i64,
     );
 
-    let async_attrs = AsyncAttrs::new(s("thread"), true, s("zero"), 9);
-    assert_fields!(async_attrs;
-        scope = s("thread"), direct = true, fill_mode = s("zero"), prefetch_size = 9i64,
-    );
-
-    let math = MathAttrs::new(s("warp"), Optional::some(s("rn")));
-    assert_fields!(math; scope = s("warp"));
-    assert_fields!(math; optional; rounding_mode = Some(s("rn")));
-
-    let memory = MemoryAttrs::new(
-        s("cta"),
-        128,
-        Optional::some(s("c")),
-        Optional::none(),
-        Optional::some(s("l2")),
-        Optional::none(),
-    );
-    assert_fields!(memory; scope = s("cta"), vec_bits = 128i64);
-    assert_fields!(memory; optional;
-        cache = Some(s("c")), l1_evict = None::<FfiString>, l2_evict = Some(s("l2")),
-        prefetch_size = None::<FfiString>,
-    );
-
     let scope_attrs = ScopeAttrs::new(s("kernel"));
     assert_fields!(scope_attrs; scope = s("kernel"));
-
-    let tma = TMAAttrs::new(
-        s("thread"),
-        s("mode"),
-        2,
-        s("hint"),
-        Optional::some(s("u8")),
-        Optional::some(1i64),
-        true,
-        Optional::none(),
-        Optional::some(s("add")),
-    );
-    assert_fields!(tma;
-        scope = s("thread"), descriptor_mode = s("mode"), cta_group = 2i64, cache_hint = s("hint"),
-        prefetch_tensormap = true,
-    );
-    assert_fields!(tma; optional; tma_dtype = Some(s("u8")), reduce_op = Some(s("add")));
-    assert_fields!(tma; optional; oob = Some(1i64), tensormap_l2_promotion = None::<i64>);
-
-    let copy = TcCopyAttrs::new(
-        s("thread"),
-        Optional::some(s("4x256b")),
-        Optional::none(),
-        1,
-        Optional::some(s("d")),
-    );
-    assert_fields!(copy; scope = s("thread"), cta_group = 1i64);
-    assert_fields!(copy; optional;
-        shape = Some(s("4x256b")), multicast = None::<FfiString>, decompress = Some(s("d")),
-    );
-
-    let mma = TcMmaAttrs::new(
-        s("thread"),
-        2,
-        Optional::some(64i64),
-        Optional::none(),
-        s("desc"),
-        true,
-        Optional::some(false),
-    );
-    assert_fields!(mma;
-        scope = s("thread"), cta_group = 2i64, smem_desc = s("desc"), is_AB_tf32 = true,
-    );
-    assert_fields!(mma; optional; mma_m = Some(64i64), mma_n = None::<i64>);
-    assert_fields!(mma; optional; weight_stationary = Some(false));
 
     let axes: Array<i64> = Array::new(vec![0, 2]);
     let trn = TrnAttrs::new(
@@ -278,12 +208,6 @@ fn rust_allocated_data_objects_are_read_by_native_getters() {
 
     let remove_no_op = RemoveNoOpConfig::new(5, true);
     assert_fields!(remove_no_op; max_simplification_steps = 5i64, ignore_profiler_call = true);
-
-    let simplify = StmtSimplifyConfig::new(true, false, true);
-    assert_fields!(simplify;
-        transitively_prove_inequalities = true, convert_boolean_to_and_of_ors = false,
-        apply_constraints_to_boolean_branches = true,
-    );
 
     let unroll = UnrollLoopConfig::new(1, 2, 3, 4, 5);
     assert_fields!(unroll;

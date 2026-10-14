@@ -2747,7 +2747,7 @@ tvm_ffi::impl_object_upcast!(PrimType => Type);
 pub struct PtrTypeObj {
     base: TypeObj,
     pub element_type: Type,
-    pub storage_scope: MemoryScope,
+    pub scope: MemoryScope,
 }
 
 const _: () = {
@@ -2776,16 +2776,16 @@ impl Deref for PtrTypeObj {
 }
 
 impl PtrTypeObj {
-    pub(crate) fn new(loc: Location, element_type: Type, storage_scope: MemoryScope) -> Self {
+    pub(crate) fn new(loc: Location, element_type: Type, scope: MemoryScope) -> Self {
         let base = TypeObj::new(loc);
-        Self { base, element_type, storage_scope }
+        Self { base, element_type, scope }
     }
 }
 
 impl PtrType {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, element_type: Type, storage_scope: MemoryScope) -> Self {
-        let obj = PtrTypeObj::new(loc, element_type, storage_scope);
+    pub fn new(loc: Location, element_type: Type, scope: MemoryScope) -> Self {
+        let obj = PtrTypeObj::new(loc, element_type, scope);
         Self { base: ObjectArc::new(obj) }
     }
 }

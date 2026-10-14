@@ -115,6 +115,47 @@ def test_op_set_signature_checks_counts_without_types_or_attrs():
     assert call.attrs is not None
 
 
+def test_op_attr_column_names_and_values():
+    names = tvm.ir.Op.list_attr_names()
+    assert {"FInferType", "FPurity", "TCallEffectKind"} <= set(names)
+    for name in names:
+        assert tvm.ir.Op.get("relax.nn.softmax").has_attr(name)
+
+    column = tvm.ir.Op.get_attr_column("FPurity")
+    for op_name in tvm.ir.Op.list_op_names():
+        op = tvm.ir.Op.get(op_name)
+        value = column[op.index] if op.index < len(column) else None
+        assert value == op.get_attr("FPurity"), op_name
+
+    with pytest.raises(tvm.error.InternalError, match="is not registered"):
+        tvm.ir.Op.get_attr_column("test.MissingAttrColumn")
+
+
+def test_op_attr_column_is_live():
+    key = "test.LiveAttrColumn"
+    tvm.ir._ffi_api.RegisterOp("test.live_attr_column.first", "")
+    first = tvm.ir.Op.get("test.live_attr_column.first")
+    assert key not in tvm.ir.Op.list_attr_names()
+    first.set_attr(key, 7)
+    assert key in tvm.ir.Op.list_attr_names()
+
+    column = tvm.ir.Op.get_attr_column(key)
+    assert len(column) == first.index + 1
+    assert column[first.index] == 7
+
+    # A later Op grows the same column object; a cached handle sees it.
+    tvm.ir._ffi_api.RegisterOp("test.live_attr_column.second", "")
+    second = tvm.ir.Op.get("test.live_attr_column.second")
+    second.set_attr(key, 8)
+    assert len(column) == second.index + 1
+    assert column[second.index] == 8
+    first.set_attr(key, 9, override=True)
+    assert column[first.index] == 9
+    first.reset_attr(key)
+    assert column[first.index] is None
+    assert tvm.ir.Op.get_attr_column(key).same_as(column)
+
+
 if __name__ == "__main__":
     test_dict_attrs()
     test_attrs_equal()

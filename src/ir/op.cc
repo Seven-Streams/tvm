@@ -64,6 +64,12 @@ class OpRegistry {
 
   bool HasAttrMap(const ffi::String& name) const { return attrs_.count(name); }
 
+  ffi::Array<ffi::String> ListAttrNames() const {
+    ffi::Array<ffi::String> names;
+    for (const auto& [name, column] : attrs_) names.push_back(name);
+    return names;
+  }
+
   ffi::List<ffi::Any> GetAttrColumn(const ffi::String& name) const {
     auto column = attrs_.Get(name);
     TVM_FFI_CHECK(column.has_value(), InternalError)
@@ -108,6 +114,16 @@ bool Op::HasAttrMap(const ffi::String& name) { return OpRegistry::Global()->HasA
 ffi::List<ffi::Any> Op::GetAttrColumn(const ffi::String& name) {
   return OpRegistry::Global()->GetAttrColumn(name);
 }
+
+namespace {
+
+ffi::Array<ffi::String> ListOpAttrNames() { return OpRegistry::Global()->ListAttrNames(); }
+
+ffi::List<ffi::Any> GetOpAttrColumn(const ffi::String& name) {
+  return OpRegistry::Global()->GetAttrColumn(name);
+}
+
+}  // namespace
 
 OpDef::OpDef(const ffi::String& name) : op_(OpRegistry::Global()->GetOrCreate(name)) {}
 
@@ -241,6 +257,17 @@ void OpNode::RegisterReflection() {
       .def_static(
           "list_op_names", &Op::ListNames,
           "list_op_names() -> list[str]\n\nReturn registered operator names in unspecified order.")
+      .def_static(
+          "list_attr_names", &ListOpAttrNames,
+          "list_attr_names() -> list[str]\n\nReturn registered attribute column names in "
+          "unspecified order.")
+      .def_static(
+          "get_attr_column", &GetOpAttrColumn,
+          "get_attr_column(attr_name: str) -> list\n\nReturn the live attribute column indexed by "
+          "Op.index, the storage C++ OpAttrMap reads. Unset entries are None and the column may be "
+          "shorter than the Op count; later registrations are visible through the same object. "
+          "Treat it as read-only and register values with set_attr. An unregistered column raises "
+          "InternalError.")
       .def(
           "get_attr",
           [](Op op, ffi::String name) {
@@ -327,6 +354,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef()
       .def("ir.GetOp", &Op::Get)
       .def("ir.ListOpNames", &Op::ListNames)
+      .def("ir.ListOpAttrNames", &ListOpAttrNames)
+      .def("ir.GetOpAttrColumn", &GetOpAttrColumn)
       .def("ir.RegisterOp",
            [](ffi::String name, ffi::String doc) {
              TVM_FFI_CHECK(!OpRegistry::Global()->Contains(name), AttributeError)

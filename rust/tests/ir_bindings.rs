@@ -76,13 +76,13 @@ fn native_objects_are_read_through_generated_fields() {
     let ty: PrimType = value.ty.clone().try_cast().unwrap();
     assert_eq!(ty.dtype, int32);
 
-    // `PtrType.storage_scope` is the one field whose type lives outside `ir`.
+    // `PtrType.scope` is the one field whose type lives outside `ir`.
     let pointer: PtrType = global("ir.PtrType")
         .call_tuple((ty.clone(), tvm::tvm_ffi::String::from("global")))
         .unwrap()
         .try_into()
         .unwrap();
-    let _scope: &MemoryScope = &pointer.storage_scope;
+    let _scope: &MemoryScope = &pointer.scope;
     assert!(structural_equal(&pointer.element_type, &ty));
 }
 

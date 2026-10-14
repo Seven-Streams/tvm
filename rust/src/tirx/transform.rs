@@ -75,65 +75,6 @@ impl RemoveNoOpConfig {
 }
 // tvm-ffi-stubgen(end)
 
-// tvm-ffi-stubgen(begin): object/tirx.transform.StmtSimplifyConfig
-/// Complete: reflected fields fill [24, 32) exactly (alignment padding [27, 32)).
-#[repr(C)]
-#[derive(tvm_ffi::derive::Object)]
-#[type_key = "tirx.transform.StmtSimplifyConfig"]
-#[type_final]
-pub struct StmtSimplifyConfigObj {
-    base: Object,
-    pub transitively_prove_inequalities: bool,
-    pub convert_boolean_to_and_of_ors: bool,
-    pub apply_constraints_to_boolean_branches: bool,
-}
-
-const _: () = {
-    assert!(::core::mem::size_of::<StmtSimplifyConfigObj>() == 32);
-    assert!(::core::mem::align_of::<StmtSimplifyConfigObj>() == 8);
-};
-
-#[repr(C)]
-#[derive(tvm_ffi::derive::ObjectRef, Clone)]
-pub struct StmtSimplifyConfig {
-    base: ObjectArc<StmtSimplifyConfigObj>,
-}
-
-impl Deref for StmtSimplifyConfig {
-    type Target = StmtSimplifyConfigObj;
-    fn deref(&self) -> &StmtSimplifyConfigObj {
-        &self.base
-    }
-}
-
-impl StmtSimplifyConfigObj {
-    pub(crate) fn new(
-        transitively_prove_inequalities: bool,
-        convert_boolean_to_and_of_ors: bool,
-        apply_constraints_to_boolean_branches: bool,
-    ) -> Self {
-        let base = Object::new();
-        Self { base, transitively_prove_inequalities, convert_boolean_to_and_of_ors, apply_constraints_to_boolean_branches }
-    }
-}
-
-impl StmtSimplifyConfig {
-    /// Lossless complete-field allocation.
-    pub fn new(
-        transitively_prove_inequalities: bool,
-        convert_boolean_to_and_of_ors: bool,
-        apply_constraints_to_boolean_branches: bool,
-    ) -> Self {
-        let obj = StmtSimplifyConfigObj::new(
-            transitively_prove_inequalities,
-            convert_boolean_to_and_of_ors,
-            apply_constraints_to_boolean_branches,
-        );
-        Self { base: ObjectArc::new(obj) }
-    }
-}
-// tvm-ffi-stubgen(end)
-
 // tvm-ffi-stubgen(begin): object/tirx.transform.UnrollLoopConfig
 /// Complete: reflected fields fill [24, 48) exactly (alignment padding [44, 48)).
 #[repr(C)]
@@ -176,7 +117,14 @@ impl UnrollLoopConfigObj {
         unroll_local_access: i32,
     ) -> Self {
         let base = Object::new();
-        Self { base, auto_max_step, auto_max_depth, auto_max_extent, explicit_unroll, unroll_local_access }
+        Self {
+            base,
+            auto_max_step,
+            auto_max_depth,
+            auto_max_extent,
+            explicit_unroll,
+            unroll_local_access,
+        }
     }
 }
 

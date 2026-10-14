@@ -24,6 +24,9 @@ publish = false
 
 [lib]
 name = "tvm"
+# `cdylib` lets a Python process with TVM loaded register the Rust passes
+# (see `tvm_rust_register_passes` in src/lib.rs and tests/test_pass_parity.py).
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 tvm-ffi = { path = "../3rdparty/tvm-ffi/rust/tvm-ffi" }

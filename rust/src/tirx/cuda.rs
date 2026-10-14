@@ -98,7 +98,22 @@ impl TCGen05InstrDescriptorAttrsObj {
         is_sparse: bool,
     ) -> Self {
         let base = AttrsObj::new();
-        Self { base, d_dtype, a_dtype, b_dtype, M, N, K, trans_a, trans_b, n_cta_groups, neg_a, neg_b, sat_d, is_sparse }
+        Self {
+            base,
+            d_dtype,
+            a_dtype,
+            b_dtype,
+            M,
+            N,
+            K,
+            trans_a,
+            trans_b,
+            n_cta_groups,
+            neg_a,
+            neg_b,
+            sat_d,
+            is_sparse,
+        }
     }
 }
 
@@ -208,7 +223,23 @@ impl TCGen05InstrDescriptorBlockScaledAttrsObj {
         is_sparse: bool,
     ) -> Self {
         let base = AttrsObj::new();
-        Self { base, d_dtype, a_dtype, b_dtype, sfa_dtype, sfb_dtype, M, N, K, trans_a, trans_b, n_cta_groups, neg_a, neg_b, is_sparse }
+        Self {
+            base,
+            d_dtype,
+            a_dtype,
+            b_dtype,
+            sfa_dtype,
+            sfb_dtype,
+            M,
+            N,
+            K,
+            trans_a,
+            trans_b,
+            n_cta_groups,
+            neg_a,
+            neg_b,
+            is_sparse,
+        }
     }
 }
 
@@ -306,7 +337,16 @@ impl TensorMapEncodeTiledAttrObj {
         force_cu_dtype: i64,
     ) -> Self {
         let base = AttrsObj::new();
-        Self { base, descriptor_dtype, rank, interleave, swizzle, l2_promotion, oob_fill, force_cu_dtype }
+        Self {
+            base,
+            descriptor_dtype,
+            rank,
+            interleave,
+            swizzle,
+            l2_promotion,
+            oob_fill,
+            force_cu_dtype,
+        }
     }
 }
 

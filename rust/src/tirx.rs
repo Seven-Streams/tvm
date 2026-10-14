@@ -151,12 +151,8 @@ impl CallFFIKernelAttr {
         num_kernel_args: i64,
         kernel_attrs: Map<String, i64>,
     ) -> Self {
-        let obj = CallFFIKernelAttrObj::new(
-            launch_params,
-            launch_fields,
-            num_kernel_args,
-            kernel_attrs,
-        );
+        let obj =
+            CallFFIKernelAttrObj::new(launch_params, launch_fields, num_kernel_args, kernel_attrs);
         Self { base: ObjectArc::new(obj) }
     }
 }
@@ -681,7 +677,17 @@ impl TensorTypeObj {
         layout: Option<Layout>,
     ) -> Self {
         let base = TypeObj::new(loc);
-        Self { base, dtype, scope, shape, strides, elem_offset, data_alignment, offset_factor, layout }
+        Self {
+            base,
+            dtype,
+            scope,
+            shape,
+            strides,
+            elem_offset,
+            data_alignment,
+            offset_factor,
+            layout,
+        }
     }
 }
 
