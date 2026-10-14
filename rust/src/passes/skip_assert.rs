@@ -22,7 +22,7 @@
 
 use tvm_ffi::{dispatch, structural_mutate, Result, Unchanged};
 
-use super::util::{function_pass, int32, unknown_loc, with_body};
+use super::util::{function_pass, int32, unknown_loc};
 use crate::ir::{AssertStmt, Evaluate, Expr, SeqStmt};
 use crate::transform::Pass;
 
@@ -43,6 +43,6 @@ pub fn skip_assert() -> Result<Pass> {
     function_pass("tirx.SkipAssert", 0, |func, _module, _context| {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         let body: SeqStmt = structural_mutate(body, &mut AssertSkipper)?.try_into()?;
-        Ok(Some(with_body(&func, Some(body))))
+        Ok(Some(func.with_body(Some(body))))
     })
 }

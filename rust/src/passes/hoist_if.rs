@@ -29,7 +29,7 @@ use tvm_ffi::{
 
 use super::convert_ssa::convert_ssa_stmt;
 use super::side_effect::{side_effect, READ_STATE};
-use super::util::{function_pass, seq_stmt_from, sequential, unknown_loc, with_body};
+use super::util::{function_pass, seq_stmt_from, sequential, unknown_loc};
 use crate::ir::{
     Call, Expr, For, If, IntImmObj, Op, PrimTypeObj, RegionStmt, SeqStmt, Stmt, TensorLoad, Type,
     Var,
@@ -293,7 +293,7 @@ pub fn insert_hoisted_if() -> Result<Pass> {
         };
         let body: Stmt = structural_mutate(body, &mut hoister)?.try_into()?;
         let body = convert_ssa_stmt(seq_stmt_from(body)?)?;
-        Ok(Some(with_body(&func, Some(body))))
+        Ok(Some(func.with_body(Some(body))))
     })
 }
 

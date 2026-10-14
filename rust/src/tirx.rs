@@ -341,6 +341,28 @@ impl Function {
 tvm_ffi::impl_object_upcast!(Function => Expr, Function => BaseFunc);
 // tvm-ffi-stubgen(end)
 
+// Copy-on-write edits; `attrs` belongs to the `ir.BaseFunc` parent, so it has its own method.
+impl_with_fields!(Function, FunctionObj, new(loc, ty, attrs, params, ret_type, body), {
+    with_params: params: Array<Var>,
+    with_ret_type: ret_type: Type,
+    with_body: body: Option<SeqStmt>,
+});
+
+impl Function {
+    /// A copy with `attrs` replaced (C++ `CopyOnWrite()->attrs = attrs`).
+    pub fn with_attrs(&self, attrs: DictAttrs) -> Self {
+        let obj = FunctionObj::new(
+            self.loc.clone(),
+            self.ty.clone(),
+            attrs,
+            self.params.clone(),
+            self.ret_type.clone(),
+            self.body.clone(),
+        );
+        Self { base: ObjectArc::new(obj) }
+    }
+}
+
 // tvm-ffi-stubgen(begin): object/tirx.FunctionPass
 /// Opaque: parent 'transform.Pass' is opaque (layout-unknown). Fields are read through the C ABI getters.
 #[repr(C)]

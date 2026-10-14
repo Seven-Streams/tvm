@@ -31,7 +31,7 @@ use tvm_ffi::{
 use super::analyzer::{binary, bind_range, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::side_effect::{side_effect, PURE};
 use super::util::{
-    function_pass, int32, make_const, prim_dtype, seq_stmt_from, unknown_loc, with_body, MutatorExt,
+    function_pass, int32, make_const, prim_dtype, seq_stmt_from, unknown_loc, MutatorExt,
 };
 use crate::ir::{
     Bind, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, Op, PrimTypeObj, SeqStmt, Stmt,
@@ -99,7 +99,7 @@ impl StmtSimplifier {
                     call.attrs.clone(),
                     call.ty_args.clone(),
                 );
-                return Ok(Bind::new(op.loc.clone(), op.var.clone(), value.into()).into());
+                return Ok(op.with_value(value.into()).into());
             }
         }
         if op.value.ty.as_node::<PrimTypeObj>().is_none() {
@@ -113,7 +113,7 @@ impl StmtSimplifier {
         if value.same_as(&op.value) {
             return Ok(op.into());
         }
-        Ok(Bind::new(op.loc.clone(), op.var.clone(), value).into())
+        Ok(op.with_value(value).into())
     }
 
     /// A branch whose condition is provable keeps only the arm that runs.
@@ -310,6 +310,6 @@ pub fn stmt_simplify() -> Result<Pass> {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         let body = inline_string_bindings(body)?;
         let body: Stmt = tvm_ffi::structural_mutate(body, &mut simplifier)?.try_into()?;
-        Ok(Some(with_body(&func, Some(seq_stmt_from(body)?))))
+        Ok(Some(func.with_body(Some(seq_stmt_from(body)?))))
     })
 }

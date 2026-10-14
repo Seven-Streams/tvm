@@ -30,8 +30,7 @@ use tvm_ffi::{
 use super::analyzer::{binary, is_const_int, not, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::side_effect::{side_effect, READ_STATE};
 use super::util::{
-    function_pass, int32, int_imm, make_const, prim_dtype, seq_stmt_from, unknown_loc, with_body,
-    MutatorExt,
+    function_pass, int32, int_imm, make_const, prim_dtype, seq_stmt_from, unknown_loc, MutatorExt,
 };
 use crate::ir::{
     CallObj, Evaluate, EvaluateObj, Expr, For, If, IntImmObj, IntSet, Op, PrimTypeObj, SeqStmt,
@@ -266,6 +265,6 @@ pub fn remove_no_op() -> Result<Pass> {
             profiler_ops,
         };
         let body: Stmt = tvm_ffi::structural_mutate(body, &mut remover)?.try_into()?;
-        Ok(Some(with_body(&func, Some(seq_stmt_from(body)?))))
+        Ok(Some(func.with_body(Some(seq_stmt_from(body)?))))
     })
 }

@@ -76,28 +76,9 @@ pub fn native_pass(factory: &str) -> Result<Pass> {
     FfiFunction::get_global(factory)?.call_packed(&[])?.try_into()
 }
 
-/// `func` with a new body and every other field kept (C++ `f.CopyOnWrite()->body = body`).
-pub fn with_body(func: &Function, body: Option<SeqStmt>) -> Function {
-    Function::new(
-        func.loc.clone(),
-        func.ty.clone(),
-        func.attrs.clone(),
-        func.params.clone(),
-        func.ret_type.clone(),
-        body,
-    )
-}
-
 /// `WithAttr(func, key, value)`.
 pub fn with_attr(func: &Function, key: &str, value: Any) -> Function {
-    Function::new(
-        func.loc.clone(),
-        func.ty.clone(),
-        dict_with(&func.attrs, key, value),
-        func.params.clone(),
-        func.ret_type.clone(),
-        func.body.clone(),
-    )
+    func.with_attrs(dict_with(&func.attrs, key, value))
 }
 
 /// The process-wide `UnknownLoc()` singleton; a fresh `UnknownLoc::new()` would be a second one.
@@ -278,18 +259,6 @@ pub fn module_with_function(module: &IRModule, gvar: &GlobalVar, func: BaseFunc)
         module.attrs.clone(),
         module.global_infos.clone(),
         module.global_var_map.clone(),
-    )
-}
-
-/// `func` with its attributes replaced.
-pub fn with_attrs(func: &Function, attrs: DictAttrs) -> Function {
-    Function::new(
-        func.loc.clone(),
-        func.ty.clone(),
-        attrs,
-        func.params.clone(),
-        func.ret_type.clone(),
-        func.body.clone(),
     )
 }
 

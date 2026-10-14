@@ -28,7 +28,7 @@ use tvm_ffi::{
     VisitInterrupt, WalkOrder, WalkResult, WalkWithContextPolicy,
 };
 
-use super::util::{dict_without, get_attr, has_nonzero_attr, module_pass, with_attr, with_attrs};
+use super::util::{dict_without, get_attr, has_nonzero_attr, module_pass, with_attr};
 use crate::ir::{BaseFunc, Call, Expr, GlobalVar, IRModule, Op, RegionStmt, SeqStmt};
 use crate::target::Target;
 use crate::tirx::Function;
@@ -118,14 +118,7 @@ impl CallSubstitutor<'_> {
         if !self.under_device_scope {
             if let Ok(old) = call.op.clone().try_cast::<GlobalVar>() {
                 if let Some(new) = self.replacements.get(&ObjectIdentity::of(&old)) {
-                    return Ok(Any::from(Call::new(
-                        call.loc.clone(),
-                        call.ty.clone(),
-                        new.clone().into(),
-                        call.args.clone(),
-                        call.attrs.clone(),
-                        call.ty_args.clone(),
-                    )));
+                    return Ok(Any::from(call.with_op(new.clone().into())));
                 }
             }
         }
@@ -141,15 +134,10 @@ impl CallSubstitutor<'_> {
         let body = ctx.mutate(self, &region.body);
         self.under_device_scope = previous;
         let body: SeqStmt = body?.try_into()?;
-        Ok(Any::from(RegionStmt::new(
-            region.loc.clone(),
-            region.op.clone(),
-            args,
-            region.body_params.clone(),
-            region.attrs.clone(),
-            body,
-            region.result_vars.clone(),
-        )))
+        Ok(Any::from(region.with(|node| {
+            node.args = args;
+            node.body = body;
+        })))
     }
 }
 
@@ -257,7 +245,7 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
             let host = with_host(&target_host, Some(&target_host))?;
             let bound = with_attr(&function, TARGET, Any::from(host));
             let attrs = dict_without(&bound.attrs, IS_HOST_FUNC);
-            state.update(&gvar, with_attrs(&bound, attrs).into());
+            state.update(&gvar, bound.with_attrs(attrs).into());
             continue;
         }
         if exposed {
@@ -314,8 +302,7 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
                 (None, None) => true,
                 _ => false,
             };
-            let updated =
-                if unchanged { function } else { super::util::with_body(&function, body) };
+            let updated = if unchanged { function } else { function.with_body(body) };
             state.update(&gvar, updated.into());
         }
     }

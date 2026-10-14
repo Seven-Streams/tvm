@@ -1132,6 +1132,53 @@ impl<T: tvm_ffi::type_traits::AnyCompatible> OpAttrMap<T> {
     }
 }
 
+// Copy-on-write edits (`with` / `with_<field>`) for the nodes passes rebuild.
+impl_with_fields!(Call, CallObj, new(loc, ty, op, args, attrs, ty_args), {
+    with_op: op: Expr,
+    with_args: args: Array<Expr>,
+    with_attrs: attrs: Option<Attrs>,
+    with_ty_args: ty_args: Array<Type>,
+});
+impl_with_fields!(Bind, BindObj, new(loc, var, value), {
+    with_var: var: Var,
+    with_value: value: Expr,
+});
+impl_with_fields!(Evaluate, EvaluateObj, new(loc, value), {
+    with_value: value: Expr,
+});
+impl_with_fields!(AssertStmt, AssertStmtObj, new(loc, condition, error_kind, message_parts), {
+    with_condition: condition: Expr,
+    with_error_kind: error_kind: StringImm,
+    with_message_parts: message_parts: Array<StringImm>,
+});
+impl_with_fields!(If, IfObj, new(loc, condition, then_case, else_case), {
+    with_condition: condition: Expr,
+    with_then_case: then_case: SeqStmt,
+    with_else_case: else_case: Option<SeqStmt>,
+});
+impl_with_fields!(For, ForObj, new(loc, loop_var, min, extent, kind, body, annotations, step), {
+    with_loop_var: loop_var: Var,
+    with_min: min: Expr,
+    with_extent: extent: Expr,
+    with_kind: kind: i32,
+    with_body: body: SeqStmt,
+    with_annotations: annotations: Map<String, Any>,
+    with_step: step: Option<Expr>,
+});
+impl_with_fields!(
+    RegionStmt,
+    RegionStmtObj,
+    new(loc, op, args, body_params, attrs, body, result_vars),
+    {
+        with_op: op: Op,
+        with_args: args: Array<Expr>,
+        with_body_params: body_params: Array<Var>,
+        with_attrs: attrs: DictAttrs,
+        with_body: body: SeqStmt,
+        with_result_vars: result_vars: Array<Var>,
+    }
+);
+
 // tvm-ffi-stubgen(begin): object/ir.OpaqueExpr
 /// Complete: reflected fields fill [40, 40) exactly.
 #[repr(C)]

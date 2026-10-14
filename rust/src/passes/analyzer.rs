@@ -180,16 +180,12 @@ fn descend_for<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: For) -> Res
         {
             return Ok(op);
         }
-        Ok(For::new(
-            op.loc.clone(),
-            op.loop_var.clone(),
-            min,
-            extent,
-            op.kind,
-            body,
-            op.annotations.clone(),
-            step,
-        ))
+        Ok(op.with(|node| {
+            node.min = min;
+            node.extent = extent;
+            node.body = body;
+            node.step = step;
+        }))
     })
 }
 
@@ -202,7 +198,7 @@ fn descend_bind<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Bind) -> R
     if value.same_as(&op.value) {
         return Ok(op);
     }
-    Ok(Bind::new(op.loc.clone(), op.var.clone(), value))
+    Ok(op.with_value(value))
 }
 
 /// Each arm assumes the condition it runs under; a constant condition selects its arm.
@@ -248,7 +244,13 @@ fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Resul
         {
             return Ok(op.into());
         }
-        Ok(If::new(op.loc.clone(), condition, then_case, else_case).into())
+        Ok(op
+            .with(|node| {
+                node.condition = condition;
+                node.then_case = then_case;
+                node.else_case = else_case;
+            })
+            .into())
     })
 }
 
@@ -310,7 +312,7 @@ fn descend_assert<S: AnalyzerState>(
     if condition.same_as(&op.condition) {
         return Ok(op);
     }
-    Ok(AssertStmt::new(op.loc.clone(), condition, op.error_kind.clone(), op.message_parts.clone()))
+    Ok(op.with_condition(condition))
 }
 
 /// `if_then_else(c, t, f)`: `t` under `c`, `f` under `!c`; a constant `c` selects its value.

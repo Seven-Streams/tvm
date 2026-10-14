@@ -35,6 +35,32 @@
 //! `tvm-ffi-stubgen --check` agree. That needs the generator of tvm-ffi `abcc398` or later, the
 //! `3rdparty/tvm-ffi` this tree pins.
 
+/// Copy-on-write edits for a complete, `#[type_final]` node, written next to its binding.
+///
+/// `node.with(|n| { n.a = a; n.b = b; })` is C++ `auto* n = node.CopyOnWrite(); n->a = a; ...`:
+/// a copy that keeps every other field and runs no constructor logic. Each listed
+/// `with_<field>(value)` replaces one field. `new(...)` names the `<Node>Obj::new` arguments in
+/// order; fields of an ancestor (such as `loc`) are copied but cannot be edited in `with`.
+macro_rules! impl_with_fields {
+    ($node:ident, $obj:ident, new($($arg:ident),+ $(,)?), {$($method:ident: $field:ident: $ty:ty),+ $(,)?}) => {
+        impl $node {
+            /// A copy with the fields `edit` assigns replaced (C++ `CopyOnWrite()`).
+            #[allow(clippy::clone_on_copy)]
+            pub fn with(&self, edit: impl FnOnce(&mut $obj)) -> Self {
+                let mut obj = $obj::new($(self.$arg.clone()),+);
+                edit(&mut obj);
+                Self { base: ObjectArc::new(obj) }
+            }
+            $(
+                #[doc = concat!("A copy with `", stringify!($field), "` replaced.")]
+                pub fn $method(&self, $field: $ty) -> Self {
+                    self.with(|node| node.$field = $field)
+                }
+            )+
+        }
+    };
+}
+
 pub mod ir;
 pub mod passes;
 pub mod prim;

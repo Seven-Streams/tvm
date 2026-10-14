@@ -29,7 +29,7 @@ use tvm_ffi::{
 use super::analyzer::{binary, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::util::{
     function_pass, get_attr, int_imm, make_const, prim_dtype, prim_type, seq_stmt_from,
-    unknown_loc, with_body, MutatorExt,
+    unknown_loc, MutatorExt,
 };
 use crate::ir::{Call, Expr, IntImmObj, Op, OpAttrMap, PrimTypeObj, Stmt, Type, Var};
 use crate::prim::{
@@ -479,6 +479,6 @@ pub fn lower_intrin() -> Result<Pass> {
             support_bitwise_op: true,
         };
         let body: Stmt = tvm_ffi::structural_mutate(body, &mut injecter)?.try_into()?;
-        Ok(Some(with_body(&func, Some(seq_stmt_from(body)?))))
+        Ok(Some(func.with_body(Some(seq_stmt_from(body)?))))
     })
 }

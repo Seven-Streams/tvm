@@ -113,7 +113,13 @@ impl ConvertSsa {
         })?;
         let results: Array<Var> =
             m.mutate_with(self, &op.result_vars, DefRegionKind::Simple)?.try_into()?;
-        Ok(RegionStmt::new(op.loc.clone(), op.op.clone(), args, params, attrs, body, results))
+        Ok(op.with(|node| {
+            node.args = args;
+            node.body_params = params;
+            node.attrs = attrs;
+            node.body = body;
+            node.result_vars = results;
+        }))
     }
 }
 

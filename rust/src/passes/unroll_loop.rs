@@ -28,7 +28,7 @@ use tvm_ffi::{
 };
 
 use super::convert_ssa::convert_ssa_stmt;
-use super::util::{function_pass, int32, prim_type, seq_stmt_from, unknown_loc, with_body, MutatorExt};
+use super::util::{function_pass, int32, prim_type, seq_stmt_from, unknown_loc, MutatorExt};
 use crate::ir::{
     Evaluate, Expr, For, IntImm, IntImmObj, PrimTypeObj, PtrType, SeqStmt, Stmt, TensorLoad,
     TensorStore, Var,
@@ -148,16 +148,7 @@ impl LoopUnroller {
                     key.as_str() != AUTO_UNROLL_MAX_STEP && key.as_str() != UNROLL_EXPLICIT
                 })
                 .collect();
-            op = For::new(
-                op.loc.clone(),
-                op.loop_var.clone(),
-                op.min.clone(),
-                op.extent.clone(),
-                op.kind,
-                op.body.clone(),
-                annotations,
-                op.step.clone(),
-            );
+            op = op.with_annotations(annotations);
         }
         let extent = self.constant_extent(&op)?;
         let policy = self.policy;
@@ -196,17 +187,7 @@ impl LoopUnroller {
             return unroll(&op, extent);
         }
         if auto_unroll && op.kind != FOR_UNROLLED {
-            return Ok(For::new(
-                op.loc.clone(),
-                op.loop_var.clone(),
-                op.min.clone(),
-                op.extent.clone(),
-                FOR_UNROLLED,
-                op.body.clone(),
-                op.annotations.clone(),
-                op.step.clone(),
-            )
-            .into());
+            return Ok(op.with_kind(FOR_UNROLLED).into());
         }
         Ok(op.into())
     }
@@ -349,6 +330,6 @@ pub fn unroll_loop() -> Result<Pass> {
         let result: Stmt = structural_mutate(body.clone(), &mut unroller)?.try_into()?;
         let body =
             if result.same_as(&body) { body } else { convert_ssa_stmt(seq_stmt_from(result)?)? };
-        Ok(Some(with_body(&func, Some(body))))
+        Ok(Some(func.with_body(Some(body))))
     })
 }

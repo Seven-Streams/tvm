@@ -24,7 +24,7 @@ use tvm::runtime::{MemoryScope, MemoryScopeObj};
 use tvm::tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFITypeKeyToIndex};
 use tvm::tvm_ffi::{
     Any, AnyView, Array, BigInt, DLDataType, DLDataTypeExt, FieldGetter, ObjectCore, ObjectRefCast,
-    String as FfiString, TypeIndex,
+    ObjectRefCore, String as FfiString, TypeIndex,
 };
 
 mod common;
@@ -265,4 +265,53 @@ fn rust_allocated_nodes_equal_native_ones() {
     let repr: Any = global("ffi.ReprPrint").call_packed(&[AnyView::from(&rust_stmt)]).unwrap();
     let repr = tvm::tvm_ffi::String::try_from(repr).unwrap();
     assert!(repr.as_str().contains("42"), "unexpected repr: {repr}");
+}
+
+#[test]
+fn with_fields_copy_the_node_and_keep_the_rest() {
+    load_tvm_compiler();
+    let int32 = DLDataType::try_from_str("int32").unwrap();
+    let loc: Location = global("ir.UnknownLoc").call_packed(&[]).unwrap().try_into().unwrap();
+    let int_imm = |value: i64| -> Expr {
+        let imm: IntImm = global("ir.IntImm")
+            .call_tuple((int32, BigInt::from(value), loc.clone()))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        imm.into()
+    };
+    let ty: Type =
+        PrimType::try_from(global("ir.PrimType").call_tuple((int32,)).unwrap()).unwrap().into();
+    let x: Var = global("ir.Var")
+        .call_tuple((FfiString::from("x"), ty.clone(), loc.clone()))
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    // One field replaced in a new node; the original is untouched and the rest is shared.
+    let bind = Bind::new(loc.clone(), x.clone(), int_imm(1));
+    let rebound = bind.with_value(int_imm(2));
+    assert!(!rebound.same_as(&bind));
+    assert!(rebound.var.same_as(&bind.var) && rebound.loc.same_as(&bind.loc));
+    assert!(structural_equal(&bind.value, &int_imm(1)));
+    assert!(structural_equal(&rebound, &Bind::new(loc.clone(), x.clone(), int_imm(2))));
+
+    // `with` edits several fields in one copy, like C++ `CopyOnWrite()`.
+    let exp: Expr = Op::get("prim.exp").unwrap().into();
+    let call = Call::new(
+        loc.clone(),
+        ty.clone(),
+        exp,
+        Array::new(vec![x.clone().into()]),
+        None,
+        Array::new(vec![]),
+    );
+    let edited = call.with(|node| {
+        node.args = Array::new(vec![int_imm(3)]);
+        node.ty_args = Array::new(vec![ty.clone()]);
+    });
+    assert!(edited.op.same_as(&call.op) && edited.ty.same_as(&call.ty));
+    assert!(structural_equal(&edited.args, &Array::<Expr>::new(vec![int_imm(3)])));
+    assert_eq!((edited.ty_args.len(), call.ty_args.len()), (1, 0));
+    assert!(call.args.get(0).unwrap().same_as(&x));
 }
