@@ -176,6 +176,52 @@ fn hand_written_op_layout_matches_native() {
 }
 
 #[test]
+fn op_attr_map_reads_the_live_registry_column() {
+    load_tvm_compiler();
+    assert!(Op::has_attr_map("TCallEffectKind").unwrap());
+    assert!(!Op::has_attr_map("test.rust.MissingColumn").unwrap());
+    assert!(Op::attr_map::<i64>("test.rust.MissingColumn").unwrap().is_none());
+
+    // Every lookup agrees with the reflected per-Op `get_attr`.
+    let effect = Op::attr_map::<i64>("TCallEffectKind").unwrap().unwrap();
+    let get_attr =
+        tvm::tvm_ffi::Function::from_type_method(OpObj::type_index(), "get_attr").unwrap();
+    let names: Array<FfiString> =
+        global("ir.ListOpNames").call_packed(&[]).unwrap().try_into().unwrap();
+    let mut with_effect = 0;
+    for name in names.iter() {
+        let op = Op::get(name.as_str()).unwrap();
+        let native: Any =
+            get_attr.call_tuple((op.clone(), FfiString::from("TCallEffectKind"))).unwrap();
+        let native = (native.type_index() != TypeIndex::kTVMFFINone as i32)
+            .then(|| i64::try_from(native).unwrap());
+        assert_eq!(effect.get(&op).unwrap(), native, "{name}");
+        with_effect += usize::from(native.is_some());
+    }
+    assert!(with_effect > 0, "no operator has a TCallEffectKind");
+
+    // A map taken earlier sees later registrations, including the column's growth.
+    let key = FfiString::from("test.rust.LiveColumn");
+    let register = |name: &str, value: i64| {
+        global("ir.RegisterOp").call_tuple((FfiString::from(name), FfiString::from(""))).unwrap();
+        global("ir.RegisterOpAttr")
+            .call_tuple((FfiString::from(name), key.clone(), value, false))
+            .unwrap();
+        Op::get(name).unwrap()
+    };
+    let first = register("test.rust.live_column.first", 7);
+    let column = Op::attr_map::<i64>(key.as_str()).unwrap().unwrap();
+    assert_eq!(column.get(&first).unwrap(), Some(7));
+    let second = register("test.rust.live_column.second", 8);
+    assert_eq!(column.get(&second).unwrap(), Some(8));
+    assert_eq!(column.get(&Op::get("prim.exp").unwrap()).unwrap(), None);
+
+    // A value of another type is an error, not a silent miss.
+    let as_string = Op::attr_map::<FfiString>(key.as_str()).unwrap().unwrap();
+    assert!(as_string.get(&first).is_err());
+}
+
+#[test]
 fn rust_allocated_nodes_equal_native_ones() {
     load_tvm_compiler();
     let int32 = DLDataType::try_from_str("int32").unwrap();

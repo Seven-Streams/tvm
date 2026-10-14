@@ -127,8 +127,7 @@ def test_op_attr_column_names_and_values():
         value = column[op.index] if op.index < len(column) else None
         assert value == op.get_attr("FPurity"), op_name
 
-    with pytest.raises(tvm.error.InternalError, match="is not registered"):
-        tvm.ir.Op.get_attr_column("test.MissingAttrColumn")
+    assert tvm.ir.Op.get_attr_column("test.MissingAttrColumn") is None
 
 
 def test_op_attr_column_is_live():

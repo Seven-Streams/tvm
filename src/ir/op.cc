@@ -119,8 +119,10 @@ namespace {
 
 ffi::Array<ffi::String> ListOpAttrNames() { return OpRegistry::Global()->ListAttrNames(); }
 
-ffi::List<ffi::Any> GetOpAttrColumn(const ffi::String& name) {
-  return OpRegistry::Global()->GetAttrColumn(name);
+ffi::Optional<ffi::List<ffi::Any>> GetOpAttrColumn(const ffi::String& name) {
+  OpRegistry* registry = OpRegistry::Global();
+  if (!registry->HasAttrMap(name)) return std::nullopt;
+  return registry->GetAttrColumn(name);
 }
 
 }  // namespace
@@ -263,11 +265,11 @@ void OpNode::RegisterReflection() {
           "unspecified order.")
       .def_static(
           "get_attr_column", &GetOpAttrColumn,
-          "get_attr_column(attr_name: str) -> list\n\nReturn the live attribute column indexed by "
-          "Op.index, the storage C++ OpAttrMap reads. Unset entries are None and the column may be "
-          "shorter than the Op count; later registrations are visible through the same object. "
-          "Treat it as read-only and register values with set_attr. An unregistered column raises "
-          "InternalError.")
+          "get_attr_column(attr_name: str) -> list | None\n\nReturn the live attribute column "
+          "indexed by Op.index, the storage C++ OpAttrMap reads, or None when no Op registered it. "
+          "Unset entries are None and the column may be shorter than the Op count; later "
+          "registrations are visible through the same object. Treat it as read-only and register "
+          "values with set_attr.")
       .def(
           "get_attr",
           [](Op op, ffi::String name) {

@@ -19,12 +19,11 @@
 
 //! `SideEffect` (`src/ir/side_effect.cc`): the strongest `CallEffectKind` an expression evaluates.
 
-use tvm_ffi::{
-    dispatch, structural_walk, Any, Function as FfiFunction, ObjectCore, ObjectRefCast, Result,
-    String, WalkOrder, WalkResult,
-};
+use std::cell::OnceCell;
 
-use crate::ir::{Call, Op, OpObj, TensorLoad, Type};
+use tvm_ffi::{dispatch, structural_walk, ObjectRefCast, Result, WalkOrder, WalkResult};
+
+use crate::ir::{Call, Op, OpAttrMap, TensorLoad, Type};
 
 // `CallEffectKind` (include/tvm/ir/expr.h).
 pub const PURE: i64 = 1;
@@ -32,11 +31,22 @@ pub const READ_STATE: i64 = 2;
 pub const UPDATE_STATE: i64 = 3;
 pub const OPAQUE: i64 = UPDATE_STATE;
 
-/// `Op::GetAttrMap<Any>(name).get(op, None)`, through the reflected `Op.get_attr` method.
-pub fn op_attr(op: &Op, name: &str) -> Result<Option<Any>> {
-    let get_attr = FfiFunction::from_type_method(OpObj::type_index(), "get_attr")?;
-    let value = get_attr.call_tuple((op.clone(), String::from(name)))?;
-    Ok(if value.type_index() == 0 { None } else { Some(value) })
+thread_local! {
+    /// `Op::GetAttrMap(op_attr::kCallEffectKind)`, kept for the process like the C++ `static`.
+    static CALL_EFFECT_KIND: OnceCell<Option<OpAttrMap<i64>>> = const { OnceCell::new() };
+}
+
+/// The registered `TCallEffectKind` of `op`, if any.
+fn call_effect_kind(op: &Op) -> Result<Option<i64>> {
+    CALL_EFFECT_KIND.with(|cell| {
+        if cell.get().is_none() {
+            let _ = cell.set(Op::attr_map("TCallEffectKind")?);
+        }
+        match cell.get() {
+            Some(Some(column)) => column.get(op),
+            _ => Ok(None),
+        }
+    })
 }
 
 /// The strongest effect seen so far; the walk stops at the first state update.
@@ -48,10 +58,7 @@ struct EffectWalker {
 impl EffectWalker {
     fn walk_call(&mut self, call: Call) -> Result<WalkResult> {
         let effect = match call.op.clone().try_cast::<Op>() {
-            Ok(op) => match op_attr(&op, "TCallEffectKind")? {
-                Some(value) => i64::try_from(value)?,
-                None => OPAQUE,
-            },
+            Ok(op) => call_effect_kind(&op)?.unwrap_or(OPAQUE),
             Err(_) => OPAQUE,
         };
         self.kind = self.kind.max(effect.min(UPDATE_STATE));

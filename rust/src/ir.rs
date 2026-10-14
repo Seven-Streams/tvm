@@ -1041,9 +1041,96 @@ impl Op {
     pub fn get(name: &str) -> Result<Self> {
         tvm_ffi::cached_global_func!("ir.GetOp").call_tuple((String::from(name),))?.try_into()
     }
+
+    /// `Op::HasAttrMap(name)`: whether any operator registered the attribute column `name`.
+    pub fn has_attr_map(name: &str) -> Result<bool> {
+        let names: Array<String> =
+            tvm_ffi::cached_global_func!("ir.ListOpAttrNames").call_packed(&[])?.try_into()?;
+        Ok(names.iter().any(|column| column.as_str() == name))
+    }
+
+    /// `Op::GetAttrMap<T>(name)`: the live column, or `None` when no operator registered it.
+    pub fn attr_map<T: tvm_ffi::type_traits::AnyCompatible>(
+        name: &str,
+    ) -> Result<Option<OpAttrMap<T>>> {
+        let column =
+            tvm_ffi::cached_global_func!("ir.GetOpAttrColumn").call_tuple((String::from(name),))?;
+        if column.type_index() == tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex::kTVMFFINone as i32 {
+            return Ok(None);
+        }
+        if column.type_index() != tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex::kTVMFFIList as i32 {
+            return Err(tvm_ffi::Error::new(
+                tvm_ffi::TYPE_ERROR,
+                &format!("Op attribute column {name} is not an ffi.List"),
+                "",
+            ));
+        }
+        Ok(Some(OpAttrMap {
+            column: column.try_into()?,
+            name: String::from(name),
+            _value: std::marker::PhantomData,
+        }))
+    }
 }
 
 tvm_ffi::impl_object_upcast!(Op => Expr);
+
+/// `OpAttrMap<T>` (`include/tvm/ir/op.h`): one live attribute column of the operator registry.
+///
+/// It holds the registry's own column, so values registered later stay visible and a map can be
+/// cached for the process like the C++ `static` ones. A lookup reads entry `op.index` without an
+/// FFI call. The crate has no `ffi.List` binding, so the column is read through the
+/// `TVMFFISeqCell` that `ffi.List` shares with `ffi.Array` (`c_api.h`).
+pub struct OpAttrMap<T> {
+    column: tvm_ffi::object::ObjectRef,
+    name: String,
+    _value: std::marker::PhantomData<T>,
+}
+
+/// The object header followed by `TVMFFISeqCell`, the layout `ffi.List` and `ffi.Array` share.
+#[repr(C)]
+struct SeqCell {
+    object: Object,
+    data: *const tvm_ffi::tvm_ffi_sys::TVMFFIAny,
+    size: i64,
+    capacity: i64,
+    data_deleter: Option<unsafe extern "C" fn(*mut core::ffi::c_void)>,
+}
+
+impl<T: tvm_ffi::type_traits::AnyCompatible> OpAttrMap<T> {
+    /// `OpAttrMap::get(op, None)`: the value registered for `op`, if any.
+    pub fn get(&self, op: &Op) -> Result<Option<T>> {
+        // SAFETY: `column` is an `ffi.List` (checked by `Op::attr_map`) that `self` keeps alive.
+        // The cell is read on every lookup because growth may move the element buffer.
+        let cell = unsafe {
+            let data = tvm_ffi::object::ObjectRefCore::data(&self.column);
+            &*(ObjectArc::as_raw(data) as *const SeqCell)
+        };
+        let index = op.index as usize;
+        if index >= cell.size as usize {
+            return Ok(None);
+        }
+        // SAFETY: `index` is within the `size` initialized entries.
+        let entry = unsafe { &*cell.data.add(index) };
+        if entry.type_index == tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex::kTVMFFINone as i32 {
+            return Ok(None);
+        }
+        // SAFETY: `entry` is a live element of the column.
+        match unsafe { T::try_cast_from_any_view(entry) } {
+            Ok(value) => Ok(Some(value)),
+            Err(()) => Err(tvm_ffi::Error::new(
+                tvm_ffi::TYPE_ERROR,
+                &format!(
+                    "Op attribute {} of {} has unexpected type {}",
+                    self.name.as_str(),
+                    op.name.as_str(),
+                    T::get_mismatch_type_info(entry)
+                ),
+                "",
+            )),
+        }
+    }
+}
 
 // tvm-ffi-stubgen(begin): object/ir.OpaqueExpr
 /// Complete: reflected fields fill [40, 40) exactly.

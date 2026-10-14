@@ -201,13 +201,8 @@ class Op(Expr):
 
         Returns
         -------
-        list
-            The live column.
-
-        Raises
-        ------
-        InternalError
-            If no operator has registered the column.
+        list or None
+            The live column, or None when no operator has registered it.
         """
         return _ffi_api.GetOpAttrColumn(attr_name)
 

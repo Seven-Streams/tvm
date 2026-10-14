@@ -21,20 +21,17 @@
 //! lowering rules (`<target>.FLowerIntrinsic` / `FLegalize` op attributes), lower floor
 //! division and modulo to truncating forms, and fuse multiply-add.
 
-use std::collections::HashMap;
-
 use tvm_ffi::{
-    dispatch, Mutator, Any, DLDataType, Function as FfiFunction, ObjectCore, ObjectIdentity,
-    ObjectRefCast, ObjectRefCore, Result, String,
+    dispatch, Mutator, Any, DLDataType, Function as FfiFunction, ObjectRefCast, ObjectRefCore,
+    Result, String,
 };
 
 use super::analyzer::{binary, AnalyzerBase, AnalyzerScope, AnalyzerState};
-use super::side_effect::op_attr;
 use super::util::{
     function_pass, get_attr, int_imm, make_const, prim_dtype, prim_type, seq_stmt_from,
     unknown_loc, with_body, MutatorExt,
 };
-use crate::ir::{Call, Expr, IntImmObj, Op, OpObj, PrimTypeObj, Stmt, Type, Var};
+use crate::ir::{Call, Expr, IntImmObj, Op, OpAttrMap, PrimTypeObj, Stmt, Type, Var};
 use crate::prim::{
     Add, BroadcastObj, CastObj, FloorDiv, FloorDivObj, FloorMod, FloorModObj, Max, MulObj, EQ, NE,
 };
@@ -48,9 +45,7 @@ const DL_FLOAT: u8 = 2;
 
 /// The op-attribute columns holding the target's lowering rules, in lookup order.
 struct LoweringRules {
-    columns: Vec<String>,
-    /// Rules per op, one per column that has one. An `OpAttrMap` lookup is an FFI call.
-    cache: HashMap<ObjectIdentity, Vec<FfiFunction>>,
+    columns: Vec<OpAttrMap<FfiFunction>>,
     fma_op: Op,
     /// The first rule for `prim.fma`, as C++ `fma_`.
     fma: Option<FfiFunction>,
@@ -80,40 +75,32 @@ impl LoweringRules {
         }
         patterns.extend(["default.FLowerIntrinsic".to_owned(), "default.FLegalize".to_owned()]);
 
-        let fma_op = Op::get("prim.fma")?;
         let mut columns = Vec::new();
         for pattern in patterns {
-            if has_attr_map(&fma_op, &pattern)? {
-                columns.push(String::from(pattern.as_str()));
+            if let Some(column) = Op::attr_map(&pattern)? {
+                columns.push(column);
             }
         }
-        let mut rules = Self { columns, cache: HashMap::new(), fma: None, fma_op: fma_op.clone() };
-        rules.fma = rules.of(&fma_op)?.first().cloned();
-        Ok(rules)
-    }
-
-    fn of(&mut self, op: &Op) -> Result<&[FfiFunction]> {
-        let key = ObjectIdentity::of(op);
-        if !self.cache.contains_key(&key) {
-            let mut rules = Vec::new();
-            for column in &self.columns {
-                if let Some(rule) = op_attr(op, column.as_str())? {
-                    rules.push(FfiFunction::try_from(rule)?);
-                }
+        let fma_op = Op::get("prim.fma")?;
+        let mut fma = None;
+        for column in &columns {
+            if let Some(rule) = column.get(&fma_op)? {
+                fma = Some(rule);
+                break;
             }
-            self.cache.insert(key.clone(), rules);
         }
-        Ok(&self.cache[&key])
+        Ok(Self { columns, fma_op, fma })
     }
 
     /// The first rule that rewrites `call`, if any.
-    fn apply(&mut self, call: &Call) -> Result<Option<Expr>> {
+    fn apply(&self, call: &Call) -> Result<Option<Expr>> {
         let Ok(op) = call.op.clone().try_cast::<Op>() else { return Ok(None) };
         if call.ty.as_node::<PrimTypeObj>().is_none() {
             return Ok(None);
         }
         let expr: Expr = call.clone().into();
-        for rule in self.of(&op)? {
+        for column in &self.columns {
+            let Some(rule) = column.get(&op)? else { continue };
             let lowered: Expr = rule.call_tuple((expr.clone(),))?.try_into()?;
             if !lowered.same_as(&expr) {
                 return Ok(Some(lowered));
@@ -121,12 +108,6 @@ impl LoweringRules {
         }
         Ok(None)
     }
-}
-
-/// `Op::HasAttrMap(name)`, through the reflected `Op.has_attr` method.
-fn has_attr_map(op: &Op, name: &str) -> Result<bool> {
-    let has_attr = FfiFunction::from_type_method(OpObj::type_index(), "has_attr")?;
-    bool::try_from(has_attr.call_tuple((op.clone(), String::from(name)))?)
 }
 
 struct IntrinInjecter {
