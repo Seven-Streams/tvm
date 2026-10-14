@@ -24,7 +24,7 @@ use tvm::runtime::{MemoryScope, MemoryScopeObj};
 use tvm::tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFITypeKeyToIndex};
 use tvm::tvm_ffi::{
     Any, AnyView, Array, BigInt, DLDataType, DLDataTypeExt, FieldGetter, ObjectCore, ObjectRefCast,
-    ObjectRefCore, String as FfiString, TypeIndex,
+    Map, ObjectRefCore, String as FfiString, TypeIndex,
 };
 
 mod common;
@@ -258,7 +258,7 @@ fn rust_allocated_nodes_equal_native_ones() {
         .unwrap()
         .try_into()
         .unwrap();
-    let rust_stmt = Evaluate::new(loc.clone(), expr);
+    let rust_stmt = Evaluate::from_complete_fields(loc.clone(), expr);
     assert!(structural_equal(&rust_stmt, &native_stmt));
 
     // A Rust-allocated node is printed by the C++ repr machinery.
@@ -289,16 +289,19 @@ fn with_fields_copy_the_node_and_keep_the_rest() {
         .unwrap();
 
     // One field replaced in a new node; the original is untouched and the rest is shared.
-    let bind = Bind::new(loc.clone(), x.clone(), int_imm(1));
+    let bind = Bind::from_complete_fields(loc.clone(), x.clone(), int_imm(1));
     let rebound = bind.with_value(int_imm(2));
     assert!(!rebound.same_as(&bind));
     assert!(rebound.var.same_as(&bind.var) && rebound.loc.same_as(&bind.loc));
     assert!(structural_equal(&bind.value, &int_imm(1)));
-    assert!(structural_equal(&rebound, &Bind::new(loc.clone(), x.clone(), int_imm(2))));
+    assert!(structural_equal(
+        &rebound,
+        &Bind::from_complete_fields(loc.clone(), x.clone(), int_imm(2))
+    ));
 
     // `with` edits several fields in one copy, like C++ `CopyOnWrite()`.
     let exp: Expr = Op::get("prim.exp").unwrap().into();
-    let call = Call::new(
+    let call = Call::from_complete_fields(
         loc.clone(),
         ty.clone(),
         exp,
@@ -314,4 +317,73 @@ fn with_fields_copy_the_node_and_keep_the_rest() {
     assert!(structural_equal(&edited.args, &Array::<Expr>::new(vec![int_imm(3)])));
     assert_eq!((edited.ty_args.len(), call.ty_args.len()), (1, 0));
     assert!(call.args.get(0).unwrap().same_as(&x));
+}
+
+#[test]
+fn custom_new_runs_the_native_constructor() {
+    load_tvm_compiler();
+    let loc: Location = UnknownLoc::new().unwrap().into();
+    let dtype = |name: &str| DLDataType::try_from_str(name).unwrap();
+    let imm = |name: &str, value: i64| -> Expr {
+        let imm: IntImm = global("ir.IntImm")
+            .call_tuple((dtype(name), BigInt::from(value), loc.clone()))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        imm.into()
+    };
+    let prim = |name: &str| -> Type {
+        PrimType::try_from(global("ir.PrimType").call_tuple((dtype(name),)).unwrap())
+            .unwrap()
+            .into()
+    };
+    let var = |name: &str, ty: Type| -> Var {
+        global("ir.Var")
+            .call_tuple((FfiString::from(name), ty, loc.clone()))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+
+    // `UnknownLoc()` is a singleton; the lossless allocation is a second object.
+    assert!(UnknownLoc::new().unwrap().same_as(&UnknownLoc::new().unwrap()));
+    assert!(!UnknownLoc::from_complete_fields().same_as(&UnknownLoc::new().unwrap()));
+
+    // `SeqStmt(seq)` flattens a nested sequence; the lossless allocation keeps it.
+    let eval = Evaluate::new(imm("int32", 1), loc.clone()).unwrap();
+    let inner = SeqStmt::new(Array::new(vec![eval.clone().into()]), None).unwrap();
+    let nested: Array<Stmt> = Array::new(vec![inner.clone().into(), eval.clone().into()]);
+    assert_eq!(SeqStmt::new(nested.clone(), None).unwrap().seq.len(), 2);
+    assert_eq!(SeqStmt::from_complete_fields(loc.clone(), nested).seq.len(), 2);
+    assert!(SeqStmt::from_complete_fields(loc.clone(), Array::new(vec![inner.into()]))
+        .seq
+        .get(0)
+        .unwrap()
+        .as_node::<SeqStmtObj>()
+        .is_some());
+
+    // `Call(None, op, args)` infers the result type.
+    let exp = Op::get("prim.exp").unwrap();
+    let x = var("x", prim("float32"));
+    let call = Call::new(
+        None,
+        exp.into(),
+        Array::new(vec![x.into()]),
+        None,
+        Array::new(vec![]),
+        loc.clone(),
+    )
+    .unwrap();
+    assert!(structural_equal(&call.ty, &prim("float32")));
+
+    // `For(...)` promotes an int32 literal bound to an int64 loop variable's dtype.
+    let i = var("i", prim("int64"));
+    let body = SeqStmt::new(Array::new(vec![eval.into()]), None).unwrap();
+    let for_ =
+        For::new(i, imm("int32", 0), imm("int64", 4), 0, body, Map::new(), None, loc.clone())
+            .unwrap();
+    assert!(structural_equal(&for_.min.ty, &prim("int64")));
+
+    // `Bind(var, value)` rejects a value of another type.
+    assert!(Bind::new(var("y", prim("int64")), imm("int32", 1), loc.clone()).is_err());
 }

@@ -81,9 +81,9 @@ pub fn with_attr(func: &Function, key: &str, value: Any) -> Function {
     func.with_attrs(dict_with(&func.attrs, key, value))
 }
 
-/// The process-wide `UnknownLoc()` singleton; a fresh `UnknownLoc::new()` would be a second one.
+/// The process-wide `UnknownLoc()` singleton, as a `Location`.
 pub fn unknown_loc() -> Result<Location> {
-    tvm_ffi::cached_global_func!("ir.UnknownLoc").call_packed(&[])?.try_into()
+    Ok(crate::ir::UnknownLoc::new()?.into())
 }
 
 pub fn int32_dtype() -> DLDataType {

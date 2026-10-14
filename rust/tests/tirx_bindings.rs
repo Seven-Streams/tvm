@@ -255,8 +255,8 @@ fn int_imm(ir: &Ir, value: i64) -> IntImm {
 
 /// `{ evaluate(value) }`, with the statements allocated in Rust.
 fn evaluate_body(ir: &Ir, value: i64) -> SeqStmt {
-    let stmt = Evaluate::new(ir.loc.clone(), int_imm(ir, value).into());
-    SeqStmt::new(ir.loc.clone(), Array::<Stmt>::new(vec![stmt.into()]))
+    let stmt = Evaluate::from_complete_fields(ir.loc.clone(), int_imm(ir, value).into());
+    SeqStmt::from_complete_fields(ir.loc.clone(), Array::<Stmt>::new(vec![stmt.into()]))
 }
 
 fn function(ir: &Ir, body: &SeqStmt) -> tirx::Function {
@@ -283,7 +283,7 @@ fn native_ir_objects_agree_with_getters_and_rust_allocation() {
     );
     let as_base: BaseFunc = func.clone().into();
     assert_fields!(as_base; attrs);
-    let rust = tirx::Function::new(
+    let rust = tirx::Function::from_complete_fields(
         func.loc.clone(),
         func.ty.clone(),
         func.attrs.clone(),
@@ -292,7 +292,7 @@ fn native_ir_objects_agree_with_getters_and_rust_allocation() {
         func.body.clone(),
     );
     assert!(structural_equal(&rust, &func));
-    let other = tirx::Function::new(
+    let other = tirx::Function::from_complete_fields(
         func.loc.clone(),
         func.ty.clone(),
         func.attrs.clone(),
@@ -412,9 +412,10 @@ fn a_rust_closure_runs_as_a_function_pass() {
             value.ty.clone(),
             BigInt::from(value.value.to_i64().expect("a small constant") + 1),
         );
-        let stmt = Evaluate::new(stmt.loc.clone(), bumped.into());
-        let body = SeqStmt::new(body.loc.clone(), Array::<Stmt>::new(vec![stmt.into()]));
-        let rewritten = tirx::Function::new(
+        let stmt = Evaluate::from_complete_fields(stmt.loc.clone(), bumped.into());
+        let body =
+            SeqStmt::from_complete_fields(body.loc.clone(), Array::<Stmt>::new(vec![stmt.into()]));
+        let rewritten = tirx::Function::from_complete_fields(
             func.loc.clone(),
             func.ty.clone(),
             func.attrs.clone(),

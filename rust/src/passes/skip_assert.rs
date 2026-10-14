@@ -31,7 +31,7 @@ struct AssertSkipper;
 #[dispatch(mutate)]
 impl AssertSkipper {
     fn mutate_assert(&mut self, _assert: AssertStmt) -> Result<Evaluate> {
-        Ok(Evaluate::new(unknown_loc()?, int32(0)?.into()))
+        Evaluate::new(int32(0)?.into(), unknown_loc()?)
     }
 
     fn mutate_expr(&mut self, _expr: Expr) -> Unchanged {

@@ -91,7 +91,7 @@ impl StmtSimplifier {
                 }
                 let args: Array<Expr> =
                     std::iter::once(simplified).chain(call.args.iter().skip(1)).collect();
-                let value = Call::new(
+                let value = Call::from_complete_fields(
                     call.loc.clone(),
                     call.ty.clone(),
                     call.op.clone(),
@@ -118,7 +118,7 @@ impl StmtSimplifier {
         match (self.prove(&op.condition)?, &op.else_case) {
             (Some(true), _) => m.mutate(self, &op.then_case),
             (Some(false), Some(else_case)) => m.mutate(self, else_case),
-            (Some(false), None) => Ok(Evaluate::new(unknown_loc()?, int32(0)?.into()).into()),
+            (Some(false), None) => Ok(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into()),
             (None, _) => m.default_mutate(self, &op),
         }
     }
@@ -127,7 +127,7 @@ impl StmtSimplifier {
     fn mutate_store(&mut self, op: TensorStore, m: &mut Mutator) -> Result<Any> {
         let store: TensorStore = m.default_mutate_as(self, &op)?;
         if stores_loaded_value(&store)? {
-            return Ok(Evaluate::new(unknown_loc()?, int32(0)?.into()).into());
+            return Ok(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into());
         }
         Ok(store.into())
     }
@@ -280,7 +280,7 @@ impl StringInliner {
             return Ok(UnchangedOr::unchanged());
         };
         self.strings.insert(ObjectIdentity::of(&bind.var), value);
-        Ok(UnchangedOr::changed(Evaluate::new(unknown_loc()?, int32(0)?.into()).into()))
+        Ok(UnchangedOr::changed(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into()))
     }
 
     fn map_var(&mut self, var: Var) -> UnchangedOr<Any> {

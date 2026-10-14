@@ -201,13 +201,13 @@ fn is_no_op<S: ObjectRefCore>(stmt: &S) -> bool {
 }
 
 fn evaluate_zero() -> Result<Stmt> {
-    Ok(Evaluate::new(unknown_loc()?, int32(0)?.into()).into())
+    Ok(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into())
 }
 
 /// `MakeEvaluate(value)`: the evaluation if it has an effect, else a no-op.
 fn evaluate(value: &Expr) -> Result<Stmt> {
     if side_effect(value)? > READ_STATE {
-        return Ok(Evaluate::new(unknown_loc()?, value.clone()).into());
+        return Ok(Evaluate::new(value.clone(), unknown_loc()?)?.into());
     }
     evaluate_zero()
 }
@@ -217,17 +217,15 @@ fn evaluate_effects(values: &[Expr]) -> Result<Stmt> {
     let mut effects = Vec::new();
     for value in values {
         if side_effect(value)? > READ_STATE {
-            effects.push(Evaluate::new(unknown_loc()?, value.clone()).into());
+            effects.push(Evaluate::new(value.clone(), unknown_loc()?)?.into());
         }
     }
     Ok(seq_stmt(effects)?.into())
 }
 
-/// The native `SeqStmt(stmts)` constructor, which flattens and drops no-ops.
+/// `SeqStmt(stmts)`, which flattens and drops no-ops.
 fn seq_stmt(stmts: Vec<Stmt>) -> Result<SeqStmt> {
-    tvm_ffi::cached_global_func!("ir.SeqStmt")
-        .call_tuple((Array::new(stmts), Option::<crate::ir::Location>::None))?
-        .try_into()
+    SeqStmt::new(Array::new(stmts), None)
 }
 
 /// C++ `!a` (`logical_not`), which has no global: folds a constant, else the raw `Not`.

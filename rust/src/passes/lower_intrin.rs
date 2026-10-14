@@ -370,16 +370,15 @@ fn swap_broadcast_cast(expr: &Expr) -> Result<Expr> {
 
 /// `Call(ty, op, args)`.
 fn call(ty: &Type, op: &Op, args: Vec<Expr>) -> Result<Expr> {
-    tvm_ffi::cached_global_func!("ir.Call")
-        .call_tuple((
-            ty.clone(),
-            op.clone(),
-            tvm_ffi::Array::new(args),
-            Option::<crate::ir::Attrs>::None,
-            tvm_ffi::Array::<Type>::new(vec![]),
-            unknown_loc()?,
-        ))?
-        .try_into()
+    let call = Call::new(
+        Some(ty.clone()),
+        op.clone().into(),
+        tvm_ffi::Array::new(args),
+        None,
+        tvm_ffi::Array::new(vec![]),
+        unknown_loc()?,
+    )?;
+    Ok(call.into())
 }
 
 /// A global taking expressions and a trailing location.

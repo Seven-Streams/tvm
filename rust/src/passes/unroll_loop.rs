@@ -130,7 +130,7 @@ impl LoopUnroller {
         if !changed {
             return Ok(op.into());
         }
-        tvm_ffi::cached_global_func!("ir.SeqStmt").call_tuple((Array::new(seq), op.loc.clone()))
+        Ok(SeqStmt::new(Array::new(seq), Some(op.loc.clone()))?.into())
     }
 }
 
@@ -250,7 +250,7 @@ fn annotation(op: &For, key: &str) -> Result<Option<i64>> {
 /// The loop body repeated `extent` times, the loop variable replaced by each value in turn.
 fn unroll(op: &For, extent: i64) -> Result<Stmt> {
     if extent == 0 {
-        return Ok(Evaluate::new(unknown_loc()?, int32(0)?.into()).into());
+        return Ok(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into());
     }
     let dtype =
         op.loop_var.ty.as_node::<PrimTypeObj>().expect("a loop variable is a PrimVar").dtype;
@@ -276,9 +276,7 @@ fn unroll(op: &For, extent: i64) -> Result<Stmt> {
         )?;
         unrolled.push(step.try_into()?);
     }
-    tvm_ffi::cached_global_func!("ir.SeqStmt")
-        .call_tuple((Array::new(unrolled), Option::<crate::ir::Location>::None))?
-        .try_into()
+    Ok(SeqStmt::new(Array::new(unrolled), None)?.into())
 }
 
 /// `runtime::MemoryScope::Get(name)`. Rust has no lookup of a registered enum value by name, so

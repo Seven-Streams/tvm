@@ -31,14 +31,14 @@ pub fn decorate_device_scope() -> Result<Pass> {
     function_pass("tirx.DecorateDeviceScope", 0, move |func, _module, _context| {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         let region = RegionStmt::new(
-            unknown_loc()?,
             device_scope.clone(),
             Array::<Expr>::new(vec![]),
             Array::<Var>::new(vec![]),
             DictAttrs::new(Map::<String, Any>::new()),
             body,
             Array::<Var>::new(vec![]),
-        );
+            unknown_loc()?,
+        )?;
         Ok(Some(func.with_body(Some(seq_stmt_from(region.into())?))))
     })
 }

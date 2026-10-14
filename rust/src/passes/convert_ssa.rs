@@ -209,7 +209,8 @@ impl ConvertSsa {
                 params.iter().map(|param| param.ty.clone()).collect::<Array<Type>>(),
                 func.ret_type.clone(),
             );
-            Ok(Function::new(
+            // C++ `CopyOnWrite()` then `ty = func_type_annotation()`, not the constructor.
+            Ok(Function::from_complete_fields(
                 func.loc.clone(),
                 ty.into(),
                 func.attrs.clone(),

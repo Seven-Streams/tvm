@@ -25,6 +25,17 @@
 // `ir.Op` has three unreflected members, so its complete layout is hand-written below.
 // tvm-ffi-stubgen(skip): ir.Op
 // tvm-ffi-stubgen(ty-map): ir.Op -> Op
+// Constructors that do more than assign fields (checks, normalization, a singleton): `new` is
+// hand-written below and calls the native constructor; the generated lossless allocation is
+// `from_complete_fields`.
+// tvm-ffi-stubgen(custom-new): ir.AssertStmt
+// tvm-ffi-stubgen(custom-new): ir.Bind
+// tvm-ffi-stubgen(custom-new): ir.Call
+// tvm-ffi-stubgen(custom-new): ir.Evaluate
+// tvm-ffi-stubgen(custom-new): ir.For
+// tvm-ffi-stubgen(custom-new): ir.RegionStmt
+// tvm-ffi-stubgen(custom-new): ir.SeqStmt
+// tvm-ffi-stubgen(custom-new): ir.UnknownLoc
 // Names the hand-written `Op` binding uses: the import section keeps them even when no
 // generated block does.
 // tvm-ffi-stubgen(import-object): std::ops::Deref
@@ -393,7 +404,7 @@ impl CallObj {
 
 impl Call {
     /// Lossless complete-field allocation.
-    pub fn new(
+    pub fn from_complete_fields(
         loc: Location,
         ty: Type,
         op: Expr,
@@ -1179,6 +1190,106 @@ impl_with_fields!(
     }
 );
 
+// The `custom-new` constructors: each calls the native constructor, so a Rust `X::new` builds
+// what C++ `X(...)` builds. Arguments follow the C++ constructor.
+
+impl SeqStmt {
+    /// `SeqStmt(seq, loc)`: flattens nested sequences and drops no-op statements.
+    pub fn new(seq: Array<Stmt>, loc: Option<Location>) -> Result<Self> {
+        tvm_ffi::cached_global_func!("ir.SeqStmt").call_tuple((seq, loc))?.try_into()
+    }
+}
+
+impl UnknownLoc {
+    /// `UnknownLoc()`: the process-wide singleton.
+    pub fn new() -> Result<Self> {
+        tvm_ffi::cached_global_func!("ir.UnknownLoc").call_packed(&[])?.try_into()
+    }
+}
+
+impl Call {
+    /// `Call(ret_ty, op, args, attrs, ty_args, loc)`: infers the result type when `ret_ty` is
+    /// absent.
+    pub fn new(
+        ret_ty: Option<Type>,
+        op: Expr,
+        args: Array<Expr>,
+        attrs: Option<Attrs>,
+        ty_args: Array<Type>,
+        loc: Location,
+    ) -> Result<Self> {
+        tvm_ffi::cached_global_func!("ir.Call")
+            .call_tuple((ret_ty, op, args, attrs, ty_args, loc))?
+            .try_into()
+    }
+}
+
+impl Evaluate {
+    /// `Evaluate(value, loc)`: runs the validation registered for the value's type.
+    pub fn new(value: Expr, loc: Location) -> Result<Self> {
+        tvm_ffi::cached_global_func!("ir.Evaluate").call_tuple((value, loc))?.try_into()
+    }
+}
+
+impl Bind {
+    /// `Bind(var, value, loc)`: checks that the value has the variable's type.
+    pub fn new(var: Var, value: Expr, loc: Location) -> Result<Self> {
+        tvm_ffi::cached_global_func!("ir.Bind").call_tuple((var, value, loc))?.try_into()
+    }
+}
+
+impl AssertStmt {
+    /// `AssertStmt(condition, error_kind, message_parts, loc)`: checks for a boolean condition.
+    pub fn new(
+        condition: Expr,
+        error_kind: StringImm,
+        message_parts: Array<StringImm>,
+        loc: Location,
+    ) -> Result<Self> {
+        tvm_ffi::cached_global_func!("ir.AssertStmt")
+            .call_tuple((condition, error_kind, message_parts, loc))?
+            .try_into()
+    }
+}
+
+impl For {
+    /// `For(...)`: checks for integer bounds and promotes an `IntImm` bound or step to the loop
+    /// variable's dtype.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        loop_var: Var,
+        min: Expr,
+        extent: Expr,
+        kind: i32,
+        body: SeqStmt,
+        annotations: Map<String, Any>,
+        step: Option<Expr>,
+        loc: Location,
+    ) -> Result<Self> {
+        tvm_ffi::cached_global_func!("ir.For")
+            .call_tuple((loop_var, min, extent, kind, body, annotations, step, loc))?
+            .try_into()
+    }
+}
+
+impl RegionStmt {
+    /// `RegionStmt(...)`: checks the body parameters against the operation's contract and runs
+    /// its `FRegionValidate`.
+    pub fn new(
+        op: Op,
+        args: Array<Expr>,
+        body_params: Array<Var>,
+        attrs: DictAttrs,
+        body: SeqStmt,
+        result_vars: Array<Var>,
+        loc: Location,
+    ) -> Result<Self> {
+        tvm_ffi::cached_global_func!("ir.RegionStmt")
+            .call_tuple((op, args, body_params, attrs, body, result_vars, loc))?
+            .try_into()
+    }
+}
+
 // tvm-ffi-stubgen(begin): object/ir.OpaqueExpr
 /// Complete: reflected fields fill [40, 40) exactly.
 #[repr(C)]
@@ -1675,7 +1786,7 @@ impl AssertStmtObj {
 
 impl AssertStmt {
     /// Lossless complete-field allocation.
-    pub fn new(
+    pub fn from_complete_fields(
         loc: Location,
         condition: Expr,
         error_kind: StringImm,
@@ -1735,7 +1846,7 @@ impl BindObj {
 
 impl Bind {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, var: Var, value: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, var: Var, value: Expr) -> Self {
         let obj = BindObj::new(loc, var, value);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1895,7 +2006,7 @@ impl EvaluateObj {
 
 impl Evaluate {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, value: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, value: Expr) -> Self {
         let obj = EvaluateObj::new(loc, value);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1964,7 +2075,7 @@ impl ForObj {
 
 impl For {
     /// Lossless complete-field allocation.
-    pub fn new(
+    pub fn from_complete_fields(
         loc: Location,
         loop_var: Var,
         min: Expr,
@@ -2106,7 +2217,7 @@ impl RegionStmtObj {
 
 impl RegionStmt {
     /// Lossless complete-field allocation.
-    pub fn new(
+    pub fn from_complete_fields(
         loc: Location,
         op: Op,
         args: Array<Expr>,
@@ -2222,7 +2333,7 @@ impl SeqStmtObj {
 
 impl SeqStmt {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, seq: Array<Stmt>) -> Self {
+    pub fn from_complete_fields(loc: Location, seq: Array<Stmt>) -> Self {
         let obj = SeqStmtObj::new(loc, seq);
         Self { base: ObjectArc::new(obj) }
     }
@@ -3155,7 +3266,7 @@ impl UnknownLocObj {
 
 impl UnknownLoc {
     /// Lossless complete-field allocation.
-    pub fn new() -> Self {
+    pub fn from_complete_fields() -> Self {
         let obj = UnknownLocObj::new();
         Self { base: ObjectArc::new(obj) }
     }

@@ -36,7 +36,7 @@ use super::side_effect::{side_effect, PURE};
 use super::util::{int32_dtype, int_imm, prim_dtype, prim_type, unknown_loc, ContextExt};
 use crate::ir::{
     AssertStmt, Bind, Call, Evaluate, Expr, For, If, Op, PrimType, Range, RegionStmt, SeqStmt,
-    StringImm, Type, Var,
+    StringImm, Var,
 };
 use crate::prim::{And, BitwiseAnd, FloorDivObj, Let, Select, EQ, GE, GT, LE, LT};
 use crate::sym::{Analyzer, ConstraintContext};
@@ -225,7 +225,7 @@ fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Resul
         if is_const_int(&real_condition, 0) {
             return Ok(match else_case {
                 Some(else_case) => else_case.into(),
-                None => Evaluate::new(unknown_loc()?, int_imm(int32_dtype(), 0)?.into()).into(),
+                None => Evaluate::new(int_imm(int32_dtype(), 0)?.into(), unknown_loc()?)?.into(),
             });
         }
         Ok(op
@@ -272,16 +272,15 @@ fn launch_index(intrinsic: &str, axis: &str) -> Result<Expr> {
         .call_tuple((String::from(axis), unknown_loc()?))?
         .try_into()?;
     let args: tvm_ffi::Array<Expr> = tvm_ffi::Array::new(vec![axis.into()]);
-    tvm_ffi::cached_global_func!("ir.Call")
-        .call_tuple((
-            prim_type(int32_dtype())?,
-            Op::get(intrinsic)?,
-            args,
-            Option::<crate::ir::Attrs>::None,
-            tvm_ffi::Array::<Type>::new(vec![]),
-            unknown_loc()?,
-        ))?
-        .try_into()
+    let call = Call::new(
+        Some(prim_type(int32_dtype())?.into()),
+        Op::get(intrinsic)?.into(),
+        args,
+        None,
+        tvm_ffi::Array::new(vec![]),
+        unknown_loc()?,
+    )?;
+    Ok(call.into())
 }
 
 /// A pure asserted condition holds for the rest of the scope.
@@ -318,16 +317,14 @@ fn descend_if_then_else<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Ca
     if cond_new.same_as(&cond) && true_new.same_as(&true_value) && false_new.same_as(&false_value) {
         return Ok(op.into());
     }
-    let call: Call = tvm_ffi::cached_global_func!("ir.Call")
-        .call_tuple((
-            op.ty.clone(),
-            op.op.clone(),
-            tvm_ffi::Array::new(vec![cond_new, true_new, false_new]),
-            op.attrs.clone(),
-            tvm_ffi::Array::<Type>::new(vec![]),
-            op.loc.clone(),
-        ))?
-        .try_into()?;
+    let call = Call::new(
+        Some(op.ty.clone()),
+        op.op.clone(),
+        tvm_ffi::Array::new(vec![cond_new, true_new, false_new]),
+        op.attrs.clone(),
+        tvm_ffi::Array::new(vec![]),
+        op.loc.clone(),
+    )?;
     Ok(call.into())
 }
 
