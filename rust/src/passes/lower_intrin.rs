@@ -22,17 +22,19 @@
 //! division and modulo to truncating forms, and fuse multiply-add.
 
 use tvm_ffi::{
-    dispatch, Mutator, Any, DLDataType, Function as FfiFunction, ObjectRefCore, Result, String,
+    dispatch, Any, DLDataType, Function as FfiFunction, Mutator, ObjectRefCast, ObjectRefCore,
+    Result, String,
 };
 
-use super::analyzer::{binary, AnalyzerBase, AnalyzerScope, AnalyzerState};
+use super::analyzer::{AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::util::{
-    function_pass, get_attr, int_imm, make_const, prim_dtype, prim_type, seq_stmt_from,
-    unknown_loc, MutatorExt,
+    function_pass, get_attr, int_imm, prim_dtype, prim_type, seq_stmt_from, unknown_loc, MutatorExt,
 };
-use crate::ir::{Call, Expr, IntImmObj, Op, OpAttrMap, OpObj, PrimTypeObj, Stmt, Type, Var};
+use crate::ir::{Call, Expr, IntImmObj, Op, OpAttrMap, OpObj, PrimType, PrimTypeObj, Stmt, Type, Var};
+use crate::ops::{let_, select, Ex, PrimOps};
 use crate::prim::{
-    Add, BroadcastObj, CastObj, FloorDiv, FloorDivObj, FloorMod, FloorModObj, Max, MulObj, EQ, NE,
+    Add, Broadcast, BroadcastObj, Cast, CastObj, FloorDiv, FloorDivObj, FloorMod, FloorModObj, Max,
+    Mul, MulObj, EQ, NE,
 };
 use crate::sym::Analyzer;
 use crate::target::Target;
@@ -165,9 +167,9 @@ impl IntrinInjecter {
             if c.value >= tvm_ffi::BigInt::from(0i64)
                 && self.analyzer().can_prove_greater_equal(&div.b, 0)?
             {
-                let truncated = truncdiv(&div.a, &div.b)?;
+                let truncated = div.a.truncdiv(&div.b).expr()?;
                 let lowered: Expr = m.mutate_as(self, &truncated)?;
-                return binary("prim._OpMax", &lowered, &op.b).map(Any::from);
+                return lowered.max(&op.b).expr().map(Any::from);
             }
         }
         m.default_mutate(self, &op)
@@ -175,7 +177,7 @@ impl IntrinInjecter {
 
     /// `floormod(x, y) == 0` is `truncmod(x, y) == 0`.
     fn mutate_eq(&mut self, op: EQ, m: &mut Mutator) -> Result<Any> {
-        match divisibility(&op.a, &op.b, "prim._OpEQ")? {
+        match divisibility(&op.a, &op.b, true)? {
             Some(test) => m.mutate(self, &test),
             None => m.default_mutate(self, &op),
         }
@@ -183,7 +185,7 @@ impl IntrinInjecter {
 
     /// `floormod(x, y) != 0` is `truncmod(x, y) != 0`.
     fn mutate_ne(&mut self, op: NE, m: &mut Mutator) -> Result<Any> {
-        match divisibility(&op.a, &op.b, "prim._OpNE")? {
+        match divisibility(&op.a, &op.b, false)? {
             Some(test) => m.mutate(self, &test),
             None => m.default_mutate(self, &op),
         }
@@ -207,9 +209,10 @@ impl IntrinInjecter {
                 }
             }
             _ if !lhs.same_as(&a) || !rhs.same_as(&b) => {
-                let product: Expr = m.mutate_as(self, &raw_binary("prim.Mul", &lhs, &rhs)?)?;
+                let product: Expr =
+                    m.mutate_as(self, &Mul::new(lhs, rhs, unknown_loc()?)?.into())?;
                 let c: Expr = m.mutate_as(self, &c)?;
-                return raw_binary("prim.Add", &product, &c).map(Any::from);
+                return Ok(Add::new(product, c, unknown_loc()?)?.into());
             }
             _ => {}
         }
@@ -258,39 +261,37 @@ impl IntrinInjecter {
         let (a, b) = (&div.a, &div.b);
         let dtype = prim_dtype(e)?;
         if let Some(shift) = power_of_two_shift(b).filter(|_| self.support_bitwise_op) {
-            return right_shift(a, &imm(dtype, shift as i128)?);
+            return (a >> int_imm(dtype, shift as i128)).expr();
         }
         if !self.analyzer().can_prove_greater_equal(b, 0)? {
             if dtype.code == DL_FLOAT {
-                let floor = call_global("prim.floor", &[&binary("prim._OpDiv", a, b)?])?;
+                let floor = a.div(b).floor().expr()?;
                 return m.mutate_as(self, &floor);
             }
             // Neither sign known: correct the truncating quotient when the signs differ.
             let rmod = prim_var("rmod", dtype)?;
             let rdiv = prim_var("rdiv", dtype)?;
-            let (rmod_e, rdiv_e): (Expr, Expr) = (rmod.clone().into(), rdiv.clone().into());
-            let cond = signs_agree(b, &rmod_e, dtype)?;
-            let corrected = select(&cond, &rdiv_e, &sub(&rdiv_e, &make_const(dtype, 1)?)?)?;
-            return let_(&rmod, &truncmod(a, b)?, &let_(&rdiv, &truncdiv(a, b)?, &corrected)?);
+            let corrected = select(signs_agree(b, &rmod), &rdiv, &rdiv - 1);
+            return let_(&rmod, a.truncmod(b), let_(&rdiv, a.truncdiv(b), corrected)).expr();
         }
         if self.analyzer().can_prove_greater_equal(a, 0)?
             || self.analyzer().can_prove_greater_equal(original, 0)?
         {
-            return truncdiv(a, b);
+            return a.truncdiv(b).expr();
         }
         if let Some(b_value) = int_value(b) {
             if let Some(c) = self.shift_coefficient(a, b_value)? {
                 // Shift `a` into the non-negative range by a multiple of `b`, then back.
-                let shifted = add(a, &imm(dtype, b_value as i128 * c as i128)?)?;
-                return sub(&truncdiv(&shifted, b)?, &imm(dtype, c as i128)?);
+                let shifted = a + int_imm(dtype, b_value as i128 * c as i128);
+                return (shifted.truncdiv(b) - int_imm(dtype, c as i128)).expr();
             }
         }
-        let rdiv = truncdiv(a, b)?;
-        let rmod = truncmod(a, b)?;
+        let rdiv = a.truncdiv(b);
+        let rmod = a.truncmod(b);
         if is_int32_or_int64(dtype) && self.support_bitwise_op {
-            return add(&rdiv, &right_shift(&rmod, &imm(dtype, dtype.bits as i128 - 1)?)?);
+            return (&rdiv + (&rmod >> int_imm(dtype, dtype.bits as i128 - 1))).expr();
         }
-        select(&ge(&rmod, &make_const(dtype, 0)?)?, &rdiv, &sub(&rdiv, &make_const(dtype, 1)?)?)
+        select(rmod.greater_equal(0), &rdiv, &rdiv - 1).expr()
     }
 
     /// `floormod(a, b)`, its operands already lowered, in truncating arithmetic.
@@ -299,55 +300,51 @@ impl IntrinInjecter {
         let (a, b) = (&modulo.a, &modulo.b);
         let dtype = prim_dtype(e)?;
         if let Some(shift) = power_of_two_shift(b).filter(|_| self.support_bitwise_op) {
-            return bitwise_and(a, &imm(dtype, (1i128 << shift) - 1)?);
+            return (a & int_imm(dtype, (1i128 << shift) - 1)).expr();
         }
         if !self.analyzer().can_prove_greater_equal(b, 0)? {
             if dtype.code == DL_FLOAT {
-                let floor = call_global("prim.floor", &[&binary("prim._OpDiv", a, b)?])?;
+                let floor = a.div(b).floor().expr()?;
                 let floor: Expr = m.mutate_as(self, &floor)?;
-                return sub(a, &binary("prim._OpMul", &floor, b)?);
+                return (a - &floor * b).expr();
             }
             let rmod = prim_var("rmod", dtype)?;
-            let rmod_e: Expr = rmod.clone().into();
-            let cond = signs_agree(b, &rmod_e, dtype)?;
-            return let_(&rmod, &truncmod(a, b)?, &select(&cond, &rmod_e, &add(&rmod_e, b)?)?);
+            return let_(&rmod, a.truncmod(b), select(signs_agree(b, &rmod), &rmod, &rmod + b))
+                .expr();
         }
         if self.analyzer().can_prove_greater_equal(a, 0)? {
-            return truncmod(a, b);
+            return a.truncmod(b).expr();
         }
         if let Some(b_value) = int_value(b) {
             if let Some(c) = self.shift_coefficient(a, b_value)? {
-                return truncmod(&add(a, &imm(dtype, b_value as i128 * c as i128)?)?, b);
+                return (a + int_imm(dtype, b_value as i128 * c as i128)).truncmod(b).expr();
             }
         }
-        let rmod = truncmod(a, b)?;
+        let rmod = a.truncmod(b);
         if is_int32_or_int64(dtype) && self.support_bitwise_op {
-            let sign = right_shift(&rmod, &imm(dtype, dtype.bits as i128 - 1)?)?;
-            return add(&rmod, &bitwise_and(b, &sign)?);
+            return (&rmod + (b & (&rmod >> int_imm(dtype, dtype.bits as i128 - 1)))).expr();
         }
-        select(&ge(&rmod, &make_const(dtype, 0)?)?, &rmod, &add(&rmod, b)?)
+        select(rmod.greater_equal(0), &rmod, &rmod + b).expr()
     }
 }
 
-/// `floormod(x, y) <compare> 0` as `truncmod(x, y) <compare> 0`; `None` for anything else.
-fn divisibility(lhs: &Expr, rhs: &Expr, compare: &str) -> Result<Option<Expr>> {
+/// `floormod(x, y) == 0` (or `!= 0`) as `truncmod(x, y) == 0`; `None` for anything else.
+fn divisibility(lhs: &Expr, rhs: &Expr, equal: bool) -> Result<Option<Expr>> {
     match (lhs.as_node::<FloorModObj>(), int_value(rhs)) {
         (Some(modulo), Some(0)) => {
-            let truncated = truncmod(&modulo.a, &modulo.b)?;
-            let zero = make_const(prim_dtype(&truncated)?, 0)?;
-            binary(compare, &truncated, &zero).map(Some)
+            let truncated = modulo.a.truncmod(&modulo.b);
+            let test = if equal { truncated.equal(0) } else { truncated.not_equal(0) };
+            test.expr().map(Some)
         }
         _ => Ok(None),
     }
 }
 
 /// `(b >= 0 && r >= 0) || (b < 0 && r <= 0)`: the remainder `r` has the sign of `b`.
-fn signs_agree(b: &Expr, r: &Expr, dtype: DLDataType) -> Result<Expr> {
-    let zero = make_const(dtype, 0)?;
-    let nonneg = binary("prim._OpAnd", &ge(b, &zero)?, &ge(r, &zero)?)?;
-    let negative =
-        binary("prim._OpAnd", &binary("prim._OpLT", b, &zero)?, &binary("prim._OpLE", r, &zero)?)?;
-    binary("prim._OpOr", &nonneg, &negative)
+fn signs_agree(b: &Expr, r: &Var) -> Ex {
+    let nonneg = b.greater_equal(0).logical_and(r.greater_equal(0));
+    let negative = b.less(0).logical_and(r.less_equal(0));
+    nonneg.logical_or(negative)
 }
 
 /// `SwapBroadcastCast`: `broadcast(cast(x))` to `cast(broadcast(x))` when the cast widens.
@@ -362,10 +359,9 @@ fn swap_broadcast_cast(expr: &Expr) -> Result<Expr> {
     if !widens {
         return Ok(expr.clone());
     }
-    let broadcast = call_global("prim.Broadcast", &[&cast.value, &bcast.lanes])?;
-    tvm_ffi::cached_global_func!("prim.Cast")
-        .call_tuple((broadcast, bcast.ty.clone(), unknown_loc()?))?
-        .try_into()
+    let broadcast = Broadcast::new(cast.value.clone(), bcast.lanes.clone(), unknown_loc()?)?;
+    let ty: PrimType = bcast.ty.clone().try_cast()?;
+    Ok(Cast::new(broadcast.into(), ty, unknown_loc()?)?.into())
 }
 
 /// `Call(ty, op, args)`.
@@ -381,54 +377,6 @@ fn call(ty: &Type, op: &Op, args: Vec<Expr>) -> Result<Expr> {
     Ok(call.into())
 }
 
-/// A global taking expressions and a trailing location.
-fn call_global(name: &str, args: &[&Expr]) -> Result<Expr> {
-    let loc = unknown_loc()?;
-    let mut packed: Vec<tvm_ffi::AnyView> =
-        args.iter().map(|arg| tvm_ffi::AnyView::from(*arg)).collect();
-    packed.push(tvm_ffi::AnyView::from(&loc));
-    FfiFunction::get_global(name)?.call_packed(&packed)?.try_into()
-}
-
-/// A raw binary constructor (`prim.Add`, `prim.Mul`): no folding or type matching.
-fn raw_binary(name: &str, a: &Expr, b: &Expr) -> Result<Expr> {
-    call_global(name, &[a, b])
-}
-
-fn add(a: &Expr, b: &Expr) -> Result<Expr> {
-    binary("prim._OpAdd", a, b)
-}
-fn sub(a: &Expr, b: &Expr) -> Result<Expr> {
-    binary("prim._OpSub", a, b)
-}
-fn ge(a: &Expr, b: &Expr) -> Result<Expr> {
-    binary("prim._OpGE", a, b)
-}
-fn truncdiv(a: &Expr, b: &Expr) -> Result<Expr> {
-    binary("prim._OpTruncDiv", a, b)
-}
-fn truncmod(a: &Expr, b: &Expr) -> Result<Expr> {
-    binary("prim._OpTruncMod", a, b)
-}
-fn right_shift(a: &Expr, b: &Expr) -> Result<Expr> {
-    call_global("prim.right_shift", &[a, b])
-}
-fn bitwise_and(a: &Expr, b: &Expr) -> Result<Expr> {
-    call_global("prim.bitwise_and", &[a, b])
-}
-/// `prim::Select(c, t, f)`, the raw constructor.
-fn select(c: &Expr, t: &Expr, f: &Expr) -> Result<Expr> {
-    call_global("prim.Select", &[c, t, f])
-}
-/// `prim::Let(var, value, body)`, the raw constructor.
-fn let_(var: &Var, value: &Expr, body: &Expr) -> Result<Expr> {
-    tvm_ffi::cached_global_func!("prim.Let")
-        .call_tuple((var.clone(), value.clone(), body.clone(), unknown_loc()?))?
-        .try_into()
-}
-fn imm(dtype: DLDataType, value: i128) -> Result<Expr> {
-    Ok(int_imm(dtype, value)?.into())
-}
 /// `PrimVar(name, dtype)`.
 fn prim_var(name: &str, dtype: DLDataType) -> Result<Var> {
     tvm_ffi::cached_global_func!("ir.Var")

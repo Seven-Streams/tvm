@@ -28,7 +28,7 @@ use tvm_ffi::{
     ObjectRefCore, Result, Unchanged, UnchangedOr, WalkOrder,
 };
 
-use super::analyzer::{binary, bind_range, AnalyzerBase, AnalyzerScope, AnalyzerState};
+use super::analyzer::{bind_range, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::side_effect::{side_effect, PURE};
 use super::util::{
     function_pass, int32, make_const, prim_dtype, seq_stmt_from, unknown_loc, MutatorExt,
@@ -37,6 +37,7 @@ use crate::ir::{
     Bind, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, Op, PrimTypeObj, SeqStmt, Stmt,
     StringImm, TensorLoadObj, TensorStore, Var, VarObj,
 };
+use crate::ops::PrimOps;
 use crate::prim::{AddObj, MulObj, SubObj};
 use crate::sym::{Analyzer, ConstIntBound};
 use crate::tirx::{Function, TensorType, TensorTypeObj};
@@ -70,10 +71,8 @@ impl StmtSimplifier {
     fn mutate_for(&mut self, op: For, m: &mut Mutator) -> Result<Any> {
         let analyzer = self.base.analyzer.clone();
         bind_range(&analyzer, &op.loop_var, &op.min, &op.extent)?;
-        let loop_var: Expr = op.loop_var.clone().into();
-        let end = binary("prim._OpAdd", &op.min, &op.extent)?;
-        let _lower = analyzer.assume(&binary("prim._OpGE", &loop_var, &op.min)?)?;
-        let _upper = analyzer.assume(&binary("prim._OpLT", &loop_var, &end)?)?;
+        let _lower = analyzer.assume(&op.loop_var.greater_equal(&op.min).expr()?)?;
+        let _upper = analyzer.assume(&op.loop_var.less(&op.min + &op.extent).expr()?)?;
         m.default_mutate(self, &op)
     }
 
@@ -220,8 +219,8 @@ fn mark_global_non_neg_value(analyzer: &Analyzer, value: &Expr) -> Result<()> {
     for (term, sign) in sum_terms(value, 1) {
         match constant(&term) {
             Some(c) => offset += c * sign as i128,
-            None if sign > 0 => symbol_scale = binary("prim._OpAdd", &symbol_scale, &term)?,
-            None => symbol_scale = binary("prim._OpSub", &symbol_scale, &term)?,
+            None if sign > 0 => symbol_scale = (&symbol_scale + &term).expr()?,
+            None => symbol_scale = (&symbol_scale - &term).expr()?,
         }
     }
     let mut scale: i128 = 1;
@@ -229,7 +228,7 @@ fn mark_global_non_neg_value(analyzer: &Analyzer, value: &Expr) -> Result<()> {
     for factor in product_factors(&symbol_scale) {
         match constant(&factor) {
             Some(c) => scale = scale.saturating_mul(c),
-            None => symbol = binary("prim._OpMul", &symbol, &factor)?,
+            None => symbol = (&symbol * &factor).expr()?,
         }
     }
     if scale <= 0 {

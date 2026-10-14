@@ -22,6 +22,17 @@
 
 // Every object registered under `prim` gets its block in this file; `skip` leaves one out.
 // tvm-ffi-stubgen(prefix): prim
+// The raw constructors (C++ `Add(a, b)` etc.: type checks, no folding) that passes build
+// directly: `new` is hand-written at the end of this file and calls the native constructor; the
+// generated lossless allocation is `from_complete_fields`. The folding operators are in `ops`.
+// tvm-ffi-stubgen(custom-new): prim.Add
+// tvm-ffi-stubgen(custom-new): prim.Broadcast
+// tvm-ffi-stubgen(custom-new): prim.Cast
+// tvm-ffi-stubgen(custom-new): prim.Let
+// tvm-ffi-stubgen(custom-new): prim.Mul
+// tvm-ffi-stubgen(custom-new): prim.Not
+// tvm-ffi-stubgen(custom-new): prim.Select
+// tvm-ffi-stubgen(custom-new): prim.Sub
 
 // tvm-ffi-stubgen(begin): import-section
 use std::ops::Deref;
@@ -80,7 +91,7 @@ impl AddObj {
 
 impl Add {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = AddObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -409,7 +420,7 @@ impl BroadcastObj {
 
 impl Broadcast {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, value: Expr, lanes: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, value: Expr, lanes: Expr) -> Self {
         let obj = BroadcastObj::new(loc, ty, value, lanes);
         Self { base: ObjectArc::new(obj) }
     }
@@ -463,7 +474,7 @@ impl CastObj {
 
 impl Cast {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, value: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, value: Expr) -> Self {
         let obj = CastObj::new(loc, ty, value);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1014,7 +1025,13 @@ impl LetObj {
 
 impl Let {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, var: Var, value: Expr, body: Expr) -> Self {
+    pub fn from_complete_fields(
+        loc: Location,
+        ty: Type,
+        var: Var,
+        value: Expr,
+        body: Expr,
+    ) -> Self {
         let obj = LetObj::new(loc, ty, var, value, body);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1234,7 +1251,7 @@ impl MulObj {
 
 impl Mul {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = MulObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1343,7 +1360,7 @@ impl NotObj {
 
 impl Not {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr) -> Self {
         let obj = NotObj::new(loc, ty, a);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1571,7 +1588,7 @@ impl SelectObj {
 
 impl Select {
     /// Lossless complete-field allocation.
-    pub fn new(
+    pub fn from_complete_fields(
         loc: Location,
         ty: Type,
         condition: Expr,
@@ -1687,7 +1704,7 @@ impl SubObj {
 
 impl Sub {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = SubObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1695,3 +1712,61 @@ impl Sub {
 
 tvm_ffi::impl_object_upcast!(Sub => Expr);
 // tvm-ffi-stubgen(end)
+
+// The `custom-new` raw constructors: each calls the native constructor, which checks operand
+// types and folds nothing. Arguments follow the C++ constructor.
+
+macro_rules! raw_binary_new {
+    ($($node:ident => $global:literal),+ $(,)?) => {
+        $(impl $node {
+            #[doc = concat!("`", stringify!($node), "(a, b, loc)`: the raw constructor.")]
+            pub fn new(a: Expr, b: Expr, loc: Location) -> tvm_ffi::Result<Self> {
+                tvm_ffi::cached_global_func!($global).call_tuple((a, b, loc))?.try_into()
+            }
+        })+
+    };
+}
+
+raw_binary_new!(Add => "prim.Add", Sub => "prim.Sub", Mul => "prim.Mul");
+
+impl Select {
+    /// `Select(condition, true_value, false_value, loc)`: the raw constructor.
+    pub fn new(
+        condition: Expr,
+        true_value: Expr,
+        false_value: Expr,
+        loc: Location,
+    ) -> tvm_ffi::Result<Self> {
+        tvm_ffi::cached_global_func!("prim.Select")
+            .call_tuple((condition, true_value, false_value, loc))?
+            .try_into()
+    }
+}
+
+impl Let {
+    /// `Let(var, value, body, loc)`: the raw constructor.
+    pub fn new(var: Var, value: Expr, body: Expr, loc: Location) -> tvm_ffi::Result<Self> {
+        tvm_ffi::cached_global_func!("prim.Let").call_tuple((var, value, body, loc))?.try_into()
+    }
+}
+
+impl Cast {
+    /// `Cast(value, ty, loc)`: the raw constructor.
+    pub fn new(value: Expr, ty: super::ir::PrimType, loc: Location) -> tvm_ffi::Result<Self> {
+        tvm_ffi::cached_global_func!("prim.Cast").call_tuple((value, ty, loc))?.try_into()
+    }
+}
+
+impl Broadcast {
+    /// `Broadcast(value, lanes, loc)`: the raw constructor.
+    pub fn new(value: Expr, lanes: Expr, loc: Location) -> tvm_ffi::Result<Self> {
+        tvm_ffi::cached_global_func!("prim.Broadcast").call_tuple((value, lanes, loc))?.try_into()
+    }
+}
+
+impl Not {
+    /// `Not(a, loc)`: the raw constructor.
+    pub fn new(a: Expr, loc: Location) -> tvm_ffi::Result<Self> {
+        tvm_ffi::cached_global_func!("prim.Not").call_tuple((a, loc))?.try_into()
+    }
+}

@@ -28,7 +28,7 @@ use tvm_ffi::{
 };
 
 use super::convert_ssa::convert_ssa_stmt;
-use super::util::{function_pass, int32, prim_type, seq_stmt_from, unknown_loc, MutatorExt};
+use super::util::{function_pass, int32, int_imm, prim_type, seq_stmt_from, unknown_loc, MutatorExt};
 use crate::ir::{
     Evaluate, Expr, For, IntImm, IntImmObj, PrimTypeObj, PtrType, SeqStmt, Stmt, TensorLoad,
     TensorStore, Var,
@@ -256,12 +256,8 @@ fn unroll(op: &For, extent: i64) -> Result<Stmt> {
         op.loop_var.ty.as_node::<PrimTypeObj>().expect("a loop variable is a PrimVar").dtype;
     let mut unrolled: Vec<Stmt> = Vec::new();
     for i in 0..extent {
-        let offset: Expr = tvm_ffi::cached_global_func!("ir.IntImm")
-            .call_tuple((dtype, tvm_ffi::BigInt::from(i), unknown_loc()?))?
-            .try_into()?;
-        let value: Expr = tvm_ffi::cached_global_func!("prim._OpAdd")
-            .call_tuple((op.min.clone(), offset, unknown_loc()?))?
-            .try_into()?;
+        // C++ `op->min + IntImm(op->loop_var.ty(), i)`.
+        let value = (&op.min + int_imm(dtype, i as i128)).expr()?;
         let loop_var = &op.loop_var;
         let step = structural_map(
             op.body.clone(),

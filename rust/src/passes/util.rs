@@ -20,11 +20,11 @@
 //! Pass plumbing and small IR helpers shared by the Rust passes.
 
 use tvm_ffi::{
-    Any, AnyView, Array, DLDataType, DLDataTypeCode, Function as FfiFunction, Map, MutateContext,
-    MutateDispatch, Mutator, ObjectRefCore, RValueRef, Result, String,
+    Any, AnyView, Array, Function as FfiFunction, Map, MutateContext, MutateDispatch, Mutator,
+    ObjectRefCore, RValueRef, Result, String,
 };
 
-use crate::ir::{BaseFunc, DictAttrs, GlobalVar, IRModule, IntImm, Location, PrimType, SeqStmt, Stmt};
+use crate::ir::{BaseFunc, DictAttrs, GlobalVar, IRModule, SeqStmt, Stmt};
 use crate::tirx::Function;
 use crate::transform::{Pass, PassContext, PassInfo};
 
@@ -81,69 +81,7 @@ pub fn with_attr(func: &Function, key: &str, value: Any) -> Function {
     func.with_attrs(dict_with(&func.attrs, key, value))
 }
 
-/// The process-wide `UnknownLoc()` singleton, as a `Location`.
-pub fn unknown_loc() -> Result<Location> {
-    Ok(crate::ir::UnknownLoc::new()?.into())
-}
-
-pub fn int32_dtype() -> DLDataType {
-    DLDataType { code: DLDataTypeCode::kDLInt as u8, bits: 32, lanes: 1 }
-}
-
-/// `PrimType(dtype)` through the native constructor.
-pub fn prim_type(dtype: DLDataType) -> Result<PrimType> {
-    tvm_ffi::cached_global_func!("ir.PrimType").call_tuple((dtype,))?.try_into()
-}
-
-/// `IntImm::Int32(value)`, the C++ meaning of a bare integer literal such as `Evaluate(0)`.
-pub fn int32(value: i64) -> Result<IntImm> {
-    tvm_ffi::cached_global_func!("ir.IntImm")
-        .call_tuple((int32_dtype(), tvm_ffi::BigInt::from(value), unknown_loc()?))?
-        .try_into()
-}
-
-/// `IntImm(dtype, value)` through the native constructor.
-pub fn int_imm(dtype: DLDataType, value: i128) -> Result<IntImm> {
-    tvm_ffi::cached_global_func!("ir.IntImm")
-        .call_tuple((dtype, tvm_ffi::BigInt::from(value), unknown_loc()?))?
-        .try_into()
-}
-
-/// `prim::MakeConst(dtype, value)`, which has no global: an `IntImm` or `FloatImm` by type code,
-/// broadcast for a fixed-length vector type. C++ `a >= 0` and `a - 1` build their constant so.
-pub fn make_const(dtype: DLDataType, value: i64) -> Result<crate::ir::Expr> {
-    let scalar = DLDataType { lanes: 1, ..dtype };
-    let element: crate::ir::Expr = match dtype.code {
-        // kDLInt, kDLUInt, kDLBool
-        0 | 1 | 6 => int_imm(scalar, value as i128)?.into(),
-        // kDLFloat, kDLBfloat, and the float8/6/4 codes
-        2 | 4 | 7..=17 => tvm_ffi::cached_global_func!("ir.FloatImm")
-            .call_tuple((scalar, value as f64, unknown_loc()?))?
-            .try_into()?,
-        _ => {
-            return Err(tvm_ffi::Error::new(
-                tvm_ffi::INTERNAL_ERROR,
-                "cannot make const for this type",
-                "",
-            ))
-        }
-    };
-    if dtype.lanes == 1 {
-        return Ok(element);
-    }
-    let lanes: crate::ir::Expr = int32(dtype.lanes as i64)?.into();
-    tvm_ffi::cached_global_func!("prim.Broadcast")
-        .call_tuple((element, lanes, unknown_loc()?))?
-        .try_into()
-}
-
-/// The dtype of a PrimExpr (`expr.ty()`); an error for any other expression.
-pub fn prim_dtype(expr: &crate::ir::Expr) -> Result<DLDataType> {
-    match expr.ty.as_node::<crate::ir::PrimTypeObj>() {
-        Some(ty) => Ok(ty.dtype),
-        None => Err(tvm_ffi::Error::new(tvm_ffi::TYPE_ERROR, "expected a PrimType expression", "")),
-    }
-}
+pub use crate::ops::{int32, int32_dtype, int_imm, make_const, prim_dtype, prim_type, unknown_loc};
 
 /// Typed re-entry from a `#[dispatch(mutate)]` handler: `m.mutate_as(self, &op.body)?` gives the
 /// mutated field back as its own type.

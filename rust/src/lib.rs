@@ -75,6 +75,7 @@ macro_rules! impl_with_fields {
 }
 
 pub mod ir;
+pub mod ops;
 pub mod passes;
 pub mod prim;
 pub mod runtime;

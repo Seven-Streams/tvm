@@ -27,11 +27,10 @@ use tvm_ffi::{
     String,
 };
 
-use super::analyzer::{binary, is_const_int, not, AnalyzerBase, AnalyzerScope, AnalyzerState};
+use super::analyzer::{is_const_int, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::side_effect::{side_effect, READ_STATE};
-use super::util::{
-    function_pass, int32, int_imm, make_const, prim_dtype, seq_stmt_from, unknown_loc, MutatorExt,
-};
+use super::util::{function_pass, int32, seq_stmt_from, unknown_loc, MutatorExt};
+use crate::ops::PrimOps;
 use crate::ir::{
     CallObj, Evaluate, EvaluateObj, Expr, For, ForObj, If, IfObj, IntImmObj, IntSet, Op,
     PrimTypeObj, SeqStmt, SeqStmtObj, Stmt, TensorLoadObj, TensorStore, Var,
@@ -69,8 +68,7 @@ impl NoOpRemover {
                 If::new(unknown_loc()?, op.condition.clone(), op.then_case.clone(), None).into(),
             ),
             (true, false, Some(else_case)) => Some(
-                If::new(unknown_loc()?, logical_not(&op.condition)?, else_case.clone(), None)
-                    .into(),
+                If::new(unknown_loc()?, (!&op.condition).expr()?, else_case.clone(), None).into(),
             ),
             _ => None,
         };
@@ -81,7 +79,7 @@ impl NoOpRemover {
     fn mutate_for(&mut self, op: For, m: &mut Mutator) -> Result<Stmt> {
         let max = self.extent_range(&op.extent)?.max()?;
         if !max.same_as(&pos_inf()?) && !max.same_as(&neg_inf()?) {
-            let empty = binary("prim._OpLE", &max, &make_const(prim_dtype(&max)?, 0)?)?;
+            let empty = max.less_equal(0).expr()?;
             if self.base.analyzer.can_prove(&empty, 0)? {
                 return evaluate_zero();
             }
@@ -152,8 +150,7 @@ impl NoOpRemover {
         let load: Expr = tvm_ffi::cached_global_func!("ir.TensorLoad")
             .call_tuple((dest.clone(), store.indices.clone(), unknown_loc()?))?
             .try_into()?;
-        let diff = binary("prim._OpSub", &store.value, &load)?;
-        let unchanged = binary("prim._OpEQ", &diff, &make_const(prim_dtype(&diff)?, 0)?)?;
+        let unchanged = (&store.value - &load).equal(0).expr()?;
         if is_const_int(&self.base.analyzer.simplify(&unchanged, 2)?, 1) {
             return Ok(true);
         }
@@ -187,8 +184,8 @@ fn loop_range(op: &For) -> Result<IntSet> {
     if is_const_int(&op.extent, 1) {
         return IntSet::single_point(&op.min);
     }
-    let one = make_const(prim_dtype(&op.extent)?, 1)?;
-    let max = binary("prim._OpSub", &binary("prim._OpAdd", &op.extent, &op.min)?, &one)?;
+    // C++ `IntervalSet(min, extent + min - 1)`.
+    let max = (&op.extent + &op.min - 1).expr()?;
     IntSet::interval(&op.min, &max)
 }
 
@@ -226,16 +223,6 @@ fn evaluate_effects(values: &[Expr]) -> Result<Stmt> {
 /// `SeqStmt(stmts)`, which flattens and drops no-ops.
 fn seq_stmt(stmts: Vec<Stmt>) -> Result<SeqStmt> {
     SeqStmt::new(Array::new(stmts), None)
-}
-
-/// C++ `!a` (`logical_not`), which has no global: folds a constant, else the raw `Not`.
-fn logical_not(a: &Expr) -> Result<Expr> {
-    match a.as_node::<IntImmObj>() {
-        Some(imm) => {
-            Ok(int_imm(prim_dtype(a)?, (imm.value == tvm_ffi::BigInt::from(0i64)) as i128)?.into())
-        }
-        None => not(a),
-    }
 }
 
 pub fn remove_no_op() -> Result<Pass> {

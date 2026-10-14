@@ -88,9 +88,19 @@ fn int_imm(o: &Operands, value: i64) -> Expr {
     imm.into()
 }
 
+/// The lossless allocation: `from_complete_fields` for a node with a `custom-new` constructor.
+macro_rules! lossless {
+    ($node:ident) => {
+        $node::new
+    };
+    ($node:ident, $ctor:ident) => {
+        $node::$ctor
+    };
+}
+
 /// A native binary node reads back its operands, and the Rust-allocated node equals it.
 macro_rules! check_binary {
-    ($o:expr; $($node:ident($lhs:expr, $rhs:expr)),* $(,)?) => {$({
+    ($o:expr; $($node:ident$(::$ctor:ident)?($lhs:expr, $rhs:expr)),* $(,)?) => {$({
         let name = concat!("prim.", stringify!($node));
         let native: $node = global(name)
             .call_tuple(($lhs.clone(), $rhs.clone(), $o.loc.clone()))
@@ -99,9 +109,9 @@ macro_rules! check_binary {
             .unwrap();
         assert!(structural_equal(&native.a, &$lhs), "{name}: a");
         assert!(structural_equal(&native.b, &$rhs), "{name}: b");
-        let rust = $node::new($o.loc.clone(), native.ty.clone(), $lhs.clone(), $rhs.clone());
+        let rust = lossless!($node $(, $ctor)?)($o.loc.clone(), native.ty.clone(), $lhs.clone(), $rhs.clone());
         assert!(structural_equal(&rust, &native), "{name}: Rust-allocated node differs");
-        let swapped = $node::new($o.loc.clone(), native.ty.clone(), $rhs.clone(), $lhs.clone());
+        let swapped = lossless!($node $(, $ctor)?)($o.loc.clone(), native.ty.clone(), $rhs.clone(), $lhs.clone());
         assert!(!structural_equal(&swapped, &native), "{name}: operands are not distinguished");
     })*};
 }
@@ -111,7 +121,8 @@ fn binary_nodes_round_trip() {
     load_tvm_compiler();
     let o = operands();
     check_binary!(o;
-        Add(o.x, o.y), Sub(o.x, o.y), Mul(o.x, o.y), Div(o.x, o.y), Mod(o.x, o.y),
+        Add::from_complete_fields(o.x, o.y), Sub::from_complete_fields(o.x, o.y),
+        Mul::from_complete_fields(o.x, o.y), Div(o.x, o.y), Mod(o.x, o.y),
         FloorDiv(o.x, o.y), FloorMod(o.x, o.y), Min(o.x, o.y), Max(o.x, o.y),
         EQ(o.x, o.y), NE(o.x, o.y), LT(o.x, o.y), LE(o.x, o.y), GT(o.x, o.y), GE(o.x, o.y),
         BitwiseAnd(o.x, o.y), BitwiseOr(o.x, o.y), BitwiseXor(o.x, o.y),
@@ -127,8 +138,11 @@ fn other_nodes_round_trip() {
     let loc = || o.loc.clone();
 
     let not: Not = global("prim.Not").call_tuple((o.p.clone(), loc())).unwrap().try_into().unwrap();
-    assert!(structural_equal(&Not::new(loc(), not.ty.clone(), o.p.clone()), &not));
-    assert!(!structural_equal(&Not::new(loc(), not.ty.clone(), o.q.clone()), &not));
+    assert!(structural_equal(&Not::from_complete_fields(loc(), not.ty.clone(), o.p.clone()), &not));
+    assert!(!structural_equal(
+        &Not::from_complete_fields(loc(), not.ty.clone(), o.q.clone()),
+        &not
+    ));
 
     let bitwise_not: BitwiseNot =
         global("prim.BitwiseNot").call_tuple((o.x.clone(), loc())).unwrap().try_into().unwrap();
@@ -143,7 +157,10 @@ fn other_nodes_round_trip() {
         .unwrap();
     let target: PrimType = cast.ty.clone().try_cast().unwrap();
     assert_eq!(target.dtype, DLDataType::try_from_str("float32").unwrap());
-    assert!(structural_equal(&Cast::new(loc(), cast.ty.clone(), o.x.clone()), &cast));
+    assert!(structural_equal(
+        &Cast::from_complete_fields(loc(), cast.ty.clone(), o.x.clone()),
+        &cast
+    ));
 
     let select: Select = global("prim.Select")
         .call_tuple((o.p.clone(), o.x.clone(), o.y.clone(), loc()))
@@ -152,9 +169,21 @@ fn other_nodes_round_trip() {
         .unwrap();
     assert!(structural_equal(&select.true_value, &o.x));
     assert!(structural_equal(&select.false_value, &o.y));
-    let rust = Select::new(loc(), select.ty.clone(), o.p.clone(), o.x.clone(), o.y.clone());
+    let rust = Select::from_complete_fields(
+        loc(),
+        select.ty.clone(),
+        o.p.clone(),
+        o.x.clone(),
+        o.y.clone(),
+    );
     assert!(structural_equal(&rust, &select));
-    let swapped = Select::new(loc(), select.ty.clone(), o.p.clone(), o.y.clone(), o.x.clone());
+    let swapped = Select::from_complete_fields(
+        loc(),
+        select.ty.clone(),
+        o.p.clone(),
+        o.y.clone(),
+        o.x.clone(),
+    );
     assert!(!structural_equal(&swapped, &select));
 
     let let_: Let = global("prim.Let")
@@ -163,7 +192,13 @@ fn other_nodes_round_trip() {
         .try_into()
         .unwrap();
     assert!(structural_equal(&let_.body, &o.x));
-    let rust = Let::new(loc(), let_.ty.clone(), o.x_var.clone(), int_imm(&o, 1), o.x.clone());
+    let rust = Let::from_complete_fields(
+        loc(),
+        let_.ty.clone(),
+        o.x_var.clone(),
+        int_imm(&o, 1),
+        o.x.clone(),
+    );
     assert!(structural_equal(&rust, &let_));
 
     // The reflected field `base` is spelled `base_`: `base` is the parent slot.
@@ -181,7 +216,8 @@ fn other_nodes_round_trip() {
         .unwrap()
         .try_into()
         .unwrap();
-    let rust = Broadcast::new(loc(), broadcast.ty.clone(), o.y.clone(), int_imm(&o, 4));
+    let rust =
+        Broadcast::from_complete_fields(loc(), broadcast.ty.clone(), o.y.clone(), int_imm(&o, 4));
     assert!(structural_equal(&rust, &broadcast));
 
     let vectors = Array::<Expr>::new(vec![ramp.clone().into(), broadcast.clone().into()]);

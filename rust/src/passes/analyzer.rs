@@ -38,7 +38,8 @@ use crate::ir::{
     AssertStmt, Bind, Call, Evaluate, Expr, For, If, Op, PrimType, Range, RegionStmt, SeqStmt,
     StringImm, Var,
 };
-use crate::prim::{And, BitwiseAnd, FloorDivObj, Let, Select, EQ, GE, GT, LE, LT};
+use crate::ops::PrimOps;
+use crate::prim::{And, BitwiseAnd, FloorDivObj, Let, Not, Select, EQ, GE, GT, LE, LT};
 use crate::sym::{Analyzer, ConstraintContext};
 
 /// The members C++ `StmtExprMutatorWithAnalyzer` adds: the analyzer and the stack of scoped
@@ -169,8 +170,9 @@ fn descend_for<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: For) -> Res
         let extent = ctx.mutate_as(&op.extent)?;
         let step = ctx.mutate_as(&op.step)?;
         let body: SeqStmt = ctx.scoped(|ctx| {
-            let zero: Expr = int_imm(prim_dtype(&extent)?, 0)?.into();
-            ctx.base().assume_facts(&binary("prim._OpGT", &extent, &zero)?)?;
+            // C++ `extent > IntImm(extent.ty(), 0)`.
+            let positive = extent.greater(int_imm(prim_dtype(&extent)?, 0)).expr()?;
+            ctx.base().assume_facts(&positive)?;
             ctx.mutate_as(&op.body)
         })?;
         Ok(op.update(|node| {
@@ -209,7 +211,10 @@ fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Resul
         })?;
         let else_case: Option<SeqStmt> = match &op.else_case {
             Some(else_case) => {
-                let negated = ctx.base().analyzer.rewrite_simplify(&not(&real_condition)?)?;
+                let negated = ctx
+                    .base()
+                    .analyzer
+                    .rewrite_simplify(&Not::new(real_condition.clone(), unknown_loc()?)?.into())?;
                 Some(ctx.scoped(|ctx| {
                     if pure {
                         ctx.base().assume(&negated)?;
@@ -257,9 +262,8 @@ fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionSt
                     _ => continue,
                 };
                 let index = launch_index(intrinsic, &field.as_str()[field.len() - 1..])?;
-                let zero: Expr = int_imm(int32_dtype(), 0)?.into();
-                ctx.base().assume(&binary("prim._OpGE", &index, &zero)?)?;
-                ctx.base().assume(&binary("prim._OpLT", &index, &op.args.get(i)?)?)?;
+                ctx.base().assume(&index.greater_equal(0).expr()?)?;
+                ctx.base().assume(&index.less(op.args.get(i)?).expr()?)?;
             }
         }
         ctx.default_mutate(&op)
@@ -303,7 +307,7 @@ fn descend_if_then_else<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Ca
         ctx.base().assume_facts(&cond_new)?;
         ctx.mutate_as(&true_value)
     })?;
-    let not_cond = not(&cond_new)?;
+    let not_cond: Expr = Not::new(cond_new.clone(), unknown_loc()?)?.into();
     let false_new: Expr = ctx.scoped(|ctx| {
         ctx.base().assume(&not_cond)?;
         ctx.mutate_as(&false_value)
@@ -338,10 +342,7 @@ fn descend_let<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Let) -> Res
     if value.same_as(&op.value) && body.same_as(&op.body) {
         return Ok(op.into());
     }
-    let result: Expr = tvm_ffi::cached_global_func!("prim.Let")
-        .call_tuple((op.var.clone(), value, body, unknown_loc()?))?
-        .try_into()?;
-    Ok(result.into())
+    Ok(Let::new(op.var.clone(), value, body, unknown_loc()?)?.into())
 }
 
 /// `select(c, t, f)`: `t` under `c`, `f` under `!c`; a constant `c` selects its value.
@@ -351,7 +352,8 @@ fn descend_select<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Select) 
         ctx.base().assume_facts(&cond)?;
         ctx.mutate_as(&op.true_value)
     })?;
-    let negated = ctx.base().analyzer.rewrite_simplify(&not(&cond)?)?;
+    let negated =
+        ctx.base().analyzer.rewrite_simplify(&Not::new(cond.clone(), unknown_loc()?)?.into())?;
     let false_value: Expr = ctx.scoped(|ctx| {
         ctx.base().assume(&negated)?;
         ctx.mutate_as(&op.false_value)
@@ -368,10 +370,7 @@ fn descend_select<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Select) 
     {
         return Ok(op.into());
     }
-    let result: Expr = tvm_ffi::cached_global_func!("prim.Select")
-        .call_tuple((cond, true_value, false_value, unknown_loc()?))?
-        .try_into()?;
-    Ok(result.into())
+    Ok(Select::new(cond, true_value, false_value, unknown_loc()?)?.into())
 }
 
 fn is_prim_expr(expr: &Expr) -> bool {
@@ -430,13 +429,13 @@ fn floordiv_facts(
     let a = &div.a;
     match kind {
         Compare::Eq => {
-            out.push(binary("prim._OpGE", a, &lo)?);
-            out.push(binary("prim._OpLT", a, &hi)?);
+            out.push(a.greater_equal(&lo).expr()?);
+            out.push(a.less(&hi).expr()?);
         }
-        Compare::Lt => out.push(binary("prim._OpLT", a, &lo)?),
-        Compare::Le => out.push(binary("prim._OpLT", a, &hi)?),
-        Compare::Gt => out.push(binary("prim._OpGE", a, &hi)?),
-        Compare::Ge => out.push(binary("prim._OpGE", a, &lo)?),
+        Compare::Lt => out.push(a.less(&lo).expr()?),
+        Compare::Le => out.push(a.less(&hi).expr()?),
+        Compare::Gt => out.push(a.greater_equal(&hi).expr()?),
+        Compare::Ge => out.push(a.greater_equal(&lo).expr()?),
     }
     Ok(())
 }
@@ -475,19 +474,6 @@ fn collect_derived_facts(condition: &Expr, out: &mut Vec<Expr>) -> Result<()> {
             _ => Ok(()),
         }
     }
-}
-
-/// A C++ binary operator on PrimExprs (`prim._OpAdd`, `prim._OpGE`, ...): type matching and
-/// constant folding, as `a + b` or `a >= b` in C++.
-pub fn binary(global: &str, a: &Expr, b: &Expr) -> Result<Expr> {
-    tvm_ffi::Function::get_global(global)?
-        .call_tuple((a.clone(), b.clone(), unknown_loc()?))?
-        .try_into()
-}
-
-/// `prim::Not(a)`, the raw constructor.
-pub fn not(a: &Expr) -> Result<Expr> {
-    tvm_ffi::cached_global_func!("prim.Not").call_tuple((a.clone(), unknown_loc()?))?.try_into()
 }
 
 /// `IsOne` / `IsZero`: an `IntImm` with exactly this value.
