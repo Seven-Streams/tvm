@@ -91,11 +91,7 @@ impl NoOpRemover {
         self.loop_ranges.remove(&key);
         let stmt: Stmt = stmt?;
         let Some(result) = stmt.as_node::<ForObj>() else {
-            return Err(tvm_ffi::Error::new(
-                tvm_ffi::TYPE_ERROR,
-                "a mutated For is no longer a For",
-                "",
-            ));
+            tvm_ffi::bail!(tvm_ffi::TYPE_ERROR, "a mutated For is no longer a For");
         };
         if is_const_int(&result.extent, 0) {
             return evaluate_zero();

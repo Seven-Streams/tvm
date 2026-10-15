@@ -25,23 +25,27 @@
 use std::collections::{HashMap, HashSet};
 
 use tvm_ffi::{
-    dispatch, structural_mutate, structural_walk, Any, AnyView, Array, DLDataType, DLDataTypeCode,
-    Error, Function as FfiFunction, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
-    String, WalkOrder, WalkResult,
+    dispatch, structural_mutate, structural_walk, Any, Array, DLDataType, DLDataTypeCode,
+    Function as FfiFunction, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
+    WalkOrder, WalkResult, INTERNAL_ERROR, TYPE_ERROR,
 };
 
 use super::dtype_conversion::{dtype_conversion, storage_uint};
-use super::util::{MutatorExt, function_pass, get_attr, internal};
+use super::util::{MutatorExt, function_pass, get_attr};
 use crate::ir::{
-    Bind, Call, CallObj, Expr, FloatImm, LambdaExpr, LambdaExprObj, Op, PrimType, PrimTypeObj,
-    PtrType, PtrTypeObj, SeqStmt, Stmt, TensorLoad, TensorStore, Tuple, TupleObj, Type, Var,
+    Bind, Call, CallObj, Expr, FloatImm, LambdaExpr, PrimType, PrimTypeObj, PtrType, PtrTypeObj,
+    SeqStmt, Stmt, TensorLoad, TensorStore, Tuple, TupleObj, Type, Var,
 };
-use crate::ops::{float_imm, prim_dtype, prim_type, Ex, PrimOps};
+use crate::ops::{float_imm, prim_dtype, prim_type, repr, Ex, PrimOps};
 use crate::prim::{
     Add, Broadcast, Cast, CastObj, Div, Let, Max, Min, Mul, Select, Shuffle, Sub, EQ, GE, GT, LE,
     LT, NE,
 };
 use crate::target::Target;
+use crate::tirx::op::{
+    ALLOC_TENSOR, DECL_TENSOR, GPU_THREAD_ALLREDUCE, MASKED_LOAD, MASKED_STORE, REINTERPRET,
+    TENSOR_DATA_PTR,
+};
 use crate::tirx::{Function, TensorType, TensorTypeObj};
 use crate::transform::Pass;
 
@@ -76,30 +80,6 @@ impl Family {
     }
 }
 
-struct Ops {
-    alloc_tensor: Op,
-    decl_tensor: Op,
-    tensor_data_ptr: Op,
-    masked_load: Op,
-    masked_store: Op,
-    reinterpret: Op,
-    thread_allreduce: Op,
-}
-
-impl Ops {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            alloc_tensor: Op::get("tirx.alloc_tensor")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
-            tensor_data_ptr: Op::get("tirx.tensor_data_ptr")?,
-            masked_load: Op::get("tirx.masked_load")?,
-            masked_store: Op::get("tirx.masked_store")?,
-            reinterpret: Op::get("tirx.reinterpret")?,
-            thread_allreduce: Op::get("tirx.gpu_thread_allreduce")?,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Shared helpers
 
@@ -113,7 +93,7 @@ fn prim_ty(expr: &Expr) -> Result<PrimType> {
 fn tensor_dtype(tensor: &Expr) -> Result<PrimType> {
     match tensor.ty.as_node::<TensorTypeObj>() {
         Some(ty) => Ok(ty.dtype.clone()),
-        None => Err(Error::new(tvm_ffi::TYPE_ERROR, "expected a tensor variable", "")),
+        None => Err(error!(TYPE_ERROR, "expected a tensor variable")),
     }
 }
 
@@ -159,8 +139,7 @@ fn with_tensor_ty_arg(call: Call, rewrite: impl FnOnce(&TensorType) -> TensorTyp
 
 /// C++ `ReinferMutatedCallType`: `call` with the result type its operator infers now.
 fn reinfer(call: Call) -> Result<Call> {
-    let ty: Type =
-        tvm_ffi::cached_global_func!("ir.reinfer_type").call_tuple((call.clone(),))?.try_into()?;
+    let ty = call.reinfer_type()?;
     if call.ty.same_as(&ty) {
         return Ok(call);
     }
@@ -201,18 +180,17 @@ fn same_elements(new: &[Expr], old: &Array<Expr>) -> bool {
 
 /// C++ `ComputeLegalizePlanner`: the allocations of the family's type whose storage nothing
 /// reaches through a raw pointer.
-struct Planner<'a> {
+struct Planner {
     family: Family,
-    ops: &'a Ops,
     candidates: HashSet<ObjectIdentity>,
     opaque: HashSet<ObjectIdentity>,
 }
 
 #[dispatch(walk)]
-impl Planner<'_> {
+impl Planner {
     fn walk_bind(&mut self, op: Bind) -> WalkResult {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            if call.op.same_as(&self.ops.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 let dtype =
                     call.ty_args.get(0).ok().and_then(|ty| {
                         ty.as_node::<TensorTypeObj>().map(|tensor| tensor.dtype.dtype)
@@ -226,7 +204,7 @@ impl Planner<'_> {
     }
 
     fn walk_call(&mut self, op: Call) -> WalkResult {
-        if op.op.same_as(&self.ops.tensor_data_ptr) && op.args.len() == 1 {
+        if TENSOR_DATA_PTR.is(&op.op) && op.args.len() == 1 {
             if let Ok(tensor) = op.args.get(0) {
                 if tensor.as_node::<crate::ir::VarObj>().is_some() {
                     self.opaque.insert(ObjectIdentity::of(&tensor));
@@ -245,8 +223,8 @@ impl Planner<'_> {
 }
 
 /// `ComputeLegalizePlanner::Plan(func)`: an opaque access anywhere vetoes a candidate.
-fn plan(family: Family, ops: &Ops, body: &SeqStmt) -> Result<HashSet<ObjectIdentity>> {
-    let mut planner = Planner { family, ops, candidates: HashSet::new(), opaque: HashSet::new() };
+fn plan(family: Family, body: &SeqStmt) -> Result<HashSet<ObjectIdentity>> {
+    let mut planner = Planner { family, candidates: HashSet::new(), opaque: HashSet::new() };
     structural_walk(body, &mut planner, WalkOrder::PreOrder)?;
     let Planner { mut candidates, opaque, .. } = planner;
     candidates.retain(|var| !opaque.contains(var));
@@ -258,11 +236,10 @@ fn plan(family: Family, ops: &Ops, body: &SeqStmt) -> Result<HashSet<ObjectIdent
 
 /// C++ `ComputeLegalizer`: computation on the family's type is done in `promote` instead; the
 /// family's storage stays, except for the allocations the planner chose, which are promoted.
-struct ComputeLegalizer<'a> {
+struct ComputeLegalizer {
     family: Family,
     /// The scalar type computation is promoted to.
     promote: DLDataType,
-    ops: &'a Ops,
     promoted_tensors: HashSet<ObjectIdentity>,
     /// The value of the `Bind` of an allocation to promote, while it is visited.
     allocation_to_promote: Option<Expr>,
@@ -271,7 +248,7 @@ struct ComputeLegalizer<'a> {
 }
 
 #[dispatch(mutate)]
-impl ComputeLegalizer<'_> {
+impl ComputeLegalizer {
     fn mutate_var(&mut self, var: Var, m: &mut Mutator) -> Result<Any> {
         if let Some(mapped) = self.remap.get(&ObjectIdentity::of(&var)) {
             return Ok(mapped.clone().into());
@@ -326,10 +303,10 @@ impl ComputeLegalizer<'_> {
     }
 
     fn mutate_call(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
-        if op.op.same_as(&self.ops.thread_allreduce) {
+        if GPU_THREAD_ALLREDUCE.is(&op.op) {
             return Ok(self.legalize_thread_allreduce(&op, m)?.into());
         }
-        if op.op.same_as(&self.ops.alloc_tensor) || op.op.same_as(&self.ops.decl_tensor) {
+        if ALLOC_TENSOR.is(&op.op) || DECL_TENSOR.is(&op.op) {
             let mut call: Call = m.default_mutate_as(self, &op)?;
             let promoted =
                 self.allocation_to_promote.as_ref().is_some_and(|value| value.same_as(&op));
@@ -343,11 +320,11 @@ impl ComputeLegalizer<'_> {
             }
             return Ok(reinfer(call)?.into());
         }
-        let is_load = op.op.same_as(&self.ops.masked_load);
-        if is_load || op.op.same_as(&self.ops.masked_store) {
+        let is_load = MASKED_LOAD.is(&op.op);
+        if is_load || MASKED_STORE.is(&op.op) {
             return Ok(self.legalize_masked(&op, is_load, m)?.into());
         }
-        if op.ty.as_node::<PrimTypeObj>().is_none() || op.op.same_as(&self.ops.reinterpret) {
+        if op.ty.as_node::<PrimTypeObj>().is_none() || REINTERPRET.is(&op.op) {
             return m.default_mutate(self, &op);
         }
         let mut args = Vec::with_capacity(op.args.len());
@@ -476,20 +453,14 @@ impl ComputeLegalizer<'_> {
     }
 }
 
-impl ComputeLegalizer<'_> {
+impl ComputeLegalizer {
     /// `LegalizeWithPlanner(func)`.
-    fn legalize(
-        family: Family,
-        promote: DLDataType,
-        ops: &Ops,
-        func: Function,
-    ) -> Result<Function> {
+    fn legalize(family: Family, promote: DLDataType, func: Function) -> Result<Function> {
         let Some(body) = func.body.clone() else { return Ok(func) };
         let mut legalizer = ComputeLegalizer {
             family,
             promote,
-            ops,
-            promoted_tensors: plan(family, ops, &body)?,
+            promoted_tensors: plan(family, &body)?,
             allocation_to_promote: None,
             remap: HashMap::new(),
         };
@@ -524,11 +495,11 @@ impl ComputeLegalizer<'_> {
         if value_dtype.code != DLDataTypeCode::kDLFloat as u8 {
             return Ok(value);
         }
-        if value_dtype != with_lanes(self.promote, value_dtype) {
-            return Err(internal(
-                "Check failed: value.ty() == this->promote_dtype_.WithLanes(value_ty.lanes())",
-            ));
-        }
+        tvm_ffi::ensure!(
+            value_dtype == with_lanes(self.promote, value_dtype),
+            INTERNAL_ERROR,
+            "Check failed: value.ty() == this->promote_dtype_.WithLanes(value_ty.lanes())"
+        );
         dtype_conversion(value, dtype)
     }
 
@@ -555,9 +526,7 @@ impl ComputeLegalizer<'_> {
         }
         let storage = load_type(tensor, indices)?;
         if prim_dtype(&value)? != storage.dtype {
-            if !self.family.matches(&value.ty) {
-                return Err(internal("Check failed: (MatchType(value.ty())) is false: "));
-            }
+            check!(self.family.matches(&value.ty), INTERNAL_ERROR, "MatchType(value.ty())");
             value = dtype_conversion(value, &storage)?;
         }
         Ok(value)
@@ -608,10 +577,8 @@ impl ComputeLegalizer<'_> {
     /// C++ `LegalizeThreadAllreduce`: the reduction computed in the promoted type, its operands
     /// and combiner retyped, tuples kept as tuples.
     fn legalize_thread_allreduce(&mut self, op: &Call, m: &mut Mutator) -> Result<Expr> {
-        let combine = op.args.get(0)?;
-        let combine_obj = combine
-            .as_node::<LambdaExprObj>()
-            .ok_or_else(|| Error::new(tvm_ffi::TYPE_ERROR, "expected a LambdaExpr", ""))?;
+        let combine: LambdaExpr =
+            op.args.get(0)?.try_cast().map_err(|_| error!(TYPE_ERROR, "expected a LambdaExpr"))?;
         let identity = self.map_operand(&op.args.get(1)?, &mut |this, value| {
             let value: Expr = m.mutate_as(this, value)?;
             this.promote(value)
@@ -625,14 +592,12 @@ impl ComputeLegalizer<'_> {
             None => vec![values.clone()],
         };
         let mut vars = Vec::new();
-        for (i, var) in combine_obj.vars.iter().enumerate() {
+        for (i, var) in combine.vars.iter().enumerate() {
             let field_ty: PrimType = value_fields[i % value_fields.len()].ty.clone().try_cast()?;
             vars.push(copy_with_type(&var, field_ty.into()));
         }
         let arguments: Array<Expr> = vars.iter().map(|var| Expr::from(var.clone())).collect();
-        let applied: Expr = tvm_ffi::cached_global_func!("ir.LambdaExprApply")
-            .call_tuple((combine.clone(), arguments))?
-            .try_into()?;
+        let applied = combine.apply(arguments)?;
         let body = self.map_operand(&applied, &mut |this, value| {
             let value: Expr = m.mutate_as(this, value)?;
             this.promote(value)
@@ -667,15 +632,14 @@ impl ComputeLegalizer<'_> {
 
 /// C++ `StorageLegalizer`: the family's remaining storage becomes unsigned integers of the same
 /// width, and reinterprets between them are rewritten or dropped.
-struct StorageLegalizer<'a> {
+struct StorageLegalizer {
     family: Family,
-    ops: &'a Ops,
     /// `VarRemapSet` of the pointer variables this pass retypes.
     remap: HashMap<ObjectIdentity, Var>,
 }
 
 #[dispatch(mutate)]
-impl StorageLegalizer<'_> {
+impl StorageLegalizer {
     fn mutate_var(&mut self, var: Var, m: &mut Mutator) -> Result<Any> {
         if let Some(mapped) = self.remap.get(&ObjectIdentity::of(&var)) {
             return Ok(mapped.clone().into());
@@ -729,7 +693,7 @@ impl StorageLegalizer<'_> {
     }
 
     fn mutate_call(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
-        if op.op.same_as(&self.ops.alloc_tensor) || op.op.same_as(&self.ops.decl_tensor) {
+        if ALLOC_TENSOR.is(&op.op) || DECL_TENSOR.is(&op.op) {
             let mut call: Call = m.default_mutate_as(self, &op)?;
             let ty: TensorType = call.ty_args.get(0)?.try_cast()?;
             if self.family.matches_dtype(ty.dtype.dtype) {
@@ -740,8 +704,8 @@ impl StorageLegalizer<'_> {
             }
             return Ok(reinfer(call)?.into());
         }
-        let is_load = op.op.same_as(&self.ops.masked_load);
-        if is_load || op.op.same_as(&self.ops.masked_store) {
+        let is_load = MASKED_LOAD.is(&op.op);
+        if is_load || MASKED_STORE.is(&op.op) {
             return Ok(self.legalize_masked(&op, is_load, m)?.into());
         }
         if let Some(pointer) = op.ty.as_node::<PtrTypeObj>() {
@@ -762,7 +726,7 @@ impl StorageLegalizer<'_> {
             )?;
             return Ok(rebuilt.into());
         }
-        if op.ty.as_node::<PrimTypeObj>().is_none() || !op.op.same_as(&self.ops.reinterpret) {
+        if op.ty.as_node::<PrimTypeObj>().is_none() || !REINTERPRET.is(&op.op) {
             return m.default_mutate(self, &op);
         }
         // A reinterpret between the family and its storage type is dropped or retargeted.
@@ -786,16 +750,16 @@ impl StorageLegalizer<'_> {
     }
 }
 
-impl StorageLegalizer<'_> {
+impl StorageLegalizer {
     /// `StorageLegalizer::Legalize(func)`: parameters and body, after MakePackedAPI.
-    fn legalize(family: Family, ops: &Ops, func: Function) -> Result<Function> {
-        if func.params.iter().any(|param| param.ty.as_node::<TensorTypeObj>().is_some()) {
-            return Err(internal(
-                "Check failed: (!param->ty.as<TensorTypeNode>()) is false: This pass must be \
-                 called after MakePackedAPI",
-            ));
-        }
-        let mut legalizer = StorageLegalizer { family, ops, remap: HashMap::new() };
+    fn legalize(family: Family, func: Function) -> Result<Function> {
+        check!(
+            !func.params.iter().any(|param| param.ty.as_node::<TensorTypeObj>().is_some()),
+            INTERNAL_ERROR,
+            "!param->ty.as<TensorTypeNode>()",
+            "This pass must be called after MakePackedAPI"
+        );
+        let mut legalizer = StorageLegalizer { family, remap: HashMap::new() };
         let mut params = Vec::with_capacity(func.params.len());
         for param in func.params.iter() {
             params.push(legalizer.remap_var_def(&param)?);
@@ -825,7 +789,7 @@ impl StorageLegalizer<'_> {
             return Ok(value);
         }
         match value.as_node::<CallObj>() {
-            Some(call) if call.op.same_as(&self.ops.reinterpret) => {
+            Some(call) if REINTERPRET.is(&call.op) => {
                 let storage = prim_type(storage_uint(dtype))?;
                 Ex::from(call.args.get(0)?).reinterpret(storage).expr()
             }
@@ -852,18 +816,17 @@ impl StorageLegalizer<'_> {
     fn remapped_tensor(&mut self, tensor: &Expr, m: &mut Mutator) -> Result<Expr> {
         let mapped: Expr = m.mutate_as(self, tensor)?;
         if mapped.same_as(tensor) && self.family.matches_dtype(tensor_dtype(tensor)?.dtype) {
-            let message = format!("Cannot find var remap for {}", repr(tensor));
-            return Err(internal(&message));
+            tvm_ffi::bail!(INTERNAL_ERROR, "Cannot find var remap for {}", repr(tensor));
         }
         Ok(mapped)
     }
 
     fn check_uint_tensor(&self, tensor: &Expr) -> Result<()> {
-        if tensor_dtype(tensor)?.dtype.code != DLDataTypeCode::kDLUInt as u8 {
-            return Err(internal(
-                "Check failed: (new_buf.dtype().MatchesCode(DLDataTypeCode::kDLUInt)) is false: ",
-            ));
-        }
+        check!(
+            tensor_dtype(tensor)?.dtype.code == DLDataTypeCode::kDLUInt as u8,
+            INTERNAL_ERROR,
+            "new_buf.dtype().MatchesCode(DLDataTypeCode::kDLUInt)"
+        );
         Ok(())
     }
 
@@ -895,14 +858,6 @@ impl StorageLegalizer<'_> {
     }
 }
 
-fn repr(expr: &Expr) -> std::string::String {
-    tvm_ffi::cached_global_func!("ffi.ReprPrint")
-        .call_packed(&[AnyView::from(expr)])
-        .and_then(String::try_from)
-        .map(|text| text.as_str().to_string())
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------------------------
 // Passes
 
@@ -911,11 +866,7 @@ fn has_native_support(target: &Target, family: Family) -> Result<bool> {
     if target.kind()?.name()?.as_str() != "cuda" {
         return Ok(false);
     }
-    let Ok(compute_version) = FfiFunction::get_global("tvm.support.nvcc.get_compute_version")
-    else {
-        return Ok(false);
-    };
-    let version: String = compute_version.call_tuple((target.clone(),))?.try_into()?;
+    let Some(version) = target.cuda_compute_version()? else { return Ok(false) };
     let Ok(supports) = FfiFunction::get_global(family.support_function()) else {
         return Ok(false);
     };
@@ -931,22 +882,20 @@ fn natively_supported(func: &Function, family: Family) -> Result<bool> {
 }
 
 fn compute_legalize(name: &str, family: Family, promote: DLDataType) -> Result<Pass> {
-    let ops = Ops::new()?;
     function_pass(name, 0, move |func, _module, _context| {
         if natively_supported(&func, family)? {
             return Ok(Some(func));
         }
-        ComputeLegalizer::legalize(family, promote, &ops, func).map(Some)
+        ComputeLegalizer::legalize(family, promote, func).map(Some)
     })
 }
 
 fn storage_legalize(name: &str, family: Family) -> Result<Pass> {
-    let ops = Ops::new()?;
     function_pass(name, 0, move |func, _module, _context| {
         if natively_supported(&func, family)? {
             return Ok(Some(func));
         }
-        StorageLegalizer::legalize(family, &ops, func).map(Some)
+        StorageLegalizer::legalize(family, func).map(Some)
     })
 }
 

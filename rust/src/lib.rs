@@ -74,6 +74,57 @@ macro_rules! impl_with_fields {
     };
 }
 
+/// C++ `TVM_FFI_CHECK(condition, Kind) << message`, and `TVM_FFI_ICHECK(condition)` with
+/// `INTERNAL_ERROR`: unless `condition` holds, return the error `Check failed: (<cpp>) is false:
+/// <message>`. `cpp` is the condition as C++ spells it, which the message shows; `message` is a
+/// format string with its arguments.
+///
+/// ```ignore
+/// check!(!tag.is_empty(), VALUE_ERROR, "!tag->value.empty()", "expects a nonempty tag");
+/// ```
+macro_rules! check {
+    ($condition:expr, $kind:expr, $cpp:literal $(,)?) => {
+        tvm_ffi::ensure!($condition, $kind, concat!("Check failed: (", $cpp, ") is false: "))
+    };
+    ($condition:expr, $kind:expr, $cpp:literal, $message:literal $(, $args:expr)* $(,)?) => {
+        tvm_ffi::ensure!(
+            $condition,
+            $kind,
+            concat!("Check failed: (", $cpp, ") is false: ", $message)
+            $(, $args)*
+        )
+    };
+}
+
+/// C++ `TVM_FFI_CHECK_EQ(lhs, rhs, Kind) << message` and the other comparisons, and their
+/// `TVM_FFI_ICHECK_*` forms with `INTERNAL_ERROR`: unless `lhs <op> rhs`, return the error `Check
+/// failed: <cpp> (<lhs> vs. <rhs>) : <message>`, which shows both values.
+///
+/// ```ignore
+/// check_cmp!(indices.len(), ==, 1, INTERNAL_ERROR, "store->indices.size() == 1");
+/// ```
+macro_rules! check_cmp {
+    ($lhs:expr, $op:tt, $rhs:expr, $kind:expr, $cpp:literal $(, $message:literal $(, $args:expr)*)? $(,)?) => {{
+        let (lhs, rhs) = ($lhs, $rhs);
+        tvm_ffi::ensure!(
+            lhs $op rhs,
+            $kind,
+            concat!("Check failed: ", $cpp, " ({} vs. {}) : " $(, $message)?),
+            lhs,
+            rhs
+            $($(, $args)*)?
+        )
+    }};
+}
+
+/// An error of `kind` with a formatted message, as a value: for `ok_or_else` and the like, where
+/// `tvm_ffi::bail!` cannot return.
+macro_rules! error {
+    ($kind:expr, $($message:tt)+) => {
+        tvm_ffi::Error::new($kind, &format!($($message)+), "")
+    };
+}
+
 pub mod ir;
 pub mod ops;
 pub mod passes;

@@ -25,17 +25,19 @@
 //! parameter) with an `int32` copy before rewriting the function.
 
 use tvm_ffi::{
-    dispatch, structural_mutate, Any, AnyView, Array, DefRegionKind, Mutator, ObjectRefCast,
-    ObjectRefCore, Result, String, UnchangedOr,
+    dispatch, structural_mutate, Any, Array, DefRegionKind, Mutator, ObjectRefCast, ObjectRefCore,
+    Result, UnchangedOr, INTERNAL_ERROR,
 };
 
 use super::data_type_rewriter::{
     copy_with_type, tensor_dtype, DataTypeRewrite, DataTypeRewriterBase, DataTypeRewriterState,
 };
-use super::util::{MutatorExt, function_pass, int32_dtype, internal, prim_dtype, prim_type};
-use crate::ir::{Bind, CallObj, Expr, IntImm, Op, PrimType, SeqStmt, Stmt, Var};
+use super::util::{MutatorExt, function_pass, int32_dtype, prim_dtype, prim_type};
+use crate::ir::{Bind, CallObj, Expr, IntImm, PrimType, SeqStmt, Stmt, Var};
+use crate::ops::repr;
 use crate::prim::Cast;
 use crate::runtime::MemoryScope;
+use crate::tirx::op::ALLOC_TENSOR;
 use crate::tirx::{Function, TensorTypeObj};
 use crate::transform::Pass;
 
@@ -49,18 +51,6 @@ fn can_rewrite(ty: &PrimType) -> bool {
 /// `param.as<TensorVar>()`: a variable whose type is a tensor type.
 fn is_tensor_var(var: &Var) -> bool {
     var.ty.as_node::<TensorTypeObj>().is_some()
-}
-
-/// How C++ prints a node in an error message (`ffi.ReprPrint`).
-fn repr<T>(value: &T) -> std::string::String
-where
-    for<'a> AnyView<'a>: From<&'a T>,
-{
-    tvm_ffi::cached_global_func!("ffi.ReprPrint")
-        .call_packed(&[AnyView::from(value)])
-        .and_then(String::try_from)
-        .map(|text| text.as_str().to_string())
-        .unwrap_or_default()
 }
 
 /// `IndexVarCollector`: the variables a function uses in indices, in the order C++ seeds them.
@@ -106,7 +96,6 @@ impl IndexVarCollector {
 struct Int32Narrower {
     base: DataTypeRewriterBase,
     target: PrimType,
-    alloc_tensor: Op,
     local: MemoryScope,
     /// The function before rewriting, for error messages.
     func: Function,
@@ -127,11 +116,13 @@ impl Int32Narrower {
             return Ok(UnchangedOr::<Any>::unchanged().into());
         }
         let Some(value) = op.value.to_i64().filter(|v| *v <= i32::MAX as i64) else {
-            let message = format!(
-                "Check failed: op->value <= prim::max_value(target_data_type_).as_or_throw<IntImm>()->value ({} vs. {}) : ",
-                op.value, i32::MAX
+            tvm_ffi::bail!(
+                INTERNAL_ERROR,
+                "Check failed: op->value <= \
+                 prim::max_value(target_data_type_).as_or_throw<IntImm>()->value ({} vs. {}) : ",
+                op.value,
+                i32::MAX
             );
-            return Err(internal(&message));
         };
         Ok(super::util::int32(value)?.into())
     }
@@ -153,12 +144,11 @@ impl Int32Narrower {
     /// An allocated tensor may not have an integer type wider than `int32`, unless it is the
     /// local scalar storage of a TVMScript assignment.
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
-        let allocates =
-            op.value.as_node::<CallObj>().is_some_and(|call| call.op.same_as(&self.alloc_tensor));
+        let allocates = op.value.as_node::<CallObj>().is_some_and(|call| ALLOC_TENSOR.is(&call.op));
         let result = m.default_mutate(self, &op)?;
         if allocates {
             let alloc: Bind = result.clone().try_into()?;
-            self.check_allocated_tensor(&alloc.var.clone().into())?;
+            self.check_allocated_tensor(&alloc.var)?;
         }
         Ok(result)
     }
@@ -184,20 +174,19 @@ impl Int32Narrower {
 }
 
 impl Int32Narrower {
-    fn check_allocated_tensor(&self, tensor: &Expr) -> Result<()> {
+    fn check_allocated_tensor(&self, tensor: &Var) -> Result<()> {
         let Some(ty) = tensor.ty.as_node::<TensorTypeObj>() else { return Ok(()) };
-        let is_scalar: bool = tvm_ffi::cached_global_func!("tirx.TensorIsScalar")
-            .call_tuple((tensor.clone(), true))?
-            .try_into()?;
+        let is_scalar = tensor.tensor_is_scalar(true)?;
         let is_local_scalar = ty.scope.same_as(&self.local) && is_scalar;
-        let dtype = tensor_dtype(tensor)?;
+        let dtype = tensor_dtype(&tensor.clone().into())?;
         if !is_local_scalar && dtype.dtype.code == DL_INT && dtype.dtype.bits > 32 {
-            return Err(internal(&format!(
+            tvm_ffi::bail!(
+                INTERNAL_ERROR,
                 "The tensor {} allocated in the function has dtype {}. The function is {}",
                 repr(tensor),
                 repr(&dtype),
                 repr(&self.func)
-            )));
+            );
         }
         Ok(())
     }
@@ -211,12 +200,13 @@ fn check_tensor_params(func: &Function) -> Result<()> {
         }
         let dtype = tensor_dtype(&param.clone().into())?;
         if dtype.dtype.code == DL_INT && dtype.dtype.bits > 32 {
-            return Err(internal(&format!(
+            tvm_ffi::bail!(
+                INTERNAL_ERROR,
                 "The tensor parameter {} has dtype {}. The function is {}",
                 repr(&param),
                 repr(&dtype),
                 repr(func)
-            )));
+            );
         }
     }
     Ok(())
@@ -225,12 +215,11 @@ fn check_tensor_params(func: &Function) -> Result<()> {
 /// C++ `ForceNarrowIndexToInt32(func)`.
 fn rewrite(func: Function) -> Result<Function> {
     check_tensor_params(&func)?;
-    let mut collector = IndexVarCollector { base: DataTypeRewriterBase::new(true)?, seeds: vec![] };
+    let mut collector = IndexVarCollector { base: DataTypeRewriterBase::new(true), seeds: vec![] };
     structural_mutate(func.clone(), &mut collector)?;
     let mut narrower = Int32Narrower {
-        base: DataTypeRewriterBase::new(true)?,
+        base: DataTypeRewriterBase::new(true),
         target: prim_type(int32_dtype())?,
-        alloc_tensor: Op::get("tirx.alloc_tensor")?,
         local: MemoryScope::get("local")?,
         func: func.clone(),
     };

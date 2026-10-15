@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use tvm_ffi::tvm_ffi_sys::{TVMFFIAny, TVMFFITypeIndex};
@@ -220,8 +221,8 @@ impl OpDef {
 
 /// A handle to an operator, kept in a `static` as C++ keeps one in `const Op& xxx_op()`: either
 /// an operator registered elsewhere (C++ or Python), looked up by name, or one Rust defines,
-/// registered once, by [`register_ops`] or on first use. [`OpHandle::get`] returns the operator,
-/// fetched once per thread.
+/// registered once, by [`register_ops`] or on first use. The operator is fetched once per thread;
+/// [`OpHandle::get`] returns it and [`OpHandle::is`] compares with it.
 ///
 /// ```ignore
 /// static LAUNCH_THREAD: OpHandle = OpHandle::registered("tirx.launch_thread");
@@ -231,26 +232,40 @@ impl OpDef {
 ///         .set_infer_type(first_arg_type)
 /// });
 ///
+/// if LAUNCH_THREAD.is(&region.op) { ... }
 /// let clamped = Call::new(ty, CLAMP.get()?, [index, bound])?;
 /// ```
 pub struct OpHandle {
     name: &'static str,
-    /// The documentation and the definition of an operator Rust defines.
-    definition: Option<(&'static str, fn(OpDef) -> OpDef)>,
+    definition: Option<Definition>,
     /// The outcome of the definition, which runs once: the error's text if it failed.
     defined: OnceLock<std::result::Result<(), std::string::String>>,
+    /// This handle's slot in each thread's cache of fetched operators.
+    slot: OnceLock<usize>,
+}
+
+/// The documentation and the definition of an operator Rust defines.
+type Definition = (&'static str, fn(OpDef) -> OpDef);
+
+/// The number of slots handed out to handles.
+static SLOTS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// The operators this thread fetched, by handle slot.
+    static FETCHED: RefCell<Vec<Option<Op>>> = const { RefCell::new(Vec::new()) };
 }
 
 impl OpHandle {
     /// The operator `name`, registered elsewhere.
     pub const fn registered(name: &'static str) -> Self {
-        Self { name, definition: None, defined: OnceLock::new() }
+        Self { name, definition: None, defined: OnceLock::new(), slot: OnceLock::new() }
     }
 
     /// The operator `name`, defined here: `define` adds to `OpDef::new(name, doc)`. An operator
     /// of that name registered elsewhere is an error, as Rust does not take operators over.
     pub const fn define(name: &'static str, doc: &'static str, define: fn(OpDef) -> OpDef) -> Self {
-        Self { name, definition: Some((doc, define)), defined: OnceLock::new() }
+        let definition = Some((doc, define));
+        Self { name, definition, defined: OnceLock::new(), slot: OnceLock::new() }
     }
 
     pub fn name(&self) -> &'static str {
@@ -282,8 +297,30 @@ impl OpHandle {
 
     /// The operator, registered first if Rust defines it.
     pub fn get(&self) -> Result<Op> {
+        self.with(Op::clone)
+    }
+
+    /// Whether `value`, such as a Call's `op`, is this operator (C++ `value.same_as(op)`). No
+    /// value is an operator that cannot be fetched, such as one this build does not register.
+    pub fn is(&self, value: &impl ObjectRefCore) -> bool {
+        self.with(|op| value.same_as(op)).unwrap_or(false)
+    }
+
+    /// `use_op` applied to the operator, fetched into this thread's slot the first time.
+    fn with<R>(&self, use_op: impl FnOnce(&Op) -> R) -> Result<R> {
         self.register()?;
-        cached_op(self.name)
+        let slot = *self.slot.get_or_init(|| SLOTS.fetch_add(1, Ordering::Relaxed));
+        FETCHED.with(|fetched| {
+            if let Some(Some(op)) = fetched.borrow().get(slot) {
+                return Ok(use_op(op));
+            }
+            let op = Op::get(self.name)?;
+            let mut fetched = fetched.borrow_mut();
+            if fetched.len() <= slot {
+                fetched.resize(slot + 1, None);
+            }
+            Ok(use_op(fetched[slot].insert(op)))
+        })
     }
 }
 

@@ -160,13 +160,11 @@ impl LoopUnroller {
             && self.counters.unroll_depth <= self.auto_max_depth
             && fits;
         if op.kind == FOR_UNROLLED {
-            if extent < 0 {
-                return Err(tvm_ffi::Error::new(
-                    tvm_ffi::INTERNAL_ERROR,
-                    "Cannot unroll non-constant loop",
-                    "",
-                ));
-            }
+            tvm_ffi::ensure!(
+                extent >= 0,
+                tvm_ffi::INTERNAL_ERROR,
+                "Cannot unroll non-constant loop"
+            );
             auto_unroll = true;
         }
         if self.unroll_local_access

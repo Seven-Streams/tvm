@@ -26,21 +26,28 @@
 //! a call needs prepared go before the statement holding it.
 
 use tvm_ffi::{
-    dispatch, structural_mutate, Any, Array, BigInt, DLDataType, DLDataTypeExt, Error, Mutator,
-    ObjectRefCast, ObjectRefCore, Result, String, TYPE_ERROR, VALUE_ERROR,
+    dispatch, structural_mutate, Any, Array, BigInt, DLDataType, DLDataTypeExt, Mutator,
+    ObjectRefCast, ObjectRefCore, Result, String, INTERNAL_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 
-use super::util::{MutatorExt, function_pass, get_attr, has_nonzero_attr, internal, prim_type};
+use super::util::{MutatorExt, function_pass, get_attr, has_nonzero_attr, prim_type};
 use crate::ir::{
     Bind, BindObj, Call, CallObj, DictAttrs, Evaluate, Expr, For, ForObj, If, IfObj, IntImmObj, Op,
     PrimType, PrimTypeObj, PtrType, PtrTypeObj, RegionStmt, RegionStmtObj, SeqStmt, Stmt,
     StringImm, StringImmObj, TensorLoad, TensorStore, Var,
 };
-use crate::ops::{int32, int_imm, unknown_loc, Ex, PrimOps};
+use crate::ops::{int32, int_imm, repr, unknown_loc, Ex, PrimOps};
 use crate::prim::Cast;
 use crate::runtime::MemoryScope;
 use crate::target::Target;
 use crate::tirx::cuda::TensorMapEncodeTiledAttrObj;
+use crate::tirx::op::{
+    ABI_FIELD_GET, ABI_FIELD_SET, ADDRESS_OF, ALLOC_TENSOR, ALLOC_WORKSPACE, CALL_CPACKED,
+    CALL_CPACKED_LOWERED, CALL_FFI_KERNEL, CALL_PACKED, CALL_PACKED_LOWERED,
+    CUDA_TENSORMAP_ENCODE_TILED, DECL_TENSOR, DEVICE_CONTEXT, FREE_WORKSPACE, ISNULLPTR,
+    OPENCL_ND_MEM_ALLOC_WITH_SCOPE, STACK_ALLOCA, STACK_MAKE_DLTENSOR, STACK_MAKE_SHAPE,
+    TENSOR_DATA_PTR, THROW_LAST_ERROR,
+};
 use crate::tirx::{Function, TensorType, TensorTypeObj};
 use crate::transform::Pass;
 use crate::SameField;
@@ -87,11 +94,6 @@ const HANDLE: u8 = 3;
 const BFLOAT: u8 = 4;
 const BOOL: u8 = 6;
 
-/// The text of a failed C++ `TVM_FFI_ICHECK(condition) << message`.
-fn check_failed(condition: &str, message: &str) -> Error {
-    internal(&format!("Check failed: ({condition}) is false: {message}"))
-}
-
 fn dtype(code: u8, bits: u8, lanes: u16) -> DLDataType {
     DLDataType { code, bits, lanes }
 }
@@ -103,9 +105,10 @@ fn ty(code: u8, bits: u8) -> Result<PrimType> {
 /// `PrimType::lanes()`, which a scalable vector has none of at compile time.
 fn lanes(d: DLDataType) -> Result<i64> {
     match d.lanes as i16 {
-        lanes if lanes < 0 => {
-            Err(internal("Can't fetch the lanes of a scalable vector at a compile time."))
-        }
+        lanes if lanes < 0 => Err(error!(
+            INTERNAL_ERROR,
+            "Can't fetch the lanes of a scalable vector at a compile time."
+        )),
         lanes => Ok(lanes as i64),
     }
 }
@@ -132,7 +135,7 @@ fn tensor_type_of(var: &Var) -> Result<TensorType> {
     var.ty
         .clone()
         .try_cast::<TensorType>()
-        .map_err(|_| Error::new(TYPE_ERROR, "expected a TensorVar, a variable of a TensorType", ""))
+        .map_err(|_| error!(TYPE_ERROR, "expected a TensorVar, a variable of a TensorType"))
 }
 
 /// `TensorTypeNode::ConstantAllocationSize()`.
@@ -158,7 +161,7 @@ fn is_prim_expr(x: &Expr) -> bool {
 fn prim_dtype_of(x: &Expr) -> Result<DLDataType> {
     x.ty.as_node::<PrimTypeObj>()
         .map(|t| t.dtype)
-        .ok_or_else(|| Error::new(TYPE_ERROR, "expected a PrimExpr", ""))
+        .ok_or_else(|| error!(TYPE_ERROR, "expected a PrimExpr"))
 }
 
 /// `runtime::DLDeviceType2Str`.
@@ -179,58 +182,8 @@ fn device_type_name(device_type: i64) -> Result<&'static str> {
         15 => "webgpu",
         16 => "hexagon",
         18 => "trn",
-        other => return Err(internal(&format!("unknown type = {other}"))),
+        other => tvm_ffi::bail!(INTERNAL_ERROR, "unknown type = {other}"),
     })
-}
-
-/// The operators the lowering recognizes and emits.
-#[derive(Clone)]
-struct Ops {
-    alloc_tensor: Op,
-    decl_tensor: Op,
-    stack_alloca: Op,
-    nd_mem_alloc_with_scope: Op,
-    device_context: Op,
-    tensormap_encode_tiled: Op,
-    call_packed: Op,
-    call_packed_lowered: Op,
-    call_cpacked: Op,
-    call_cpacked_lowered: Op,
-    call_ffi_kernel: Op,
-    stack_make_shape: Op,
-    stack_make_dltensor: Op,
-    abi_field_set: Op,
-    abi_field_get: Op,
-    address_of: Op,
-    isnullptr: Op,
-    throw_last_error: Op,
-    tensor_data_ptr: Op,
-}
-
-impl Ops {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            alloc_tensor: Op::get("tirx.alloc_tensor")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
-            stack_alloca: Op::get("tirx.stack_alloca")?,
-            nd_mem_alloc_with_scope: Op::get("tirx.opencl.nd_mem_alloc_with_scope")?,
-            device_context: Op::get("tirx.device_context")?,
-            tensormap_encode_tiled: Op::get("tirx.cuda.tensormap_encode_tiled")?,
-            call_packed: Op::get("tirx.call_packed")?,
-            call_packed_lowered: Op::get("tirx.call_packed_lowered")?,
-            call_cpacked: Op::get("tirx.call_cpacked")?,
-            call_cpacked_lowered: Op::get("tirx.call_cpacked_lowered")?,
-            call_ffi_kernel: Op::get("tirx.call_ffi_kernel")?,
-            stack_make_shape: Op::get("tirx.stack_make_shape")?,
-            stack_make_dltensor: Op::get("tirx.stack_make_dltensor")?,
-            abi_field_set: Op::get("tirx.abi_field_set")?,
-            abi_field_get: Op::get("tirx.abi_field_get")?,
-            address_of: Op::get("tirx.address_of")?,
-            isnullptr: Op::get("tirx.isnullptr")?,
-            throw_last_error: Op::get("tirx.throw_last_error")?,
-            tensor_data_ptr: Op::get("tirx.tensor_data_ptr")?,
-        })
-    }
 }
 
 /// The stack slots in use, or the most a scope needs. A shape stack of `-1` is no shape at all;
@@ -275,22 +228,19 @@ impl AllocaScope {
     }
 
     fn assert_max_is_valid(&self) -> Result<()> {
-        if self.max.shape >= self.run.shape
-            || self.max.array >= self.run.array
-            || self.max.arg >= self.run.arg
-        {
-            return Ok(());
-        }
-        Err(check_failed(
+        check!(
+            self.max.shape >= self.run.shape
+                || self.max.array >= self.run.array
+                || self.max.arg >= self.run.arg,
+            INTERNAL_ERROR,
             "(max_sizes.shape_stack >= run_sizes.shape_stack) || (max_sizes.array_stack >= \
-             run_sizes.array_stack) || (max_sizes.arg_stack >= run_sizes.arg_stack)",
-            "",
-        ))
+             run_sizes.array_stack) || (max_sizes.arg_stack >= run_sizes.arg_stack)"
+        );
+        Ok(())
     }
 }
 
 struct BuiltinLower {
-    ops: Ops,
     /// The statements to emit before the statement being lowered, one list per statement.
     prep_seq: Vec<Vec<Stmt>>,
     device_type: Option<Expr>,
@@ -306,9 +256,8 @@ struct BuiltinLower {
 }
 
 impl BuiltinLower {
-    fn new(ops: Ops, device_type: Option<Expr>, preserve_ffi_kernel: bool) -> Self {
+    fn new(device_type: Option<Expr>, preserve_ffi_kernel: bool) -> Self {
         Self {
-            ops,
             prep_seq: Vec::new(),
             device_type,
             device_id: None,
@@ -320,7 +269,10 @@ impl BuiltinLower {
     }
 
     fn scope(&mut self) -> Result<&mut AllocaScope> {
-        self.alloca_scope.last_mut().ok_or_else(|| check_failed("!alloca_scope_.empty()", ""))
+        let scope = self.alloca_scope.last_mut();
+        scope.ok_or_else(|| {
+            error!(INTERNAL_ERROR, "Check failed: (!alloca_scope_.empty()) is false: ")
+        })
     }
 
     fn prep(&mut self) -> &mut Vec<Stmt> {
@@ -347,10 +299,16 @@ impl BuiltinLower {
 
     fn require_device(&self) -> Result<(Expr, Expr)> {
         let Some(device_type) = self.device_type.clone() else {
-            return Err(check_failed("device_type_", "Unknown device type in current IR"));
+            tvm_ffi::bail!(
+                INTERNAL_ERROR,
+                "Check failed: (device_type_) is false: Unknown device type in current IR"
+            );
         };
         let Some(device_id) = self.device_id.clone() else {
-            return Err(check_failed("device_id_", "Unknown device id in current IR"));
+            tvm_ffi::bail!(
+                INTERNAL_ERROR,
+                "Check failed: (device_id_) is false: Unknown device id in current IR"
+            );
         };
         Ok((device_type, device_id))
     }
@@ -361,20 +319,20 @@ impl BuiltinLower {
     /// `GetMaxStack(stmt)`: the stack sizes `stmt` needs, from a sizing run over it.
     fn max_stack(&self, stmt: &Stmt) -> Result<StackSizes> {
         // A default-constructed precheck: it lowers `call_ffi_kernel` whatever this one does.
-        let mut precheck = BuiltinLower::new(self.ops.clone(), self.device_type.clone(), false);
+        let mut precheck = BuiltinLower::new(self.device_type.clone(), false);
         precheck.is_precheck = true;
         precheck.device_id = self.device_id.clone();
         let mut scope = AllocaScope::new()?;
         scope.stack_shape = Some(int64_tensor_var("stack_shape", 0)?);
         precheck.alloca_scope.push(scope);
         structural_mutate(stmt.clone(), &mut precheck)?;
-        if precheck.alloca_scope.len() != 1 {
-            let message = format!(
-                "Check failed: precheck->alloca_scope_.size() == 1 ({} vs. 1) : ",
-                precheck.alloca_scope.len()
-            );
-            return Err(internal(&message));
-        }
+        check_cmp!(
+            precheck.alloca_scope.len(),
+            ==,
+            1,
+            INTERNAL_ERROR,
+            "precheck->alloca_scope_.size() == 1"
+        );
         Ok(precheck.alloca_scope[0].max)
     }
 
@@ -399,12 +357,12 @@ impl BuiltinLower {
             let tensor = tensor_type_of(&stack_shape)?;
             let data = Call::new(
                 tensor.data_ptr_type()?,
-                self.ops.stack_alloca.clone(),
+                STACK_ALLOCA.get()?,
                 vec![StringImm::new("shape")?.into(), int32(scope.max.shape)?.into()],
             )?;
             let decl = Call::new_full(
                 Some(tensor.clone().into()),
-                self.ops.decl_tensor.clone().into(),
+                DECL_TENSOR.get()?.into(),
                 Array::new(vec![data.into()]),
                 None,
                 Array::new(vec![tensor.into()]),
@@ -425,7 +383,7 @@ impl BuiltinLower {
     /// `Bind(var, stack_alloca(kind, size))`.
     fn stack_alloca(&self, var: &Var, kind: &str, size: u64) -> Result<Stmt> {
         let args = vec![StringImm::new(kind)?.into(), int32(size as i64)?.into()];
-        let call = Call::new(var.ty.clone(), self.ops.stack_alloca.clone(), args)?;
+        let call = Call::new(var.ty.clone(), STACK_ALLOCA.get()?, args)?;
         Ok(Bind::new(var.clone(), call)?.into())
     }
 
@@ -484,10 +442,10 @@ impl BuiltinLower {
 
     fn lower_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Stmt> {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            if call.op.same_as(&self.ops.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 return self.lower_alloc_tensor(op, m);
             }
-            if call.op.same_as(&self.ops.nd_mem_alloc_with_scope) {
+            if OPENCL_ND_MEM_ALLOC_WITH_SCOPE.is(&call.op) {
                 return self.lower_nd_mem_alloc(op, m);
             }
         }
@@ -503,7 +461,7 @@ impl BuiltinLower {
         let alloc_type: TensorType = tensor_call.ty_args.get(0)?.try_cast()?;
         let element = alloc_type.dtype.dtype;
         let Some(attrs) = tensor_call.attrs.clone() else {
-            return Err(internal("bad optional access: alloc_tensor has no attrs"));
+            tvm_ffi::bail!(INTERNAL_ERROR, "bad optional access: alloc_tensor has no attrs");
         };
         let annotations: DictAttrs = attrs.try_cast()?;
         if let Some(disable) = annotations.dict.get(&String::from(DISABLE_LOWER_BUILTIN))? {
@@ -535,22 +493,21 @@ impl BuiltinLower {
         let (device_type, device_id) = self.require_device()?;
         let int32_ty = ty(INT, 32)?;
         let throw_last_error: Stmt =
-            Evaluate::new(Call::new(int32_ty.clone(), self.ops.throw_last_error.clone(), vec![])?)?
-                .into();
+            Evaluate::new(Call::new(int32_ty.clone(), THROW_LAST_ERROR.get()?, vec![])?)?.into();
         let data: Expr = Call::new(
             var_type.data_ptr_type()?,
-            self.ops.tensor_data_ptr.clone(),
+            TENSOR_DATA_PTR.get()?,
             vec![bind.var.clone().into()],
         )?
         .into();
-        let is_null = Call::new(ty(BOOL, 8)?, self.ops.isnullptr.clone(), vec![data.clone()])?;
+        let is_null = Call::new(ty(BOOL, 8)?, ISNULLPTR.get()?, vec![data.clone()])?;
         let alloc_nullptr_check: Stmt = If::new(is_null, throw_last_error.clone(), None)?.into();
 
         let device_type = device_type.cast(int32_ty.clone()).expr()?;
         let device_id = device_id.cast(int32_ty.clone()).expr()?;
         let free = Call::new(
             int32_ty.clone(),
-            Op::get("tirx.free_workspace")?,
+            FREE_WORKSPACE.get()?,
             vec![device_type.clone(), device_id.clone(), data],
         )?;
         let failed = Ex::from(free).not_equal(int32(0)?).expr()?;
@@ -559,7 +516,7 @@ impl BuiltinLower {
 
         let alloc = Call::new(
             var_type.data_ptr_type()?,
-            Op::get("tirx.alloc_workspace")?,
+            ALLOC_WORKSPACE.get()?,
             vec![
                 device_type,
                 device_id,
@@ -570,7 +527,7 @@ impl BuiltinLower {
         )?;
         let decl = Call::new_full(
             Some(var_type.clone().into()),
-            self.ops.decl_tensor.clone().into(),
+            DECL_TENSOR.get()?.into(),
             Array::new(vec![alloc.into()]),
             None,
             Array::new(vec![var_type.into()]),
@@ -588,15 +545,14 @@ impl BuiltinLower {
         let (device_type, device_id) = self.require_device()?;
         let int32_ty = ty(INT, 32)?;
         let throw_last_error: Stmt =
-            Evaluate::new(Call::new(int32_ty.clone(), self.ops.throw_last_error.clone(), vec![])?)?
-                .into();
+            Evaluate::new(Call::new(int32_ty.clone(), THROW_LAST_ERROR.get()?, vec![])?)?.into();
         let element = op
             .var
             .ty
             .as_node::<PtrTypeObj>()
             .and_then(|ptr| ptr.element_type.as_node::<PrimTypeObj>())
             .map(|element| element.dtype)
-            .ok_or_else(|| check_failed("dtype_node", ""))?;
+            .ok_or_else(|| error!(INTERNAL_ERROR, "Check failed: (dtype_node) is false: "))?;
         let mut args: Vec<Expr> = vec![
             self.device_method_name("alloc_nd")?.into(),
             device_type.clone(),
@@ -605,14 +561,13 @@ impl BuiltinLower {
             int32(element.bits as i64)?.into(),
         ];
         args.extend(call.args.iter());
-        let call_packed = Call::new(op.var.ty.clone(), self.ops.call_packed.clone(), args)?;
-        let is_null =
-            Call::new(ty(BOOL, 8)?, self.ops.isnullptr.clone(), vec![op.var.clone().into()])?;
+        let call_packed = Call::new(op.var.ty.clone(), CALL_PACKED.get()?, args)?;
+        let is_null = Call::new(ty(BOOL, 8)?, ISNULLPTR.get()?, vec![op.var.clone().into()])?;
         let null_check: Stmt = If::new(is_null, throw_last_error.clone(), None)?.into();
 
         let free = Call::new(
             int32_ty,
-            self.ops.call_packed.clone(),
+            CALL_PACKED.get()?,
             vec![
                 self.device_method_name("free_nd")?.into(),
                 device_type,
@@ -635,23 +590,25 @@ impl BuiltinLower {
     /// `GetDeviceMethodName(method)`: `device_api.<device>.<method>`.
     fn device_method_name(&self, method: &str) -> Result<StringImm> {
         let Some(device_type) = &self.device_type else {
-            let message = format!(
-                "Method {method} requires the device type, but occurred outside of a \
-                 \"device_context\" region"
+            tvm_ffi::bail!(
+                INTERNAL_ERROR,
+                "Check failed: (device_type_) is false: Method {method} requires the device type, \
+                 but occurred outside of a \"device_context\" region"
             );
-            return Err(check_failed("device_type_", &message));
         };
         let Some(imm) = device_type.as_node::<IntImmObj>() else {
-            let message =
-                format!("Method {method} requires the device type to be a DLDeviceType enum value");
-            return Err(check_failed("as_int", &message));
+            tvm_ffi::bail!(
+                INTERNAL_ERROR,
+                "Check failed: (as_int) is false: Method {method} requires the device type to be a \
+                 DLDeviceType enum value"
+            );
         };
         let device = imm.value.to_i64().unwrap_or(-1);
         StringImm::new(&format!("device_api.{}.{method}", device_type_name(device)?))
     }
 
     fn lower_region(&mut self, op: RegionStmt, m: &mut Mutator) -> Result<Stmt> {
-        if op.op.same_as(&self.ops.device_context) {
+        if DEVICE_CONTEXT.is(&op.op) {
             let device_type: Expr = m.mutate_as(self, &op.args.get(0)?)?;
             let device_id: Expr = m.mutate_as(self, &op.args.get(1)?)?;
             let saved_type = self.device_type.replace(device_type);
@@ -716,25 +673,20 @@ impl BuiltinLower {
 
     fn lower_call(&mut self, call: Call, m: &mut Mutator) -> Result<Expr> {
         let op = &call.op;
-        if op.same_as(&self.ops.tensormap_encode_tiled) && !self.preserve_ffi_kernel {
+        if CUDA_TENSORMAP_ENCODE_TILED.is(op) && !self.preserve_ffi_kernel {
             let packed = self.tensormap_packed_call(&call)?;
-            let lowered = self.ops.call_packed_lowered.clone();
-            return self.make_call_packed(packed, lowered, m);
+            return self.make_call_packed(packed, CALL_PACKED_LOWERED.get()?, m);
         }
-        if op.same_as(&self.ops.call_packed)
-            || (op.same_as(&self.ops.call_ffi_kernel) && !self.preserve_ffi_kernel)
-        {
-            let lowered = self.ops.call_packed_lowered.clone();
-            return self.make_call_packed(call, lowered, m);
+        if CALL_PACKED.is(op) || (CALL_FFI_KERNEL.is(op) && !self.preserve_ffi_kernel) {
+            return self.make_call_packed(call, CALL_PACKED_LOWERED.get()?, m);
         }
-        if op.same_as(&self.ops.call_cpacked) {
-            let lowered = self.ops.call_cpacked_lowered.clone();
-            return self.make_call_packed(call, lowered, m);
+        if CALL_CPACKED.is(op) {
+            return self.make_call_packed(call, CALL_CPACKED_LOWERED.get()?, m);
         }
-        if op.same_as(&self.ops.stack_make_shape) {
+        if STACK_MAKE_SHAPE.is(op) {
             return self.make_shape(call, m);
         }
-        if op.same_as(&self.ops.stack_make_dltensor) {
+        if STACK_MAKE_DLTENSOR.is(op) {
             return self.make_array(call, m);
         }
         m.default_mutate(self, &call)?.try_into()
@@ -747,10 +699,12 @@ impl BuiltinLower {
         let Some(attr) = attr.filter(|attr| {
             (1..=5).contains(&attr.rank) && call.args.len() as i64 == 4 * attr.rank + 1
         }) else {
-            let message = "Check failed: (attr && attr->rank >= 1 && attr->rank <= 5 && \
-                           op->args.size() == static_cast<size_t>(4 * attr->rank + 1)) is false: \
-                           Invalid tensormap_encode_tiled attributes or operands";
-            return Err(Error::new(VALUE_ERROR, message, ""));
+            tvm_ffi::bail!(
+                VALUE_ERROR,
+                "Check failed: (attr && attr->rank >= 1 && attr->rank <= 5 && op->args.size() == \
+                 static_cast<size_t>(4 * attr->rank + 1)) is false: Invalid tensormap_encode_tiled \
+                 attributes or operands"
+            );
         };
         let int32_imm = |value: i64| -> Result<Expr> { Ok(int32(value)?.into()) };
         let mut args: Vec<Expr> = vec![
@@ -767,7 +721,7 @@ impl BuiltinLower {
         if attr.force_cu_dtype != -1 {
             args.push(int32_imm(attr.force_cu_dtype)?);
         }
-        Call::new(call.ty.clone(), self.ops.call_packed.clone(), args)
+        Call::new(call.ty.clone(), CALL_PACKED.get()?, args)
     }
 
     /// `MakeShape`: the extents stored on the shape stack, passed as the address of the first.
@@ -783,7 +737,7 @@ impl BuiltinLower {
         };
         let call: Call = m.default_mutate(self, &call)?.try_into()?;
         let Some(stack_shape) = self.scope()?.stack_shape.clone() else {
-            return Err(internal("bad optional access: no shape stack"));
+            tvm_ffi::bail!(INTERNAL_ERROR, "bad optional access: no shape stack");
         };
         let int64 = ty(INT, 64)?;
         for (i, arg) in call.args.iter().enumerate() {
@@ -794,15 +748,14 @@ impl BuiltinLower {
         }
         let load = TensorLoad::new(stack_shape.clone(), vec![int32(begin)?.into()])?;
         let tensor = tensor_type_of(&stack_shape)?;
-        Ok(Call::new(tensor.data_ptr_type()?, self.ops.address_of.clone(), vec![load.into()])?
-            .into())
+        Ok(Call::new(tensor.data_ptr_type()?, ADDRESS_OF.get()?, vec![load.into()])?.into())
     }
 
     /// `abi_field_set(stack, index, field, value)` as a statement.
     fn set_field(&self, stack: &Var, index: i64, field: i32, value: Expr) -> Result<Stmt> {
         let args =
             vec![stack.clone().into(), int32(index)?.into(), int32(field as i64)?.into(), value];
-        let call = Call::new(ty(INT, 32)?, self.ops.abi_field_set.clone(), args)?;
+        let call = Call::new(ty(INT, 32)?, ABI_FIELD_SET.get()?, args)?;
         Ok(Evaluate::new(call)?.into())
     }
 
@@ -872,13 +825,13 @@ impl BuiltinLower {
         prep.push(self.set_field(&stack, index, DLTENSOR_DEVICE_TYPE, device_type)?);
         self.prep().extend(prep);
         let args = vec![stack.into(), int32(index)?.into(), int32(DLTENSOR_ADDR as i64)?.into()];
-        Ok(Call::new(PtrType::void()?, self.ops.abi_field_get.clone(), args)?.into())
+        Ok(Call::new(PtrType::void()?, ABI_FIELD_GET.get()?, args)?.into())
     }
 
     /// `IsArrayHandle`: the address of a `DLTensor` made by `stack_make_dltensor`.
     fn is_array_handle(&self, arg: &Expr) -> bool {
         let Some(call) = arg.as_node::<CallObj>() else { return false };
-        call.op.same_as(&self.ops.abi_field_get)
+        ABI_FIELD_GET.is(&call.op)
             && call.args.get(2).ok().is_some_and(|field| {
                 matches!(field.as_node::<IntImmObj>(), Some(imm) if imm.value == BigInt::from(DLTENSOR_ADDR as i64))
             })
@@ -908,7 +861,7 @@ impl BuiltinLower {
                 FLOAT => FFI_FLOAT,
                 _ => {
                     let api = prim_type(api_type)?;
-                    return Err(internal(&format!("Unsupported type: {}", repr(&api))));
+                    tvm_ffi::bail!(INTERNAL_ERROR, "Unsupported type: {}", repr(&api));
                 }
             }
         };
@@ -917,7 +870,7 @@ impl BuiltinLower {
         };
         let kind: Stmt = if type_index == FFI_OPAQUE_PTR {
             // An opaque handle that is null is passed as None.
-            let is_null = Call::new(ty(BOOL, 8)?, self.ops.isnullptr.clone(), vec![arg.clone()])?;
+            let is_null = Call::new(ty(BOOL, 8)?, ISNULLPTR.get()?, vec![arg.clone()])?;
             let opaque = SeqStmt::from_stmt(type_slot(FFI_OPAQUE_PTR)?)?;
             If::new(is_null, type_slot(FFI_NONE)?, Some(opaque))?.into()
         } else {
@@ -943,18 +896,15 @@ impl BuiltinLower {
         let stack = self.scope()?.stack_ffi_any.clone();
         for i in 0..num_args {
             let arg = call.args.get(1 + i as usize)?;
-            let accepted = is_prim_expr(&arg)
-                || arg.ty.as_node::<PtrTypeObj>().is_some()
-                || arg.as_node::<StringImmObj>().is_some();
-            if !accepted {
-                let message = format!(
-                    "Check failed: (arg.as<PrimExpr>() || arg->ty.as<PtrTypeNode>() || \
-                     arg.as<StringImmNode>()) is false: Packed call argument must have a \
-                     primitive, pointer, or string type, but got {}",
-                    repr(&arg.ty)
-                );
-                return Err(Error::new(TYPE_ERROR, &message, ""));
-            }
+            check!(
+                is_prim_expr(&arg)
+                    || arg.ty.as_node::<PtrTypeObj>().is_some()
+                    || arg.as_node::<StringImmObj>().is_some(),
+                TYPE_ERROR,
+                "arg.as<PrimExpr>() || arg->ty.as<PtrTypeNode>() || arg.as<StringImmNode>()",
+                "Packed call argument must have a primitive, pointer, or string type, but got {}",
+                repr(&arg.ty)
+            );
             self.set_packed_arg(arg, &stack, (arg_begin + i) as i64)?;
         }
         // The return value starts as None.
@@ -997,16 +947,22 @@ impl BuiltinLower {
         self.prep_seq.push(Vec::new());
         let scope_size = self.alloca_scope.len();
         let stmt = self.lower_stmt(op, m)?;
-        if self.alloca_scope.len() != scope_size {
-            return Err(internal("alloca_scope_ length is different before and after recursion"));
-        }
+        tvm_ffi::ensure!(
+            self.alloca_scope.len() == scope_size,
+            INTERNAL_ERROR,
+            "alloca_scope_ length is different before and after recursion"
+        );
         let scope = self.scope()?;
-        if scope.run.shape != -1 {
-            return Err(internal("Expect no stack_make_shape outside of CallNodes"));
-        }
-        if scope.run.array != 0 {
-            return Err(internal("Expect no stack_make_dltensor outside of CallNodes"));
-        }
+        tvm_ffi::ensure!(
+            scope.run.shape == -1,
+            INTERNAL_ERROR,
+            "Expect no stack_make_shape outside of CallNodes"
+        );
+        tvm_ffi::ensure!(
+            scope.run.array == 0,
+            INTERNAL_ERROR,
+            "Expect no stack_make_dltensor outside of CallNodes"
+        );
         let mut prep = self.prep_seq.pop().expect("pushed above");
         if prep.is_empty() {
             return Ok(stmt.into());
@@ -1022,24 +978,24 @@ impl BuiltinLower {
 
 /// `APIType(t)`: the type a value of type `t` is passed through the packed API as.
 fn api_type(t: DLDataType) -> Result<DLDataType> {
-    if t.code == HANDLE && t.bits == 0 && t.lanes as i16 == 0 {
-        return Err(check_failed("!t.IsVoid()", "Cannot pass void type through packed API."));
-    }
-    let lanes = lanes(t)?;
-    if lanes != 1 {
-        let message =
-            format!("Check failed: t.lanes() == 1 ({lanes} vs. 1) : Cannot pass vector type through packed API.");
-        return Err(internal(&message));
-    }
+    let is_void = t.code == HANDLE && t.bits == 0 && t.lanes as i16 == 0;
+    check!(!is_void, INTERNAL_ERROR, "!t.IsVoid()", "Cannot pass void type through packed API.");
+    check_cmp!(
+        lanes(t)?,
+        ==,
+        1,
+        INTERNAL_ERROR,
+        "t.lanes() == 1",
+        "Cannot pass vector type through packed API."
+    );
     if matches!(t.code, BOOL | UINT | INT) {
         return Ok(dtype(INT, 64, 1));
     }
-    if !matches!(t.code, FLOAT | BFLOAT) {
-        return Err(check_failed(
-            "t.MatchesCode(DLDataTypeCode::kDLFloat, DLDataTypeCode::kDLBfloat)",
-            "",
-        ));
-    }
+    check!(
+        matches!(t.code, FLOAT | BFLOAT),
+        INTERNAL_ERROR,
+        "t.MatchesCode(DLDataTypeCode::kDLFloat, DLDataTypeCode::kDLBfloat)"
+    );
     Ok(dtype(FLOAT, 64, 1))
 }
 
@@ -1055,25 +1011,13 @@ fn int_attr(value: Any) -> Result<BigInt> {
     Ok(imm.value.clone())
 }
 
-/// How C++ prints a node in an error message.
-fn repr<T>(value: &T) -> std::string::String
-where
-    for<'a> tvm_ffi::AnyView<'a>: From<&'a T>,
-{
-    tvm_ffi::cached_global_func!("ffi.ReprPrint")
-        .call_packed(&[tvm_ffi::AnyView::from(value)])
-        .and_then(String::try_from)
-        .map(|text| text.as_str().to_string())
-        .unwrap_or_default()
-}
-
 /// `target->GetHost()`.
 fn host_of(target: &Target) -> Result<Option<Target>> {
     target.host()?.map(|host| host.try_cast::<Target>()).transpose()
 }
 
 /// `BuiltinLower::Build(func)`.
-fn build(func: Function, ops: &Ops) -> Result<Function> {
+fn build(func: Function) -> Result<Function> {
     let Some(body) = func.body.clone() else { return Ok(func) };
     let (device_type, preserve_ffi_kernel) = match get_attr(&func.attrs, TARGET)? {
         Some(target) => {
@@ -1084,13 +1028,12 @@ fn build(func: Function, ops: &Ops) -> Result<Function> {
         }
         None => (None, false),
     };
-    let mut lower = BuiltinLower::new(ops.clone(), device_type, preserve_ffi_kernel);
+    let mut lower = BuiltinLower::new(device_type, preserve_ffi_kernel);
     let body = lower.realize_body(body.into())?;
     Ok(func.with_body(Some(SeqStmt::from_stmt(body)?)))
 }
 
 pub fn lower_tvm_builtin() -> Result<Pass> {
-    let ops = Ops::new()?;
     function_pass("tirx.LowerTVMBuiltin", 0, move |func, _module, _context| {
         let mut is_host = has_nonzero_attr(&func.attrs, IS_HOST_FUNC)?;
         if !is_host {
@@ -1102,6 +1045,6 @@ pub fn lower_tvm_builtin() -> Result<Pass> {
         if !is_host {
             return Ok(Some(func));
         }
-        build(func, &ops).map(Some)
+        build(func).map(Some)
     })
 }

@@ -30,73 +30,50 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    dispatch, structural_mutate, structural_walk, Any, Array, Error, FieldGetter,
+    bail, dispatch, structural_mutate, structural_walk, Any, Array, FieldGetter,
     Function as FfiFunction, Map, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
-    String, Unchanged, WalkOrder, WalkResult,
+    String, Unchanged, WalkOrder, WalkResult, INTERNAL_ERROR, VALUE_ERROR,
 };
 
 use super::cuda_exec_analysis::{lower_indices, ExecAnalysis, LaunchParams};
-use super::util::{MutatorExt, function_pass, get_attr, internal, sequential};
+use super::util::{MutatorExt, function_pass, get_attr, print_ir, sequential};
 use crate::ir::{
     Bind, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, Op, OpObj, OpAttrMap, Range,
     RegionStmt, SeqStmt, Stmt, Var,
 };
-use crate::ops::{int32_dtype, prim_dtype};
+use crate::ops::{int32_dtype, prim_dtype, repr};
 use crate::prim::Max;
 use crate::sym::Analyzer;
 use crate::target::Target;
+use crate::tirx::op::{
+    ALLOC_TENSOR, CUDA_DECL_TMEM, DECL_TENSOR, DEVICE_ENTRY, DEVICE_SCOPE, KERNEL_REPLACE_POINT,
+    TENSOR_DATA_PTR,
+};
 use crate::tirx::{DispatchContext, ExecScope, Function, TensorTypeObj};
 use crate::transform::Pass;
 
-/// A failed C++ `TVM_FFI_CHECK(condition, ValueError) << message`.
-fn value_error(condition: &str, message: &str) -> Error {
-    let message = format!("Check failed: ({condition}) is false: {message}");
-    Error::new(tvm_ffi::VALUE_ERROR, &message, "")
-}
+/// The `FTileOpDispatch` column, or `None` when no operator registered one.
+struct Dispatchers(Option<OpAttrMap<FfiFunction>>);
 
-/// The operators the pass recognizes.
-struct TileOps {
-    device_entry: Op,
-    device_scope: Op,
-    alloc_tensor: Op,
-    decl_tensor: Op,
-    decl_tmem: Op,
-    tensor_data_ptr: Op,
-    kernel_replace_point: Op,
-    /// The `FTileOpDispatch` column, or `None` when no operator registered one.
-    dispatchers: Option<OpAttrMap<FfiFunction>>,
-}
-
-impl TileOps {
+impl Dispatchers {
     fn new() -> Result<Self> {
-        Ok(TileOps {
-            device_entry: Op::get("tirx.device_entry")?,
-            device_scope: Op::get("tirx.device_scope")?,
-            alloc_tensor: Op::get("tirx.alloc_tensor")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
-            decl_tmem: Op::get("tirx.cuda.decl_tmem")?,
-            tensor_data_ptr: Op::get("tirx.tensor_data_ptr")?,
-            kernel_replace_point: Op::get("tirx.kernel_replace_point")?,
-            dispatchers: Op::attr_map("FTileOpDispatch")?,
-        })
+        Ok(Self(Op::attr_map("FTileOpDispatch")?))
     }
 
     /// The dispatcher of a call to a tile instruction.
-    fn dispatcher(&self, call: &CallObj) -> Result<Option<FfiFunction>> {
-        match (call.op.as_node::<OpObj>(), &self.dispatchers) {
+    fn get(&self, call: &CallObj) -> Result<Option<FfiFunction>> {
+        match (call.op.as_node::<OpObj>(), &self.0) {
             (Some(op), Some(dispatchers)) => dispatchers.get(op),
             _ => Ok(None),
         }
     }
+}
 
-    /// A call that defines a tensor: `alloc_tensor`, `decl_tensor` or `cuda.decl_tmem`.
-    fn defines_tensor(&self, value: &Expr) -> bool {
-        value.as_node::<CallObj>().is_some_and(|call| {
-            call.op.same_as(&self.alloc_tensor)
-                || call.op.same_as(&self.decl_tensor)
-                || call.op.same_as(&self.decl_tmem)
-        })
-    }
+/// A call that defines a tensor: `alloc_tensor`, `decl_tensor` or `cuda.decl_tmem`.
+fn defines_tensor(value: &Expr) -> bool {
+    value.as_node::<CallObj>().is_some_and(|call| {
+        ALLOC_TENSOR.is(&call.op) || DECL_TENSOR.is(&call.op) || CUDA_DECL_TMEM.is(&call.op)
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -104,24 +81,22 @@ impl TileOps {
 
 /// C++ `KernelReplacePointSearcher::Seek`: `stmt` with each `kernel_replace_point()` evaluation
 /// replaced by `body`.
-fn seek(stmt: &Stmt, body: &Stmt, ops: &TileOps) -> Result<Stmt> {
+fn seek(stmt: &Stmt, body: &Stmt) -> Result<Stmt> {
     struct Searcher<'a> {
         body: &'a Stmt,
-        replace_point: &'a Op,
     }
 
     #[dispatch(mutate)]
     impl Searcher<'_> {
         fn mutate_evaluate(&mut self, op: Evaluate, m: &mut Mutator) -> Result<Any> {
-            if op.value.as_node::<CallObj>().is_some_and(|call| call.op.same_as(self.replace_point))
-            {
+            if op.value.as_node::<CallObj>().is_some_and(|call| KERNEL_REPLACE_POINT.is(&call.op)) {
                 return Ok(self.body.clone().into());
             }
             m.default_mutate(self, &op)
         }
     }
 
-    let mut searcher = Searcher { body, replace_point: &ops.kernel_replace_point };
+    let mut searcher = Searcher { body };
     structural_mutate(stmt.clone(), &mut searcher)?.try_into()
 }
 
@@ -156,20 +131,15 @@ fn tensor_var(expr: &Expr) -> Option<Var> {
 
 /// C++ `StorageRootResolver::Apply`: each `tensor_data_ptr(view)` as the data pointer of the
 /// view's storage root.
-fn resolve_storage_roots(
-    stmt: &Stmt,
-    roots: &HashMap<ObjectIdentity, Var>,
-    ops: &TileOps,
-) -> Result<Stmt> {
+fn resolve_storage_roots(stmt: &Stmt, roots: &HashMap<ObjectIdentity, Var>) -> Result<Stmt> {
     struct Resolver<'a> {
         roots: &'a HashMap<ObjectIdentity, Var>,
-        tensor_data_ptr: &'a Op,
     }
 
     #[dispatch(mutate)]
     impl Resolver<'_> {
         fn mutate_call(&mut self, call: Call, m: &mut Mutator) -> Result<Any> {
-            if call.op.same_as(self.tensor_data_ptr) && call.args.len() == 1 {
+            if TENSOR_DATA_PTR.is(&call.op) && call.args.len() == 1 {
                 if let Some(var) = tensor_var(&call.args.get(0)?) {
                     if let Some(root) = self.roots.get(&ObjectIdentity::of(&var)) {
                         if !root.same_as(&var) {
@@ -182,17 +152,17 @@ fn resolve_storage_roots(
         }
     }
 
-    let mut resolver = Resolver { roots, tensor_data_ptr: &ops.tensor_data_ptr };
+    let mut resolver = Resolver { roots };
     structural_mutate(stmt.clone(), &mut resolver)?.try_into()
 }
 
 /// C++ `NoOpCallVerifier::Verify`: no tile instruction is left. (C++ also rejects a statement
 /// its visitor cannot dispatch; every statement the parser makes can be dispatched.)
-fn no_tile_calls_left(stmt: &Stmt, ops: &TileOps) -> Result<bool> {
+fn no_tile_calls_left(stmt: &Stmt, dispatchers: &Dispatchers) -> Result<bool> {
     let mut error = None;
     let interrupted = structural_walk(
         stmt,
-        |call: Call| match ops.dispatcher(&call) {
+        |call: Call| match dispatchers.get(&call) {
             Ok(Some(_)) => WalkResult::Interrupt,
             Ok(None) => WalkResult::Advance,
             Err(e) => {
@@ -211,25 +181,8 @@ fn no_tile_calls_left(stmt: &Stmt, ops: &TileOps) -> Result<bool> {
 // ---------------------------------------------------------------------------------------------
 // The dispatcher
 
-/// Restores the enclosing target context when dropped (C++ `With<Target>`).
-struct TargetScope(Target);
-
-impl TargetScope {
-    fn enter(target: &Target) -> Result<Self> {
-        tvm_ffi::cached_global_func!("target.TargetEnterScope").call_tuple((target.clone(),))?;
-        Ok(TargetScope(target.clone()))
-    }
-}
-
-impl Drop for TargetScope {
-    fn drop(&mut self) {
-        let _ =
-            tvm_ffi::cached_global_func!("target.TargetExitScope").call_tuple((self.0.clone(),));
-    }
-}
-
 struct TileDispatcher {
-    ops: TileOps,
+    dispatchers: Dispatchers,
     target: Target,
     native_launch: bool,
     variable_cluster: bool,
@@ -258,7 +211,7 @@ impl TileDispatcher {
     }
 
     fn mutate_region(&mut self, op: RegionStmt, m: &mut Mutator) -> Result<Any> {
-        if op.op.same_as(&self.ops.device_entry) {
+        if DEVICE_ENTRY.is(&op.op) {
             return Ok(self.process_device_entry(&op, m)?.into());
         }
         m.default_mutate(self, &op)
@@ -276,7 +229,7 @@ impl TileDispatcher {
         for s in seq.seq.iter() {
             rebuilt.push(s.clone());
             if let Ok(bind) = s.try_cast::<Bind>() {
-                if self.ops.defines_tensor(&bind.value) {
+                if defines_tensor(&bind.value) {
                     changed |=
                         self.append_post_tensor_def_stmts(&mut rebuilt, &bind.var, &bind.var)?;
                 }
@@ -290,15 +243,16 @@ impl TileDispatcher {
 
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            if call.op.same_as(&self.ops.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 return Ok(self.mutate_tensor_def(op, false, m)?.into());
             }
-            if call.op.same_as(&self.ops.decl_tensor) || call.op.same_as(&self.ops.decl_tmem) {
+            if DECL_TENSOR.is(&call.op) || CUDA_DECL_TMEM.is(&call.op) {
                 return Ok(self.mutate_tensor_def(op, true, m)?.into());
             }
         }
         let stmt: Stmt = m.default_mutate_as(self, &Stmt::from(op))?;
-        let bind: Bind = stmt.clone().try_cast().map_err(|_| internal("Check failed: bind"))?;
+        let bind: Bind =
+            stmt.clone().try_cast().map_err(|_| error!(INTERNAL_ERROR, "Check failed: bind"))?;
         if prim_dtype(&bind.value).is_ok() {
             if let Some(analysis) = &mut self.analysis {
                 analysis.bind(&bind.var, &bind.value)?;
@@ -310,12 +264,12 @@ impl TileDispatcher {
     }
 
     fn mutate_for(&mut self, op: For, m: &mut Mutator) -> Result<Any> {
-        if self.var_index.contains_key(&ObjectIdentity::of(&op.loop_var)) {
-            return Err(internal(
-                "Check failed: (!var_range_map_.count(loop_var)) is false: Internal Error: \
-                 Duplicate loop variable",
-            ));
-        }
+        check!(
+            !self.var_index.contains_key(&ObjectIdentity::of(&op.loop_var)),
+            INTERNAL_ERROR,
+            "!var_range_map_.count(loop_var)",
+            "Internal Error: Duplicate loop variable",
+        );
         self.set_var_range(
             &op.loop_var,
             Range::from_min_extent(op.min.clone(), op.extent.clone())?,
@@ -360,16 +314,17 @@ impl TileDispatcher {
         let Some(call) = stmt.value.as_node::<CallObj>() else {
             return m.default_mutate(self, &stmt);
         };
-        let Some(dispatcher) = self.ops.dispatcher(call)? else {
+        let Some(dispatcher) = self.dispatchers.get(call)? else {
             return m.default_mutate(self, &stmt);
         };
         let call: Call = stmt.value.clone().try_cast()?;
-        tvm_ffi::cached_global_func!("ir.CallValidate").call_tuple((call.clone(),))?;
+        call.validate()?;
         let Some(attrs) = call.attrs.clone() else {
-            return Err(value_error(
-                "op->attrs.has_value()",
-                "A tile instruction must have scope attributes",
-            ));
+            bail!(
+                VALUE_ERROR,
+                "Check failed: (op->attrs.has_value()) is false: A tile instruction must have \
+                 scope attributes"
+            );
         };
         let attrs_type = Any::from(attrs.clone()).type_index();
         let scope_name: String = FieldGetter::new(attrs_type, "scope")?.get(&*attrs)?;
@@ -400,20 +355,21 @@ impl TileDispatcher {
             scope.name.clone(),
         )?;
         let implementation = dispatcher.call_tuple((call, context.clone()))?;
-        if implementation.type_index() == tvm_ffi::TypeIndex::kTVMFFINone as i32 {
-            return Err(internal(
-                "Check failed: implementation.defined() is false: TIRx dispatcher did not return \
-                 a Function",
-            ));
-        }
+        tvm_ffi::ensure!(
+            implementation.type_index() != tvm_ffi::TypeIndex::kTVMFFINone as i32,
+            INTERNAL_ERROR,
+            "Check failed: implementation.defined() is false: TIRx dispatcher did not return a \
+             Function"
+        );
         let implementation: Function = implementation.try_into()?;
         self.collect_callbacks(&context.callbacks()?)?;
         self.shared_state = context.shared_state()?;
         let Some(body) = implementation.body.clone() else {
-            return Err(value_error(
-                "res->body.has_value()",
-                "A tile op implementation must have a body",
-            ));
+            bail!(
+                VALUE_ERROR,
+                "Check failed: (res->body.has_value()) is false: A tile op implementation must \
+                 have a body"
+            );
         };
         m.mutate(self, &body)
     }
@@ -422,7 +378,7 @@ impl TileDispatcher {
 impl TileDispatcher {
     fn new(target: Target) -> Result<Self> {
         Ok(TileDispatcher {
-            ops: TileOps::new()?,
+            dispatchers: Dispatchers::new()?,
             target,
             native_launch: false,
             variable_cluster: false,
@@ -490,12 +446,13 @@ impl TileDispatcher {
     fn mutate_tensor_def(&mut self, op: Bind, declared: bool, m: &mut Mutator) -> Result<Stmt> {
         let old_tensor = op.var.clone();
         let stmt: Stmt = m.default_mutate_as(self, &Stmt::from(op))?;
-        let bind: Bind = stmt.clone().try_cast().map_err(|_| internal("Check failed: op"))?;
+        let bind: Bind =
+            stmt.clone().try_cast().map_err(|_| error!(INTERNAL_ERROR, "Check failed: op"))?;
         let data = if declared {
             let call = bind
                 .value
                 .as_node::<CallObj>()
-                .ok_or_else(|| internal("Check failed: tensor_call"))?;
+                .ok_or_else(|| error!(INTERNAL_ERROR, "Check failed: tensor_call"))?;
             Some(call.args.get(0)?)
         } else {
             None
@@ -511,7 +468,7 @@ impl TileDispatcher {
     fn register_storage_root(&mut self, old_var: &Var, new_var: &Var, data: Option<&Expr>) {
         let mut root = new_var.clone();
         if let Some(call) = data.and_then(|data| data.as_node::<CallObj>()) {
-            if call.op.same_as(&self.ops.tensor_data_ptr) && call.args.len() == 1 {
+            if TENSOR_DATA_PTR.is(&call.op) && call.args.len() == 1 {
                 if let Some(src) = call.args.get(0).ok().as_ref().and_then(tensor_var) {
                     root = self.storage_root_of(&src);
                 }
@@ -548,7 +505,7 @@ impl TileDispatcher {
             let no_op: Stmt = Evaluate::new(0)?.into();
             for stmt in stmts {
                 let remapped = rewrite_tensor_ref(&stmt, &src, new_tensor)?;
-                seq.push(seek(&remapped, &no_op, &self.ops)?);
+                seq.push(seek(&remapped, &no_op)?);
             }
             changed = true;
         }
@@ -561,19 +518,19 @@ impl TileDispatcher {
         if let Some(target) = get_attr(&entry.attrs, "target")? {
             self.target = target.try_into()?;
         }
-        let _target_scope = TargetScope::enter(&self.target)?;
+        let _target_scope = self.target.enter_scope()?;
         let is_first_block = std::mem::replace(&mut self.is_first_block, false);
 
         self.launch_params.clear();
         self.cluster_bounds.clear();
         self.variable_cluster = false;
         self.native_launch = get_attr(&entry.attrs, "cuda.launch_fields")?.is_some();
-        if !is_first_block && self.native_launch {
-            return Err(value_error(
-                "is_first_block || !native_launch_",
-                "Nested CUDA device_entry regions are not supported",
-            ));
-        }
+        check!(
+            is_first_block || !self.native_launch,
+            VALUE_ERROR,
+            "is_first_block || !native_launch_",
+            "Nested CUDA device_entry regions are not supported",
+        );
         if self.native_launch {
             self.prepare_cuda_launch_params(entry)?;
         }
@@ -615,7 +572,7 @@ impl TileDispatcher {
 
         let mut body = body;
         for init in self.device_init_stmts.clone().iter().rev() {
-            body = seek(init, &body, &self.ops)?;
+            body = seek(init, &body)?;
         }
         if !self.alloc_tensors.is_empty() {
             let mut seq: Vec<Stmt> = self.alloc_tensors.iter().cloned().map(Stmt::from).collect();
@@ -630,7 +587,7 @@ impl TileDispatcher {
         }
         if self.native_launch || get_attr(&entry.attrs, "backend_config")?.is_some() {
             res = RegionStmt::new(
-                self.ops.device_scope.clone(),
+                DEVICE_SCOPE.get()?,
                 entry.args.clone(),
                 Array::new(vec![]),
                 entry.attrs.clone(),
@@ -641,8 +598,8 @@ impl TileDispatcher {
         // Host init statements leave the kernel, where a `tensor_data_ptr` of a device-local
         // view cannot be resolved: each one is moved onto the view's storage root.
         for stmt in std::mem::take(&mut self.host_init_stmts) {
-            let resolved = resolve_storage_roots(&stmt, &self.tensor_root, &self.ops)?;
-            res = seek(&resolved, &res, &self.ops)?;
+            let resolved = resolve_storage_roots(&stmt, &self.tensor_root)?;
+            res = seek(&resolved, &res)?;
         }
         self.is_first_block = is_first_block;
         restore(self);
@@ -652,22 +609,22 @@ impl TileDispatcher {
     /// C++ `PrepareCudaLaunchParams`: the launch variables and extents of the kernel, and the
     /// bounds of its cluster.
     fn prepare_cuda_launch_params(&mut self, entry: &RegionStmt) -> Result<()> {
-        if self.target.kind()?.name()?.as_str() != "cuda" {
-            return Err(value_error(
-                "target_->kind->name == \"cuda\"",
-                "CUDA LaunchConfig requires a CUDA target",
-            ));
-        }
+        check!(
+            self.target.kind()?.name()?.as_str() == "cuda",
+            VALUE_ERROR,
+            "target_->kind->name == \"cuda\"",
+            "CUDA LaunchConfig requires a CUDA target",
+        );
         let fields: Array<String> = get_attr(&entry.attrs, "cuda.launch_fields")?
-            .ok_or_else(|| internal("cuda.launch_fields"))?
+            .ok_or_else(|| error!(INTERNAL_ERROR, "cuda.launch_fields"))?
             .try_into()?;
-        if fields.len() != entry.args.len() {
-            return Err(internal(&format!(
-                "Check failed: fields.size() == entry->args.size() ({} vs. {}) : ",
-                fields.len(),
-                entry.args.len()
-            )));
-        }
+        check_cmp!(
+            fields.len(),
+            ==,
+            entry.args.len(),
+            INTERNAL_ERROR,
+            "fields.size() == entry->args.size()"
+        );
         for (field, arg) in fields.iter().zip(entry.args.iter()) {
             let field = field.as_str();
             let tag = if let Some(axis) = field.strip_prefix("grid.") {
@@ -687,12 +644,12 @@ impl TileDispatcher {
             }
         }
         let has = |tag: &str| self.launch_params.iter().any(|(name, _, _)| name == tag);
-        if !has("blockIdx.x") || !has("threadIdx.x") {
-            return Err(value_error(
-                "launch_params_.count(\"blockIdx.x\") && launch_params_.count(\"threadIdx.x\")",
-                "LaunchConfig requires grid and block dimensions",
-            ));
-        }
+        check!(
+            has("blockIdx.x") && has("threadIdx.x"),
+            VALUE_ERROR,
+            "launch_params_.count(\"blockIdx.x\") && launch_params_.count(\"threadIdx.x\")",
+            "LaunchConfig requires grid and block dimensions",
+        );
         self.variable_cluster = false;
         self.cluster_bounds.clear();
         for axis in ["x", "y", "z"] {
@@ -724,29 +681,22 @@ fn lower_op_calls(body: SeqStmt, target: Target) -> Result<Stmt> {
     structural_mutate(Stmt::from(body), &mut dispatcher)?.try_into()
 }
 
-/// How C++ prints a node into an error message.
-fn repr<T: Into<Any> + Clone>(value: &T) -> Result<std::string::String> {
-    let text: String = tvm_ffi::cached_global_func!("ffi.ReprPrint")
-        .call_tuple((value.clone().into(),))?
-        .try_into()?;
-    Ok(text.as_str().to_string())
-}
-
 pub fn tile_dispatch() -> Result<Pass> {
     function_pass("tirx.TileDispatch", 0, move |func, _module, _context| {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         let target: Target = match get_attr(&func.attrs, "target")? {
             Some(target) => target.try_into()?,
-            None => tvm_ffi::cached_global_func!("target.TargetCurrent")
-                .call_tuple((false,))?
-                .try_into()?,
+            None => Target::current(false)?
+                .ok_or_else(|| error!(INTERNAL_ERROR, "Target context required"))?,
         };
         let body = lower_op_calls(body, target)?;
-        let ops = TileOps::new()?;
         let func = func.with_body(Some(SeqStmt::from_stmt(body.clone())?));
-        if !no_tile_calls_left(&body, &ops)? {
-            return Err(internal(&format!("Failed to lower the TIRx program: {}", repr(&func)?)));
-        }
+        tvm_ffi::ensure!(
+            no_tile_calls_left(&body, &Dispatchers::new()?)?,
+            INTERNAL_ERROR,
+            "Failed to lower the TIRx program: {}",
+            repr(&func)
+        );
         Ok(Some(func))
     })
 }
@@ -754,10 +704,7 @@ pub fn tile_dispatch() -> Result<Pass> {
 pub fn lower_tirx() -> Result<Pass> {
     let mut passes = vec![tile_dispatch()?];
     if std::env::var_os("TVM_PRINT_AFTER_TIRX_DISPATCH_OPS").is_some() {
-        let print: Pass = tvm_ffi::cached_global_func!("transform.PrintIR")
-            .call_tuple((String::from(""),))?
-            .try_into()?;
-        passes.push(print);
+        passes.push(print_ir("")?);
     }
     passes.push(super::lower_tirx_cleanup::lower_tirx_cleanup()?);
     sequential(passes, "tirx.LowerTIRx")

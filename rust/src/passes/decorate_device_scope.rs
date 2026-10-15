@@ -23,16 +23,16 @@
 use tvm_ffi::{Array, Map, Result};
 
 use super::util::function_pass;
-use crate::ir::{DictAttrs, Op, RegionStmt, SeqStmt};
+use crate::ir::{DictAttrs, RegionStmt, SeqStmt};
+use crate::tirx::op::DEVICE_SCOPE;
 use crate::transform::Pass;
 
 pub fn decorate_device_scope() -> Result<Pass> {
-    let device_scope = Op::get("tirx.device_scope")?;
     function_pass("tirx.DecorateDeviceScope", 0, move |func, _module, _context| {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         let no_attrs = DictAttrs::new(Map::new());
         let region = RegionStmt::new(
-            device_scope.clone(),
+            DEVICE_SCOPE.get()?,
             Array::new(vec![]),
             Array::new(vec![]),
             no_attrs,

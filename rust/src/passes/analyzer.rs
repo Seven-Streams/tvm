@@ -37,12 +37,14 @@ use tvm_ffi::{
 use super::side_effect::{side_effect, PURE};
 use super::util::{int32_dtype, int_imm, prim_dtype, prim_type, ContextExt};
 use crate::ir::{
-    AssertStmt, Bind, Call, Evaluate, Expr, For, If, Op, PrimType, Range, RegionStmt, SeqStmt,
-    StringImm, Var,
+    AssertStmt, Bind, Call, Evaluate, Expr, For, If, OpHandle, PrimType, Range, RegionStmt,
+    SeqStmt, StringImm, Var,
 };
 use crate::ops::PrimOps;
+use crate::prim::op::{IF_THEN_ELSE, LIKELY};
 use crate::prim::{And, BitwiseAnd, FloorDivObj, Let, Not, Select, EQ, GE, GT, LE, LT};
 use crate::sym::{Analyzer, ConstraintContext};
+use crate::tirx::op::{CUDA_BLOCK_IDX, CUDA_THREAD_IDX, LAUNCH_THREAD};
 
 /// The members C++ `StmtExprMutatorWithAnalyzer` adds: the analyzer and the stack of scoped
 /// constraints (`ScopeStack<WithGroup<ConstraintContext>>`).
@@ -56,9 +58,6 @@ pub struct AnalyzerBase {
     iter_vars: Vec<(Var, Range)>,
     /// `iter_predicates_`: the conditions over loop variables of the enclosing branches.
     iter_predicates: Vec<Expr>,
-    likely: Op,
-    if_then_else: Op,
-    launch_thread: Op,
 }
 
 impl AnalyzerBase {
@@ -68,9 +67,6 @@ impl AnalyzerBase {
             scopes: vec![Vec::new()],
             iter_vars: Vec::new(),
             iter_predicates: Vec::new(),
-            likely: Op::get("prim.likely")?,
-            if_then_else: Op::get("prim.if_then_else")?,
-            launch_thread: Op::get("tirx.launch_thread")?,
         })
     }
 
@@ -124,16 +120,8 @@ impl AnalyzerBase {
         }
         let iters: Map<Var, Range> = self.iter_vars.iter().cloned().collect();
         // `IterMapLevel::Surjective`, with trivial iterators simplified.
-        let simplified: Array<Expr> = tvm_ffi::cached_global_func!("sym.IterMapSimplify")
-            .call_tuple((
-                indices.clone(),
-                iters,
-                predicate.expr()?,
-                1i32,
-                true,
-                self.analyzer.clone(),
-            ))?
-            .try_into()?;
+        let simplified =
+            self.analyzer.iter_map_simplify(indices, iters, &predicate.expr()?, 1, true)?;
         if !non_trivial_only {
             return Ok(simplified);
         }
@@ -220,7 +208,7 @@ fn descend<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, value: Any) -> Resu
             If(op) => descend_if(ctx, op)?,
             RegionStmt(op) => descend_region(ctx, op)?,
             AssertStmt(op) => descend_assert(ctx, op)?.into(),
-            Call(op) if op.op.same_as(&ctx.base().if_then_else) => descend_if_then_else(ctx, op)?,
+            Call(op) if IF_THEN_ELSE.is(&op.op) => descend_if_then_else(ctx, op)?,
             Let(op) => descend_let(ctx, op)?,
             Select(op) => descend_select(ctx, op)?,
             _ => return Ok(None),
@@ -266,9 +254,8 @@ fn descend_bind<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Bind) -> R
 fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Result<Any> {
     ctx.scoped(|ctx| {
         let condition: Expr = ctx.mutate_as(&op.condition)?;
-        let likely = ctx.base().likely.clone();
         let real_condition = match condition.as_node::<crate::ir::CallObj>() {
-            Some(call) if call.op.same_as(&likely) => call.args.get(0)?,
+            Some(call) if LIKELY.is(&call.op) => call.args.get(0)?,
             _ => condition.clone(),
         };
         let pure = side_effect(&real_condition)? <= PURE;
@@ -317,7 +304,7 @@ fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Resul
 /// thread indices, for the region's body.
 fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionStmt) -> Result<Any> {
     ctx.scoped(|ctx| {
-        if op.op.same_as(&ctx.base().launch_thread) {
+        if LAUNCH_THREAD.is(&op.op) {
             let var = op.body_params.get(0)?;
             let extent = op.args.get(1)?;
             let zero = int_imm(prim_dtype(&extent)?, 0)?;
@@ -329,8 +316,8 @@ fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionSt
             let fields: tvm_ffi::Array<String> = fields.try_into()?;
             for (i, field) in fields.iter().enumerate() {
                 let intrinsic = match field.as_str() {
-                    f if f.starts_with("grid.") => "tirx.cuda.block_idx",
-                    f if f.starts_with("block.") => "tirx.cuda.thread_idx",
+                    f if f.starts_with("grid.") => &CUDA_BLOCK_IDX,
+                    f if f.starts_with("block.") => &CUDA_THREAD_IDX,
                     _ => continue,
                 };
                 let index = launch_index(intrinsic, &field.as_str()[field.len() - 1..])?;
@@ -362,10 +349,10 @@ fn with_iter_predicate<S: AnalyzerState, T>(
     result
 }
 
-/// `Call(int32, Op::Get(intrinsic), {StringImm(axis)})`.
-fn launch_index(intrinsic: &str, axis: &str) -> Result<Expr> {
+/// `Call(int32, intrinsic, {StringImm(axis)})`.
+fn launch_index(intrinsic: &OpHandle, axis: &str) -> Result<Expr> {
     let axis: Expr = StringImm::new(axis)?.into();
-    Ok(Call::new(prim_type(int32_dtype())?, Op::get(intrinsic)?, vec![axis])?.into())
+    Ok(Call::new(prim_type(int32_dtype())?, intrinsic.get()?, vec![axis])?.into())
 }
 
 /// A pure asserted condition holds for the rest of the scope.

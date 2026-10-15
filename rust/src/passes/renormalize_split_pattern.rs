@@ -30,7 +30,7 @@ use tvm_ffi::{dispatch, Any, BigInt, Mutator, ObjectRefCore, Result};
 use super::analyzer::{bind_range, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::util::{function_pass, int_imm, prim_dtype, MutatorExt};
 use crate::ir::{Expr, For, IntImmObj, SeqStmt, Stmt, VarObj};
-use crate::ops::{ex, PrimOps};
+use crate::ops::{deep_equal, ex, PrimOps};
 use crate::prim::{
     AddObj, Broadcast, BroadcastObj, FloorDiv, FloorDivObj, FloorModObj, GEObj, GTObj, LEObj,
     LTObj, MulObj, Not, NotObj, GE, GT, LE, LT,
@@ -74,9 +74,7 @@ fn same_value(lhs: &Expr, rhs: &Expr) -> Result<bool> {
     if lhs.same_as(rhs) {
         return Ok(true);
     }
-    tvm_ffi::cached_global_func!("prim.expr_deep_equal")
-        .call_tuple((lhs.clone(), rhs.clone()))?
-        .try_into()
+    deep_equal(lhs, rhs)
 }
 
 /// C++ `ffi::BigInt` `%` by a nonzero divisor, compared with zero.

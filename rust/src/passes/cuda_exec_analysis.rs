@@ -28,19 +28,22 @@
 //! only; here it is the ordered axis list that layout holds.
 
 use tvm_ffi::{
-    Array, Error, Map, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String, WalkOrder,
-    WalkResult,
+    bail, Array, Map, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String, WalkOrder,
+    WalkResult, INTERNAL_ERROR, VALUE_ERROR,
 };
 
-use super::util::internal;
-use crate::ir::{Bind, Call, CallObj, Expr, IntImmObj, Op, OpObj, SeqStmt, Stmt, StringImm, Var};
-use crate::ops::{int32, int32_dtype, int_imm, prim_dtype, prim_type, unknown_loc, Ex, PrimOps};
+use crate::ir::{Bind, Call, CallObj, Expr, IntImmObj, OpHandle, OpObj, SeqStmt, Stmt, StringImm, Var};
+use crate::ops::{int32, int32_dtype, int_imm, prim_dtype, prim_type, Ex, PrimOps};
 use crate::passes::analyzer::is_const_int;
 use crate::prim::{
     AndObj, BitwiseAndObj, BitwiseNot, BitwiseNotObj, BitwiseOrObj, BitwiseXorObj, CastObj, EQObj,
-    FloorModObj, GEObj, GTObj, LEObj, LShiftObj, LTObj, ModObj, RShiftObj,
+    FloorDiv, FloorMod, FloorModObj, GEObj, GTObj, LEObj, LShiftObj, LTObj, ModObj, RShiftObj,
 };
-use crate::sym::Analyzer;
+use crate::sym::{detect_linear_equation, Analyzer};
+use crate::tirx::op::{
+    CUDA_BLOCK_DIM, CUDA_BLOCK_IDX, CUDA_ELECT_SYNC, CUDA_GRID_DIM, CUDA_MOV_SREG, CUDA_THREAD_IDX,
+    GPU_ACTIVE_THREAD_SELECTOR, GPU_THREAD_FILTER, GPU_WARP_SHUFFLE,
+};
 use crate::tirx::ExecScope;
 
 const WARP_SIZE: i64 = 32;
@@ -48,12 +51,6 @@ const WG_SIZE: i64 = 4;
 /// `sym::ConstIntBound::kPosInf` and `kNegInf`.
 const POS_INF: i64 = i64::MAX;
 const NEG_INF: i64 = -i64::MAX;
-
-/// A failed C++ `TVM_FFI_CHECK(condition, ValueError) << message`.
-fn value_error(condition: &str, message: &str) -> Error {
-    let message = format!("Check failed: ({condition}) is false: {message}");
-    Error::new(tvm_ffi::VALUE_ERROR, &message, "")
-}
 
 fn int64(value: i64) -> Result<Expr> {
     let dtype = tvm_ffi::DLDataType { code: 0, bits: 64, lanes: 1 };
@@ -75,9 +72,7 @@ fn is_zero(expr: &Expr) -> Result<bool> {
 
 /// C++ `FloorDivInt`, with its unsigned wrap-around for a negative dividend.
 fn floor_div(a: i64, b: i64) -> Result<i64> {
-    if b <= 0 {
-        return Err(internal(&format!("Check failed: b > 0 ({b} vs. 0) : ")));
-    }
+    check_cmp!(b, >, 0, INTERNAL_ERROR, "b > 0");
     if a >= 0 {
         return Ok(a / b);
     }
@@ -108,9 +103,7 @@ fn extended_gcd(a: i64, b: i64) -> (i64, i64, i64) {
 
 fn modular_inverse(value: i64, modulus: i64) -> Result<i64> {
     let (g, x, _) = extended_gcd(normalize_mod(value, modulus), modulus);
-    if g != 1 {
-        return Err(internal(&format!("Check failed: g == 1 ({g} vs. 1) : ")));
-    }
+    check_cmp!(g, ==, 1, INTERNAL_ERROR, "g == 1");
     Ok(normalize_mod(x, modulus))
 }
 
@@ -142,7 +135,7 @@ fn scope_kind(name: &str) -> Result<ScopeKind> {
         "warpgroup" => ScopeKind::Warpgroup,
         "warp" => ScopeKind::Warp,
         "thread" => ScopeKind::Thread,
-        _ => return Err(internal(&format!("Unknown scope kind name: {name}"))),
+        _ => bail!(INTERNAL_ERROR, "Unknown scope kind name: {name}"),
     })
 }
 
@@ -256,7 +249,7 @@ impl ActiveSet {
     fn with_axis(&self, axis: &str, range: AxisRange) -> Result<ActiveSet> {
         let mut axes = self.axes.clone();
         let Some(entry) = axes.iter_mut().find(|(name, _)| name == axis) else {
-            return Err(internal(&format!("Internal Error: unknown active-set axis {axis}")));
+            bail!(INTERNAL_ERROR, "Internal Error: unknown active-set axis {axis}");
         };
         entry.1 = range;
         ActiveSet::new(axes)
@@ -460,7 +453,7 @@ fn filter_narrow(
             let (Some(outer_ext), Some(outer_off)) =
                 (as_i64(&new_outer.extent), as_i64(&new_outer.offset))
             else {
-                return Err(internal("Check failed: TryAsInt64(new_outer.extent)"));
+                bail!(INTERNAL_ERROR, "Check failed: TryAsInt64(new_outer.extent)");
             };
             Ok(Some(
                 active
@@ -482,7 +475,7 @@ fn filter_narrow(
             let (Some(inner_ext), Some(new_off)) =
                 (as_i64(&new_inner.extent), as_i64(&new_inner.offset))
             else {
-                return Err(internal("Check failed: TryAsInt64(new_inner.extent)"));
+                bail!(INTERNAL_ERROR, "Check failed: TryAsInt64(new_inner.extent)");
             };
             let outer_base = (offset / WG_SIZE) * WG_SIZE;
             Ok(Some(active.with_axis("warpid", make_range(inner_ext, outer_base + new_off)?)?))
@@ -496,7 +489,7 @@ fn filter_narrow(
 /// C++ `ScopeSwitch`: `A` factored into `(inter, intra)` for `kind`, or `None`.
 fn scope_switch(active: &ActiveSet, kind: ScopeKind) -> Result<Option<(SplitSide, SplitSide)>> {
     let (Some(laneid), Some(warpid)) = (active.get("laneid"), active.get("warpid")) else {
-        return Err(internal("Check failed: A.GetAxis(\"laneid\", &laneid)"));
+        bail!(INTERNAL_ERROR, "Check failed: A.GetAxis(\"laneid\", &laneid)");
     };
     let (mut inter, mut intra) = (SplitSide::new(), SplitSide::new());
     match kind {
@@ -696,14 +689,13 @@ fn parse_compare_atom(
 /// C++ `TryClassifyCanonical`: `cond` as a conjunction of canonical atoms, or `None`.
 fn classify_canonical(
     cond: &Expr,
-    elect_sync: &Op,
     is_scope_id: &mut dyn FnMut(&Var) -> bool,
 ) -> Option<Vec<FilterAtom>> {
     let mut terms = Vec::new();
     flatten_conjuncts_stripped(cond, &mut terms);
     let mut atoms = Vec::with_capacity(terms.len());
     for term in terms {
-        if term.as_node::<CallObj>().is_some_and(|call| call.op.same_as(elect_sync)) {
+        if term.as_node::<CallObj>().is_some_and(|call| CUDA_ELECT_SYNC.is(&call.op)) {
             atoms.push(FilterAtom::ElectSync(term));
             continue;
         }
@@ -748,11 +740,26 @@ struct ScopeIdRange {
 }
 
 /// Does `expr` contain a call to `op`?
-fn contains_call(expr: &Expr, op: &Op) -> Result<bool> {
+/// C++ `TVM_FFI_ICHECK_EQ(call->args.size(), 2)` of a `tirx.gpu_thread_filter` call.
+fn check_thread_filter_arity(call: &CallObj) -> Result<()> {
+    let count = call.args.len();
+    check_cmp!(
+        count,
+        ==,
+        2,
+        INTERNAL_ERROR,
+        "call->args.size() == 2",
+        "TIRxError: tirx.gpu_thread_filter expects (var, cond); got {} args",
+        count
+    );
+    Ok(())
+}
+
+fn contains_call(expr: &Expr, op: &OpHandle) -> Result<bool> {
     let found = tvm_ffi::structural_walk(
         expr,
         |call: Call| {
-            if call.op.same_as(op) {
+            if op.is(&call.op) {
                 WalkResult::Interrupt
             } else {
                 WalkResult::Advance
@@ -761,12 +768,6 @@ fn contains_call(expr: &Expr, op: &Op) -> Result<bool> {
         WalkOrder::PreOrder,
     )?;
     Ok(found.is_some())
-}
-
-struct AnalysisOps {
-    elect_sync: Op,
-    active_thread_selector: Op,
-    thread_filter: Op,
 }
 
 /// C++ `backend::cuda::ExecAnalysis`.
@@ -779,7 +780,6 @@ pub(crate) struct ExecAnalysis {
     stack: Vec<ExecContext>,
     launch_params: LaunchParams,
     cluster_cta_axis_extents: Vec<(std::string::String, i64)>,
-    ops: AnalysisOps,
 }
 
 impl ExecAnalysis {
@@ -796,11 +796,6 @@ impl ExecAnalysis {
             stack: Vec::new(),
             launch_params: launch_params.clone(),
             cluster_cta_axis_extents: Vec::new(),
-            ops: AnalysisOps {
-                elect_sync: Op::get("tirx.cuda.elect_sync")?,
-                active_thread_selector: Op::get("tirx.gpu_active_thread_selector")?,
-                thread_filter: Op::get("tirx.gpu_thread_filter")?,
-            },
         };
         analysis.push_kernel_entry()?;
         Ok(analysis)
@@ -878,7 +873,7 @@ impl ExecAnalysis {
         }
         let active = ActiveSet::initial(lanes, warps, ctas, &cta_axes)?;
         if scope_switch(&active, ScopeKind::Thread)?.is_none() {
-            return Err(internal("kernel-entry scope switch failed"));
+            bail!(INTERNAL_ERROR, "kernel-entry scope switch failed");
         }
         self.stack.push(ExecContext { active, kind: ScopeKind::Thread });
         Ok(true)
@@ -1050,9 +1045,7 @@ impl ExecAnalysis {
     fn linear_scope_diff(&self, diff: &Expr) -> Result<Option<(ScopeIdTarget, i64, i64)>> {
         let simplified = self.analyzer.simplify(diff, 2)?;
         for (var, target) in &self.scope_aliases {
-            let linear: Array<Expr> = tvm_ffi::cached_global_func!("sym.DetectLinearEquation")
-                .call_tuple((simplified.clone(), Array::new(vec![var.clone()])))?
-                .try_into()?;
+            let linear = detect_linear_equation(&simplified, &Array::new(vec![var.clone()]))?;
             if linear.len() != 2 {
                 continue;
             }
@@ -1154,17 +1147,10 @@ impl ExecAnalysis {
     }
 
     fn push_filter_predicate(&mut self, call: &CallObj) -> Result<i32> {
-        if call.args.len() != 2 {
-            return Err(internal(&format!(
-                "Check failed: call->args.size() == 2 ({} vs. 2) : TIRxError: tirx.gpu_thread_filter \
-                 expects (var, cond); got {} args",
-                call.args.len(),
-                call.args.len()
-            )));
-        }
+        check_thread_filter_arity(call)?;
         let (var, cond) = (call.args.get(0)?, call.args.get(1)?);
         if let Some(target) = self.resolve(&var)? {
-            if contains_call(&cond, &self.ops.elect_sync)? {
+            if contains_call(&cond, &CUDA_ELECT_SYNC)? {
                 let selector = self.selector(&var, cond.clone())?;
                 let pushed = i32::from(self.push_selector(target, selector)?);
                 return Ok(pushed + self.push_predicate_ctx(&cond)?);
@@ -1175,7 +1161,7 @@ impl ExecAnalysis {
 
     /// `tirx.gpu_active_thread_selector(var, cond)`, typed as `var`.
     fn selector(&self, var: &Expr, cond: Expr) -> Result<Expr> {
-        let op = self.ops.active_thread_selector.clone();
+        let op = GPU_ACTIVE_THREAD_SELECTOR.get()?;
         Ok(Call::new(var.ty.clone(), op, vec![var.clone(), cond])?.into())
     }
 
@@ -1265,13 +1251,13 @@ impl ExecAnalysis {
                     false
                 }
             };
-            classify_canonical(cond, &self.ops.elect_sync, &mut is_scope_id)
+            classify_canonical(cond, &mut is_scope_id)
         };
         if let Some(error) = resolve_error {
             return Err(error);
         }
         let Some(atoms) = atoms else {
-            if contains_call(cond, &self.ops.elect_sync)? {
+            if contains_call(cond, &CUDA_ELECT_SYNC)? {
                 let Some(lane) = self.lane_scope_var() else { return Ok(None) };
                 let selector = self.selector(&lane.into(), cond.clone())?;
                 let target = ScopeIdTarget::flat(ScopeBinding::WarpThread);
@@ -1336,7 +1322,7 @@ impl ExecAnalysis {
             return self.push_conjunctive(pred);
         }
         if let Some(call) = pred.as_node::<CallObj>() {
-            if call.op.same_as(&self.ops.thread_filter) {
+            if GPU_THREAD_FILTER.is(&call.op) {
                 return self.push_filter_predicate(call);
             }
         }
@@ -1390,15 +1376,8 @@ impl ExecAnalysis {
             return Ok(BitwiseNot::new_full(a, node.loc.clone())?.into());
         }
         if let Some(call) = pred.as_node::<CallObj>() {
-            if call.op.same_as(&self.ops.thread_filter) {
-                if call.args.len() != 2 {
-                    return Err(internal(&format!(
-                        "Check failed: call->args.size() == 2 ({} vs. 2) : TIRxError: \
-                         tirx.gpu_thread_filter expects (var, cond); got {} args",
-                        call.args.len(),
-                        call.args.len()
-                    )));
-                }
+            if GPU_THREAD_FILTER.is(&call.op) {
+                check_thread_filter_arity(call)?;
                 return self.rewrite_filter_calls(&as_bool(&call.args.get(1)?)?);
             }
             let mut changed = false;
@@ -1429,13 +1408,13 @@ impl ExecAnalysis {
 
     /// C++ `ExecAnalysis::Split`: the `(inter, intra)` maps for a tile instruction at `scope`.
     pub(crate) fn split(&self, scope: &ExecScope) -> Result<(SplitMap, SplitMap)> {
-        if self.variable_cluster && scope.name.as_str() == "cluster" {
-            return Err(value_error(
-                "!impl_->variable_cluster_ || scope->name() != \"cluster\"",
-                "Cluster tensor instructions require one static cluster shape; use explicit \
-                 CUDA/PTX instructions for variable or preferred cluster shapes",
-            ));
-        }
+        check!(
+            !self.variable_cluster || scope.name.as_str() != "cluster",
+            VALUE_ERROR,
+            "!impl_->variable_cluster_ || scope->name() != \"cluster\"",
+            "Cluster tensor instructions require one static cluster shape; use explicit CUDA/PTX \
+             instructions for variable or preferred cluster shapes",
+        );
         let empty = SplitMap::new;
         let Some(context) = self.stack.last() else { return Ok((empty(), empty())) };
         // C++ logs a warning when the split fails.
@@ -1519,30 +1498,20 @@ fn axis_dim(value: &str) -> i32 {
 /// The CUDA special register `name` (`ctaid.x`, `tid.y`, ...) as an int32 call.
 fn register(name: &str) -> Result<Expr> {
     let int32_ty = prim_type(int32_dtype())?;
-    let operation = if name.starts_with("ctaid.") {
-        "block_idx"
+    let op = if name.starts_with("ctaid.") {
+        &CUDA_BLOCK_IDX
     } else if name.starts_with("tid.") {
-        "thread_idx"
+        &CUDA_THREAD_IDX
     } else if name.starts_with("ntid.") {
-        "block_dim"
+        &CUDA_BLOCK_DIM
     } else if name.starts_with("nctaid.") {
-        "grid_dim"
+        &CUDA_GRID_DIM
     } else {
-        let op = Op::get("tirx.cuda.mov_sreg")?;
-        return Ok(
-            Call::new(int32_ty, op, vec![int32(32)?.into(), StringImm::new(name)?.into()])?.into()
-        );
+        let args = vec![int32(32)?.into(), StringImm::new(name)?.into()];
+        return Ok(Call::new(int32_ty, CUDA_MOV_SREG.get()?, args)?.into());
     };
-    let op = Op::get(&format!("tirx.cuda.{operation}"))?;
     let axis = StringImm::new(&name[name.len() - 1..])?;
-    Ok(Call::new(int32_ty, op, vec![axis.into()])?.into())
-}
-
-/// The raw `prim::<Node>(a, b)` constructor.
-fn raw(node: &str, a: Expr, b: Expr) -> Result<Expr> {
-    tvm_ffi::Function::get_global(&format!("prim.{node}"))?
-        .call_tuple((a, b, unknown_loc()?))?
-        .try_into()
+    Ok(Call::new(int32_ty, op.get()?, vec![axis.into()])?.into())
 }
 
 struct CudaIndexLowerer {
@@ -1575,9 +1544,10 @@ impl CudaIndexLowerer {
         let requires_cluster = |what: &str| -> Result<()> {
             match launch_param(&self.params, "clusterCtaIdx.x") {
                 Some(_) => Ok(()),
-                None => Err(value_error(
-                    "params_.count(\"clusterCtaIdx.x\")",
-                    &format!("{what} requires an explicit launch cluster"),
+                None => Err(error!(
+                    VALUE_ERROR,
+                    "Check failed: (params_.count(\"clusterCtaIdx.x\")) is false: {what} requires \
+                     an explicit launch cluster"
                 )),
             }
         };
@@ -1601,15 +1571,15 @@ impl CudaIndexLowerer {
                 register(&format!("{reg}{}", axis_letter(axis()?)))?
             }
             "linear_thread_id" => self.linear_thread()?,
-            "lane_id" => raw("FloorMod", self.linear_thread()?, int32(32)?.into())?,
-            "thread_in_warpgroup" => raw("FloorMod", self.linear_thread()?, int32(128)?.into())?,
+            "lane_id" => FloorMod::new(self.linear_thread()?, 32)?.into(),
+            "thread_in_warpgroup" => FloorMod::new(self.linear_thread()?, 128)?.into(),
             "warp_id" | "warpgroup_id" | "warp_in_warpgroup" => {
                 self.needs_warp = true;
                 let warp: Expr = self.warp.clone().into();
                 match name {
                     "warp_id" => warp,
-                    "warpgroup_id" => raw("FloorDiv", warp, int32(4)?.into())?,
-                    _ => raw("FloorMod", warp, int32(4)?.into())?,
+                    "warpgroup_id" => FloorDiv::new(warp, 4)?.into(),
+                    _ => FloorMod::new(warp, 4)?.into(),
                 }
             }
             "cta_pair_id" => {
@@ -1620,7 +1590,7 @@ impl CudaIndexLowerer {
                             + crate::ops::ex(register("cluster_nctaid.y")?)
                                 * self.axis("clusterCtaIdx.", 2)?))
                 .expr()?;
-                raw("FloorMod", rank, int32(2)?.into())?
+                FloorMod::new(rank, 2)?.into()
             }
             _ => return m.default_mutate(self, &call),
         };
@@ -1694,33 +1664,34 @@ pub(crate) fn lower_indices(stmt: &Stmt, params: &LaunchParams) -> Result<Stmt> 
         for axis in 0..3 {
             let extent = lowerer.block_dimension(axis)?;
             let Some(imm) = extent.as_node::<IntImmObj>() else {
-                return Err(value_error("extent", "Warp indices require a static block size"));
+                bail!(
+                    VALUE_ERROR,
+                    "Check failed: (extent) is false: Warp indices require a static block size"
+                );
             };
-            match imm.value.to_i64() {
-                Some(dimension) if dimension > 0 && dimension <= 1024 / threads => {
-                    threads *= dimension
-                }
-                _ => {
-                    return Err(value_error(
-                        "dimension && *dimension > 0 && *dimension <= 1024 / threads",
-                        "Block size must be positive and contain at most 1024 threads",
-                    ))
-                }
-            }
+            let dimension = imm.value.to_i64();
+            let Some(dimension) = dimension.filter(|&d| d > 0 && d <= 1024 / threads) else {
+                bail!(
+                    VALUE_ERROR,
+                    "Check failed: (dimension && *dimension > 0 && *dimension <= 1024 / threads) \
+                     is false: Block size must be positive and contain at most 1024 threads"
+                );
+            };
+            threads *= dimension;
         }
-        if threads % 32 != 0 {
-            return Err(value_error(
-                "threads % 32 == 0",
-                "Warp indices require a block size divisible by 32",
-            ));
-        }
+        check!(
+            threads % 32 == 0,
+            VALUE_ERROR,
+            "threads % 32 == 0",
+            "Warp indices require a block size divisible by 32",
+        );
         let uint32 = tvm_ffi::DLDataType { code: 1, bits: 32, lanes: 1 };
         let shuffle = Call::new(
             prim_type(int32_dtype())?,
-            Op::get("tirx.gpu_warp_shuffle")?,
+            GPU_WARP_SHUFFLE.get()?,
             vec![
                 int_imm(uint32, 0xffff_ffff)?.into(),
-                raw("FloorDiv", lowerer.linear_thread()?, int32(32)?.into())?,
+                FloorDiv::new(lowerer.linear_thread()?, 32)?.into(),
                 int32(0)?.into(),
                 int32(32)?.into(),
                 int32(32)?.into(),

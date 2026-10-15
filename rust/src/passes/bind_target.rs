@@ -23,14 +23,15 @@
 use std::collections::{HashMap, HashSet};
 
 use tvm_ffi::{
-    dispatch, structural_mutate, structural_walk, Any, AnyView, Array, ContextPolicy, Map, Mutator,
+    dispatch, structural_mutate, structural_walk, Any, Array, ContextPolicy, Map, Mutator,
     ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String, StructuralView, VisitContext,
     VisitInterrupt, WalkOrder, WalkResult, WalkWithContextPolicy,
 };
 
 use super::util::{dict_without, get_attr, has_nonzero_attr, module_pass, with_attr};
-use crate::ir::{BaseFunc, Call, Expr, GlobalVar, IRModule, Op, RegionStmt, SeqStmt};
+use crate::ir::{BaseFunc, Call, Expr, GlobalVar, IRModule, RegionStmt, SeqStmt};
 use crate::target::Target;
+use crate::tirx::op::{DEVICE_ENTRY, LAUNCH_THREAD};
 use crate::tirx::Function;
 use crate::transform::Pass;
 
@@ -38,34 +39,20 @@ const TARGET: &str = "target";
 const GLOBAL_SYMBOL: &str = "global_symbol";
 const IS_HOST_FUNC: &str = "tirx.is_host_func";
 
-struct LaunchOps {
-    launch_thread: Op,
-    device_entry: Op,
-}
-
-impl LaunchOps {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            launch_thread: Op::get("tirx.launch_thread")?,
-            device_entry: Op::get("tirx.device_entry")?,
-        })
-    }
-
-    fn opens_device_scope(&self, region: &RegionStmt) -> bool {
-        region.op.same_as(&self.launch_thread) || region.op.same_as(&self.device_entry)
-    }
+/// A launched thread or a device entry: its body runs on the device.
+fn opens_device_scope(region: &RegionStmt) -> bool {
+    LAUNCH_THREAD.is(&region.op) || DEVICE_ENTRY.is(&region.op)
 }
 
 /// `FunctionClassifierVisitor`: which global functions are called from host and from device code.
-struct Classifier<'a> {
-    ops: &'a LaunchOps,
+struct Classifier {
     under_device_scope: bool,
     host_called: HashSet<ObjectIdentity>,
     device_called: HashSet<ObjectIdentity>,
 }
 
 #[dispatch(walk)]
-impl Classifier<'_> {
+impl Classifier {
     fn walk_call(&mut self, call: Call) -> WalkResult {
         if let Ok(callee) = call.op.clone().try_cast::<GlobalVar>() {
             let callers = if self.under_device_scope {
@@ -83,14 +70,14 @@ impl Classifier<'_> {
 /// still evaluated on the host.
 struct DeviceScope;
 
-impl<'a> ContextPolicy<Classifier<'a>> for DeviceScope {
+impl ContextPolicy<Classifier> for DeviceScope {
     fn default_visit(
         &self,
         value: &StructuralView,
-        ctx: &mut VisitContext<'_, Classifier<'a>>,
+        ctx: &mut VisitContext<'_, Classifier>,
     ) -> Result<Option<VisitInterrupt>> {
         match value.cast::<RegionStmt>() {
-            Some(region) if ctx.state().ops.opens_device_scope(&region) => {
+            Some(region) if opens_device_scope(&region) => {
                 if let Some(interrupt) = ctx.visit(&region.args)? {
                     return Ok(Some(interrupt));
                 }
@@ -106,7 +93,6 @@ impl<'a> ContextPolicy<Classifier<'a>> for DeviceScope {
 
 /// `CallSubstitutor`: redirect host-side calls to the host duplicates.
 struct CallSubstitutor<'a> {
-    ops: &'a LaunchOps,
     under_device_scope: bool,
     replacements: &'a HashMap<ObjectIdentity, GlobalVar>,
 }
@@ -126,7 +112,7 @@ impl CallSubstitutor<'_> {
     }
 
     fn mutate_region(&mut self, region: RegionStmt, ctx: &mut Mutator) -> Result<Any> {
-        if !self.ops.opens_device_scope(&region) {
+        if !opens_device_scope(&region) {
             return ctx.default_mutate(self, &region);
         }
         let args: Array<Expr> = ctx.mutate(self, &region.args)?.try_into()?;
@@ -149,23 +135,12 @@ pub(crate) fn host_of(target: &Target) -> Result<Option<Target>> {
     target.host()?.map(|host| host.try_cast::<Target>()).transpose()
 }
 
-fn with_host(target: &Target, host: Option<&Target>) -> Result<Target> {
-    let host = host.map(AnyView::from).unwrap_or_default();
-    tvm_ffi::cached_global_func!("target.WithHost")
-        .call_packed(&[AnyView::from(target), host])?
-        .try_into()
-}
-
 /// `Target::WithoutHost`; `target.WithHost(target, None)` copies the node with the host cleared.
 pub(crate) fn without_host(target: &Target) -> Result<Target> {
     if host_of(target)?.is_none() {
         return Ok(target.clone());
     }
-    with_host(target, None)
-}
-
-fn new_target(name: &str) -> Result<Target> {
-    tvm_ffi::cached_global_func!("target.Target").call_tuple((String::from(name),))?.try_into()
+    target.with_host(None)
 }
 
 /// The module being rebuilt: an ordered function table, as `IRModuleNode::Update`/`Add` keep it.
@@ -195,7 +170,7 @@ impl ModuleState {
 fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
     let target_host = match host_of(target)? {
         Some(host) => host,
-        None => new_target("llvm")?,
+        None => Target::new("llvm")?,
     };
     let target_without_host = without_host(target)?;
     // C++ Step 3 iterates `mod->functions`, which `mod.CopyOnWrite()` aliases to the module
@@ -205,9 +180,7 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
     // the one C++ sees, so this port always follows the uniquely owned behavior.
 
     // Step 1: who calls whom, from the bodies of the externally exposed functions.
-    let ops = LaunchOps::new()?;
     let classifier = Classifier {
-        ops: &ops,
         under_device_scope: false,
         host_called: HashSet::new(),
         device_called: HashSet::new(),
@@ -236,14 +209,14 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
             let func_target: Target = func_target.try_into()?;
             if let Some(host) = host_of(target)? {
                 if host_of(&func_target)?.is_none() && exposed {
-                    let bound = with_host(&func_target, Some(&host))?;
+                    let bound = func_target.with_host(Some(&host))?;
                     state.update(&gvar, with_attr(&function, TARGET, bound));
                 }
             }
             continue;
         }
         if has_nonzero_attr(&function.attrs, IS_HOST_FUNC)? {
-            let host = with_host(&target_host, Some(&target_host))?;
+            let host = target_host.with_host(Some(&target_host))?;
             let bound = with_attr(&function, TARGET, host);
             let attrs = dict_without(&bound.attrs, IS_HOST_FUNC);
             state.update(&gvar, bound.with_attrs(attrs));
@@ -257,9 +230,7 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
         let (by_host, by_device) =
             (classifier.host_called.contains(&id), classifier.device_called.contains(&id));
         if by_host && by_device {
-            let host_func: Function = tvm_ffi::cached_global_func!("tirx.RenewDef")
-                .call_tuple((function.clone(),))?
-                .try_into()?;
+            let host_func = function.renew_defs()?;
             state.update(&gvar, with_attr(&function, TARGET, target_without_host.clone()));
             let host_func = with_attr(&host_func, TARGET, target_host.clone());
             let name = names.fresh(&format!("{}_host", gvar.name_hint.as_str()))?;
@@ -281,11 +252,8 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
             if !is_externally_exposed(&func)? {
                 continue;
             }
-            let mut substitutor = CallSubstitutor {
-                ops: &ops,
-                under_device_scope: false,
-                replacements: &replacements,
-            };
+            let mut substitutor =
+                CallSubstitutor { under_device_scope: false, replacements: &replacements };
             let body: Option<SeqStmt> = match function.body.clone() {
                 Some(body) => Some(structural_mutate(body, &mut substitutor)?.try_into()?),
                 None => None,
@@ -318,20 +286,14 @@ impl UniqueNames {
     pub(crate) fn new(names: impl Iterator<Item = String>) -> Result<Self> {
         let supply = crate::ir::UniqueNameSupply::new()?;
         for name in names {
-            tvm_ffi::cached_global_func!("ir.UniqueNameSupply_ReserveName").call_tuple((
-                supply.clone(),
-                name,
-                false,
-            ))?;
+            supply.reserve_name(name.as_str(), false)?;
         }
         Ok(Self { supply })
     }
 
     /// `FreshName(name, add_prefix=false)`.
     pub(crate) fn fresh(&self, name: &str) -> Result<String> {
-        tvm_ffi::cached_global_func!("ir.UniqueNameSupply_FreshName")
-            .call_tuple((self.supply.clone(), String::from(name), false, true))?
-            .try_into()
+        self.supply.fresh_name(name, false, true)
     }
 }
 

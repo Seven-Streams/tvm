@@ -28,14 +28,15 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    dispatch, structural_mutate, structural_walk, Any, AnyView, Array, Error, Mutator,
+    bail, dispatch, structural_mutate, structural_walk, Any, AnyView, Array, Mutator,
     DLDataTypeExt, ObjectCore, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, WalkOrder,
     WalkResult, INTERNAL_ERROR,
 };
 
 use super::util::{prim_dtype, prim_type, MutatorExt};
-use crate::ir::{Call, Expr, Op, PrimTypeObj, TensorLoad, TensorLoadObj, Var, VarObj};
+use crate::ir::{Call, Expr, PrimTypeObj, TensorLoad, TensorLoadObj, Var, VarObj};
 use crate::ops::{ex, Ex, PrimOps};
+use crate::prim::op::{CLZ, IF_THEN_ELSE, POW};
 use crate::prim::{
     Add, BitwiseAnd, BitwiseNot, BitwiseOr, BitwiseXor, Broadcast, Div, FloorDiv, FloorMod, LShift,
     Let, Max, Min, Mod, Mul, Ramp, RShift, Select, Shuffle, Sub, EQ, GE, GT, LE, LT, NE,
@@ -56,12 +57,7 @@ pub fn substitute_with_dtype_legalization(
             remap.insert(ObjectIdentity::of(&var), replacement);
         }
     }
-    let mut legalizer = Legalizer {
-        remap,
-        pow: Op::get("prim.pow")?,
-        if_then_else: Op::get("prim.if_then_else")?,
-        clz: Op::get("prim.clz")?,
-    };
+    let mut legalizer = Legalizer { remap };
     structural_mutate(expr, &mut legalizer)?.try_into()
 }
 
@@ -84,9 +80,6 @@ impl VarCollector {
 struct Legalizer {
     /// `VarRemapSet`: the replacements, and the retyped variables of `Let`.
     remap: HashMap<ObjectIdentity, Expr>,
-    pow: Op,
-    if_then_else: Op,
-    clz: Op,
 }
 
 /// C++ `as<TensorVar>()`: a `Var`, not a subclass, whose type is a `TensorType`.
@@ -269,15 +262,12 @@ impl Legalizer {
         }
         let (base_dtype, stride_dtype) = (prim_dtype(&base)?, prim_dtype(&stride)?);
         let int = tvm_ffi::DLDataTypeCode::kDLInt as u8;
-        if base_dtype.code != int || stride_dtype.code != int {
-            let condition = "base_dtype.MatchesCode(DLDataTypeCode::kDLInt) && \
-                             stride_dtype.MatchesCode(DLDataTypeCode::kDLInt)";
-            return Err(Error::new(
-                INTERNAL_ERROR,
-                &format!("Check failed: ({condition}) is false: "),
-                "",
-            ));
-        }
+        check!(
+            base_dtype.code == int && stride_dtype.code == int,
+            INTERNAL_ERROR,
+            "base_dtype.MatchesCode(DLDataTypeCode::kDLInt) && \
+             stride_dtype.MatchesCode(DLDataTypeCode::kDLInt)"
+        );
         let dtype =
             tvm_ffi::DLDataType { bits: base_dtype.bits.max(stride_dtype.bits), ..base_dtype };
         let base = match base_dtype == dtype {
@@ -342,15 +332,15 @@ impl Legalizer {
         let before = op.clone();
         let e: Expr = m.default_mutate_as(self, &Expr::from(op))?;
         let Some(call) = e.as_node::<crate::ir::CallObj>() else {
-            return Err(Error::new(INTERNAL_ERROR, "Expected type to be CallNode", ""));
+            bail!(INTERNAL_ERROR, "Expected type to be CallNode");
         };
         if call.ty.as_node::<PrimTypeObj>().is_none() {
             return Ok(e.into());
         }
-        if call.op.same_as(&self.pow) {
+        if POW.is(&call.op) {
             return Ok(call.args.get(0)?.pow(call.args.get(1)?).expr()?.into());
         }
-        if call.op.same_as(&self.if_then_else) {
+        if IF_THEN_ELSE.is(&call.op) {
             let args = Array::new(vec![call.args.get(0)?, call.args.get(1)?, call.args.get(2)?]);
             let rebuilt = Call::new_full(
                 Some(call.ty.clone()),
@@ -362,17 +352,17 @@ impl Legalizer {
             )?;
             return Ok(rebuilt.into());
         }
-        if call.op.same_as(&self.clz) {
+        if CLZ.is(&call.op) {
             let (before_dtype, after_dtype) =
                 (prim_dtype(&before.args.get(0)?)?, prim_dtype(&call.args.get(0)?)?);
             let integer = |d: tvm_ffi::DLDataType| d.code <= 1 && (d.bits == 32 || d.bits == 64);
             for (when, dtype) in [("before", before_dtype), ("after", after_dtype)] {
                 if !integer(dtype) {
-                    let message = format!(
+                    bail!(
+                        INTERNAL_ERROR,
                         "clz only supports 32 or 64 bit integer types, but get type {when} legalizing: {}",
                         dtype.to_string().as_str()
                     );
-                    return Err(Error::new(INTERNAL_ERROR, &message, ""));
                 }
             }
             let corrected = ex(e) - after_dtype.bits as i64 + before_dtype.bits as i64;

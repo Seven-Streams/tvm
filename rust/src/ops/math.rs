@@ -26,11 +26,12 @@
 //! combine expressions with the operators of [`super::arith`].
 
 use tvm_ffi::{
-    AnyView, Array, BigInt, DLDataType, DLDataTypeCode, DLDataTypeExt, Error, ErrorKind,
-    ObjectRefCast, ObjectRefCore, Result, INTERNAL_ERROR, TYPE_ERROR,
+    Array, BigInt, DLDataType, DLDataTypeCode, DLDataTypeExt, Error, ErrorKind, ObjectRefCast,
+    ObjectRefCore, Result, INTERNAL_ERROR, TYPE_ERROR,
 };
 
 use super::arith::{wrap_signed, Ex, PrimOps};
+use super::native::repr;
 use super::build::{
     float_imm, float_imm_at, int32, int32_dtype, int_imm_at, prim_dtype, prim_type, IntoExpr,
     IntoPrimType,
@@ -115,18 +116,6 @@ pub(super) fn internal(message: &str) -> Error {
 /// The error of a failed C++ `TVM_FFI_CHECK` or `TVM_FFI_ICHECK`.
 pub(super) fn check_failed(kind: ErrorKind, condition: &str, message: &str) -> Error {
     Error::new(kind, &format!("Check failed: ({condition}) is false: {message}"), "")
-}
-
-/// How C++ prints a node in an error message (`ffi.ReprPrint`), such as `T.float32`.
-fn repr<T>(value: &T) -> String
-where
-    for<'a> AnyView<'a>: From<&'a T>,
-{
-    tvm_ffi::cached_global_func!("ffi.ReprPrint")
-        .call_packed(&[AnyView::from(value)])
-        .and_then(tvm_ffi::String::try_from)
-        .map(|text| text.as_str().to_string())
-        .unwrap_or_default()
 }
 
 /// `Op::Get(name)`, fetched once per thread as the C++ functions keep theirs in `static`s.

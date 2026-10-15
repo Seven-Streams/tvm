@@ -21,11 +21,11 @@
 //! simplification (`src/tirx/ir/tensor.cc`), `FlattenedTensor`
 //! (`src/tirx/transform/flattened_tensor.h`), and small `TensorVar` helpers.
 
-use tvm_ffi::{AnyView, Array, ObjectCore, ObjectRefCast, ObjectRefCore, Result};
+use tvm_ffi::{AnyView, Array, ObjectCore, ObjectRefCast, ObjectRefCore, Result, INTERNAL_ERROR};
 
 use super::analyzer::is_const_int;
 use crate::ir::{Expr, Var, VarObj};
-use crate::ops::{int32, unknown_loc, Ex, PrimOps};
+use crate::ops::{deep_equal, int32, unknown_loc, Ex, PrimOps};
 use crate::prim::{AddObj, FloorDivObj, FloorModObj, Max, MulObj};
 use crate::sym::Analyzer;
 use crate::tirx::TensorType;
@@ -46,43 +46,15 @@ pub(crate) fn tensor_type(var: &Var) -> Result<TensorType> {
     var.ty.clone().try_cast()
 }
 
-/// C++ `ffi::StructuralEqual()(lhs, rhs)`.
-pub(crate) fn structural_equal<L, R>(lhs: &L, rhs: &R) -> Result<bool>
-where
-    for<'a> AnyView<'a>: From<&'a L> + From<&'a R>,
-{
-    tvm_ffi::cached_global_func!("ffi.StructuralEqual")
-        .call_packed(&[
-            AnyView::from(lhs),
-            AnyView::from(rhs),
-            AnyView::from(&false),
-            AnyView::from(&false),
-        ])?
-        .try_into()
-}
-
-/// C++ `prim::ExprDeepEqual`.
-fn deep_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
-    tvm_ffi::cached_global_func!("prim.expr_deep_equal")
-        .call_tuple((lhs.clone(), rhs.clone()))?
-        .try_into()
-}
-
-/// The text of a failed C++ `TVM_FFI_ICHECK_EQ`.
-fn check_eq_failed(condition: &str, lhs: usize, rhs: usize, message: &str) -> tvm_ffi::Error {
-    let message = format!("Check failed: {condition} ({lhs} vs. {rhs}) : {message}");
-    tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, &message, "")
-}
-
 /// C++ `FlattenedTensor(tensor)`: the 1-d storage view of `tensor`, which is `tensor` itself
 /// when it is 1-d without strides.
 pub(crate) fn flattened_tensor(tensor: &Var, ty: &TensorType) -> Result<(Var, TensorType)> {
     let (shape, strides) = (&ty.shape, &ty.strides);
     let extent: Ex = if !strides.is_empty() {
-        if shape.len() != strides.len() {
-            let condition = "tensor.shape().size() == tensor.strides().size()";
-            return Err(check_eq_failed(condition, shape.len(), strides.len(), ""));
-        }
+        check_cmp!(
+            shape.len(), ==, strides.len(), INTERNAL_ERROR,
+            "tensor.shape().size() == tensor.strides().size()"
+        );
         // Cover every addressed element: permuted views can have their largest stride inside.
         let mut span = Ex::from(int32(1));
         for (extent, stride) in shape.iter().zip(strides.iter()) {
@@ -123,21 +95,20 @@ pub(crate) fn elem_offset(
     inner: bool,
 ) -> Result<Array<Expr>> {
     let (shape, strides) = (&ty.shape, &ty.strides);
-    if shape.len() != indices.len() {
-        let message = format!(
-            "TensorType is {}-dimensional, cannot be indexed with the {}-dimensional indices \
-             provided.",
-            shape.len(),
-            indices.len()
+    check_cmp!(
+        shape.len(), ==, indices.len(), INTERNAL_ERROR, "shape.size() == input_indices.size()",
+        "TensorType is {}-dimensional, cannot be indexed with the {}-dimensional indices \
+         provided.",
+        shape.len(),
+        indices.len(),
+    );
+    if !strides.is_empty() {
+        check_cmp!(
+            strides.len(), ==, indices.len(), INTERNAL_ERROR,
+            "this->strides.size() == input_indices.size()",
+            "If strides are defined, the index's dimensionality must match the dimensionality of \
+             the index given.",
         );
-        let condition = "shape.size() == input_indices.size()";
-        return Err(check_eq_failed(condition, shape.len(), indices.len(), &message));
-    }
-    if !strides.is_empty() && strides.len() != indices.len() {
-        let message = "If strides are defined, the index's dimensionality must match the \
-                       dimensionality of the index given.";
-        let condition = "this->strides.size() == input_indices.size()";
-        return Err(check_eq_failed(condition, strides.len(), indices.len(), message));
     }
     let analyzer = Analyzer::new()?;
     let mut output = int32(0)?.into();

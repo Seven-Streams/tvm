@@ -51,7 +51,9 @@
 mod arith;
 mod build;
 mod math;
+mod native;
 
 pub use arith::*;
 pub use build::*;
 pub use math::{fast_erf_float_expr, infinity, match_types};
+pub use native::{deep_equal, repr, structural_equal, structural_hash, undefined_vars, TargetScope};

@@ -32,6 +32,7 @@ use crate::ir::{
     Call, Expr, IntImmObj, Op, OpAttrMap, OpObj, PrimType, PrimTypeObj, SeqStmt, Stmt, Var,
 };
 use crate::ops::{let_, max_value, select, Ex, PrimOps};
+use crate::prim::op::FMA;
 use crate::prim::{
     Add, Broadcast, BroadcastObj, Cast, CastObj, FloorDiv, FloorDivObj, FloorMod, FloorModObj, Max,
     Mul, MulObj, EQ, NE,
@@ -47,7 +48,6 @@ const DL_FLOAT: u8 = 2;
 /// The op-attribute columns holding the target's lowering rules, in lookup order.
 struct LoweringRules {
     columns: Vec<OpAttrMap<FfiFunction>>,
-    fma_op: Op,
     /// The first rule for `prim.fma`, as C++ `fma_`.
     fma: Option<FfiFunction>,
 }
@@ -82,7 +82,7 @@ impl LoweringRules {
                 columns.push(column);
             }
         }
-        let fma_op = Op::get("prim.fma")?;
+        let fma_op = FMA.get()?;
         let mut fma = None;
         for column in &columns {
             if let Some(rule) = column.get(&fma_op)? {
@@ -90,7 +90,7 @@ impl LoweringRules {
                 break;
             }
         }
-        Ok(Self { columns, fma_op, fma })
+        Ok(Self { columns, fma })
     }
 
     /// The first rule that rewrites `call`, if any.
@@ -202,8 +202,7 @@ impl IntrinInjecter {
         let rhs = swap_broadcast_cast(&b)?;
         match (&self.rules.fma, prim_dtype(&op.clone().into())?.code == DL_FLOAT) {
             (Some(fma), true) => {
-                let call: Expr =
-                    Call::new(op.ty.clone(), self.rules.fma_op.clone(), vec![lhs, rhs, c])?.into();
+                let call: Expr = Call::new(op.ty.clone(), FMA.get()?, vec![lhs, rhs, c])?.into();
                 let fused = fma.call_tuple((call,))?;
                 if fused.type_index() != 0 {
                     return m.mutate(self, &Expr::try_from(fused)?);
@@ -237,13 +236,7 @@ impl IntrinInjecter {
             return Ok(None);
         }
         let c = ((b - 1) - min) / b;
-        if c <= 0 {
-            return Err(tvm_ffi::Error::new(
-                tvm_ffi::INTERNAL_ERROR,
-                "Check failed: c_value > 0",
-                "",
-            ));
-        }
+        tvm_ffi::ensure!(c > 0, tvm_ffi::INTERNAL_ERROR, "Check failed: c_value > 0");
         if c > dtype_max / b || max > dtype_max - b * c {
             return Ok(None);
         }
@@ -387,11 +380,10 @@ fn config_flag(value: Option<Any>) -> Result<bool> {
 pub fn lower_intrin() -> Result<Pass> {
     function_pass("tirx.LowerIntrin", 0, |func, _module, context| {
         let Some(target) = get_attr(&func.attrs, "target")? else {
-            return Err(tvm_ffi::Error::new(
+            tvm_ffi::bail!(
                 tvm_ffi::INTERNAL_ERROR,
-                "Check failed: target.has_value() is false: LowerIntrin: Require the target attribute",
-                "",
-            ));
+                "Check failed: target.has_value() is false: LowerIntrin: Require the target attribute"
+            );
         };
         let target: Target = target.try_into()?;
         let fast_math = config_flag(context.config.get(&String::from("tirx.enable_fast_math"))?)?;

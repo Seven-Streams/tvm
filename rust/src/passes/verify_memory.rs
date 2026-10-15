@@ -23,14 +23,15 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    dispatch, structural_walk, ContextPolicy, Error, ObjectIdentity, ObjectRefCast, ObjectRefCore,
-    Result, StructuralView, VisitContext, VisitInterrupt, WalkOrder, WalkResult,
-    WalkWithContextPolicy, RUNTIME_ERROR, TYPE_ERROR,
+    dispatch, structural_walk, ContextPolicy, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
+    StructuralView, VisitContext, VisitInterrupt, WalkOrder, WalkResult, WalkWithContextPolicy,
+    RUNTIME_ERROR, TYPE_ERROR,
 };
 
 use super::util::{get_attr, module_pass};
-use crate::ir::{Bind, Call, CallObj, Expr, Op, RegionStmt, StringImm, TensorLoad, TensorStore, Var};
+use crate::ir::{Bind, Call, CallObj, Expr, RegionStmt, StringImm, TensorLoad, TensorStore, Var};
 use crate::target::Target;
+use crate::tirx::op::{ABI_FIELD_GET, DEVICE_SCOPE, LAUNCH_THREAD, MASKED_LOAD, MASKED_STORE};
 use crate::tirx::{Function, TensorTypeObj};
 use crate::transform::Pass;
 
@@ -43,17 +44,8 @@ const GPU_DEVICES: [i64; 5] = [
     10, /* ROCm */
 ];
 
-struct Ops {
-    device_scope: Op,
-    launch_thread: Op,
-    masked_load: Op,
-    masked_store: Op,
-    abi_field_get: Op,
-}
-
 struct MemoryAccessVerifier<'a> {
     func: &'a Function,
-    ops: &'a Ops,
     in_thread_env: bool,
     errors: Vec<std::string::String>,
     defs: HashMap<ObjectIdentity, Expr>,
@@ -63,7 +55,7 @@ struct MemoryAccessVerifier<'a> {
 fn tensor_var(expr: &Expr) -> Result<Var> {
     match expr.clone().try_cast::<Var>() {
         Ok(var) if var.ty.as_node::<TensorTypeObj>().is_some() => Ok(var),
-        _ => Err(Error::new(TYPE_ERROR, "expected a tensor variable", "")),
+        _ => Err(error!(TYPE_ERROR, "expected a tensor variable")),
     }
 }
 
@@ -83,7 +75,7 @@ impl MemoryAccessVerifier<'_> {
             }
             let Some(value) = self.defs.get(&ObjectIdentity::of(&current)) else { return false };
             let Some(call) = value.as_node::<CallObj>() else { return false };
-            if !call.op.same_as(&self.ops.abi_field_get) {
+            if !ABI_FIELD_GET.is(&call.op) {
                 return false;
             }
             match call.args.get(0).ok().and_then(|arg| arg.try_cast::<Var>().ok()) {
@@ -124,8 +116,7 @@ impl MemoryAccessVerifier<'_> {
     }
 
     fn walk_call(&mut self, call: Call) -> Result<WalkResult> {
-        let masked =
-            call.op.same_as(&self.ops.masked_load) || call.op.same_as(&self.ops.masked_store);
+        let masked = MASKED_LOAD.is(&call.op) || MASKED_STORE.is(&call.op);
         if masked && !call.args.is_empty() {
             let var: Var = call.args.get(0)?.try_cast()?;
             self.handle_access(&var);
@@ -163,10 +154,10 @@ impl<'a> ContextPolicy<MemoryAccessVerifier<'a>> for ThreadScope {
 
 impl MemoryAccessVerifier<'_> {
     fn opens_thread_env(&self, region: &RegionStmt) -> Result<bool> {
-        if region.op.same_as(&self.ops.device_scope) {
+        if DEVICE_SCOPE.is(&region.op) {
             return Ok(true);
         }
-        if !region.op.same_as(&self.ops.launch_thread) {
+        if !LAUNCH_THREAD.is(&region.op) {
             return Ok(false);
         }
         let tag: StringImm = region.args.get(0)?.try_cast()?;
@@ -174,13 +165,7 @@ impl MemoryAccessVerifier<'_> {
     }
 }
 
-fn device_type(target: &Target) -> Result<i64> {
-    tvm_ffi::cached_global_func!("target.TargetGetDeviceType")
-        .call_tuple((target.clone(),))?
-        .try_into()
-}
-
-fn verify(func: &Function, ops: &Ops) -> Result<Vec<std::string::String>> {
+fn verify(func: &Function) -> Result<Vec<std::string::String>> {
     let Some(target) = get_attr(&func.attrs, "target")? else { return Ok(vec![]) };
     let target: Target = target.try_into()?;
     let calling_conv = match get_attr(&func.attrs, "calling_conv")? {
@@ -190,41 +175,29 @@ fn verify(func: &Function, ops: &Ops) -> Result<Vec<std::string::String>> {
     if calling_conv != 0 {
         return Ok(vec![]);
     }
-    if !GPU_DEVICES.contains(&device_type(&target)?) {
+    if !GPU_DEVICES.contains(&target.device_type()?) {
         return Ok(vec![]);
     }
-    let verifier = MemoryAccessVerifier {
-        func,
-        ops,
-        in_thread_env: false,
-        errors: vec![],
-        defs: HashMap::new(),
-    };
+    let verifier =
+        MemoryAccessVerifier { func, in_thread_env: false, errors: vec![], defs: HashMap::new() };
     let mut walk = WalkWithContextPolicy::new(verifier, ThreadScope);
     structural_walk(&func.body, &mut walk, WalkOrder::PreOrder)?;
     Ok(walk.into_state().errors)
 }
 
 pub fn verify_memory() -> Result<Pass> {
-    let ops = Ops {
-        device_scope: Op::get("tirx.device_scope")?,
-        launch_thread: Op::get("tirx.launch_thread")?,
-        masked_load: Op::get("tirx.masked_load")?,
-        masked_store: Op::get("tirx.masked_store")?,
-        abi_field_get: Op::get("tirx.abi_field_get")?,
-    };
     module_pass("tirx.VerifyMemory", 0, move |module, _context| {
         for (_gvar, func) in module.functions.iter() {
             let Ok(func) = func.try_cast::<Function>() else { continue };
-            let errors = verify(&func, &ops)?;
+            let errors = verify(&func)?;
             if !errors.is_empty() {
                 let listed: std::string::String =
                     errors.iter().map(|e| format!("    {e}\n")).collect();
-                return Err(Error::new(
+                tvm_ffi::bail!(
                     RUNTIME_ERROR,
-                    &format!("Memory verification failed with the following errors:\n{listed}  Did you forget to bind?"),
-                    "",
-                ));
+                    "Memory verification failed with the following errors:\n{listed}  Did you \
+                     forget to bind?"
+                );
             }
         }
         Ok(module)

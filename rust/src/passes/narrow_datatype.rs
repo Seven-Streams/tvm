@@ -37,16 +37,18 @@ use tvm_ffi::{
 use super::data_type_rewriter::{DataTypeRewrite, DataTypeRewriterBase, DataTypeRewriterState};
 use super::util::{function_pass, int_imm, prim_dtype, prim_type, MutatorExt};
 use crate::ir::{
-    AssertStmt, Bind, Call, CallObj, Expr, FloatImmObj, For, IntImm, IntImmObj, OpaqueExprObj, Op,
+    AssertStmt, Bind, Call, CallObj, Expr, FloatImmObj, For, IntImm, IntImmObj, OpaqueExprObj,
     PrimTypeObj, Range, RegionStmt, SeqStmt, Stmt, TensorLoad, TensorLoadObj, TensorStore, Tuple,
     TupleGetItem, Var, VarObj,
 };
 use crate::ops::{Ex, PrimOps};
+use crate::prim::op::{CEIL, LOG2};
 use crate::prim::{
     Add, BitwiseAnd, Broadcast, Cast, Div, FloorDiv, FloorMod, LShift, Let, Max, Min, Mod, Mul,
     RShift, Ramp, Select, Shuffle, Sub, EQ, GE, GT, LE, LT, NE,
 };
 use crate::sym::Analyzer;
+use crate::tirx::op::LAUNCH_THREAD;
 use crate::transform::Pass;
 
 const DL_INT: u8 = 0;
@@ -69,9 +71,6 @@ struct DataTypeVisitor {
     released_lets: HashSet<ObjectIdentity>,
     /// The narrowed type of each node, with the node.
     vmap: HashMap<ObjectIdentity, (Expr, DLDataType)>,
-    launch_thread: Op,
-    ceil: Op,
-    log2: Op,
 }
 
 impl DataTypeVisitor {
@@ -85,9 +84,6 @@ impl DataTypeVisitor {
             memoized_lets: HashSet::new(),
             released_lets: HashSet::new(),
             vmap: HashMap::new(),
-            launch_thread: Op::get("tirx.launch_thread")?,
-            ceil: Op::get("prim.ceil")?,
-            log2: Op::get("prim.log2")?,
         })
     }
 
@@ -144,10 +140,7 @@ impl DataTypeVisitor {
         self.memoized_lets.insert(ObjectIdentity::of(op));
         self.memoize(&op.value)?;
         let key = ObjectIdentity::of(&op.var);
-        let is_bound: bool = tvm_ffi::cached_global_func!("sym.AnalyzerConstIntBoundIsBound")
-            .call_tuple((self.analyzer.clone(), op.var.clone()))?
-            .try_into()?;
-        if is_bound && !self.released_lets.contains(&key) {
+        if self.analyzer.const_int_bound_is_bound(&op.var)? && !self.released_lets.contains(&key) {
             return self.memoize(&op.body);
         }
         let value = self.analyzer.const_int_bound(&op.value)?;
@@ -167,9 +160,9 @@ impl DataTypeVisitor {
         if ty.dtype.code != DL_INT {
             return None;
         }
-        let ceil = op.value.as_node::<CallObj>().filter(|call| call.op.same_as(&self.ceil))?;
+        let ceil = op.value.as_node::<CallObj>().filter(|call| CEIL.is(&call.op))?;
         let log2 = ceil.args.get(0).ok()?;
-        let log2 = log2.as_node::<CallObj>().filter(|call| call.op.same_as(&self.log2))?;
+        let log2 = log2.as_node::<CallObj>().filter(|call| LOG2.is(&call.op))?;
         log2.args.get(0).ok()
     }
 
@@ -263,7 +256,7 @@ fn visit_node(
     }
     if let Some(op) = value.cast::<RegionStmt>() {
         let state = ctx.state_mut();
-        if op.op.same_as(&state.launch_thread) {
+        if LAUNCH_THREAD.is(&op.op) {
             let var = op.body_params.get(0)?;
             let extent = op.args.get(1)?;
             let zero = int_imm(prim_dtype(&extent)?, 0)?;
@@ -493,7 +486,7 @@ fn narrow_body(body: SeqStmt, target_bits: i32) -> Result<SeqStmt> {
     let mut visitor = VisitCallbacks::new(DataTypeVisitor::new(target_bits)?, visit);
     structural_visit(&body, &mut visitor)?;
     let mut rewriter =
-        NarrowRewriter { base: DataTypeRewriterBase::new(true)?, vmap: HashMap::new() };
+        NarrowRewriter { base: DataTypeRewriterBase::new(true), vmap: HashMap::new() };
     for (key, (expr, dtype)) in visitor.into_state().vmap {
         if prim_dtype(&expr)? == dtype {
             continue;

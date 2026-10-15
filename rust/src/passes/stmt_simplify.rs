@@ -32,12 +32,13 @@ use super::analyzer::{bind_range, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::side_effect::{side_effect, PURE};
 use super::util::{function_pass, make_const, prim_dtype, MutatorExt};
 use crate::ir::{
-    Bind, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, Op, PrimTypeObj, SeqStmt, Stmt,
-    StringImm, TensorLoadObj, TensorStore, Var, VarObj,
+    Bind, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, PrimTypeObj, SeqStmt, Stmt, StringImm,
+    TensorLoadObj, TensorStore, Var, VarObj,
 };
-use crate::ops::PrimOps;
+use crate::ops::{deep_equal, PrimOps};
 use crate::prim::{AddObj, MulObj, SubObj};
 use crate::sym::{Analyzer, ConstIntBound};
+use crate::tirx::op::{ALLOC_TENSOR, DECL_TENSOR};
 use crate::tirx::{Function, TensorType, TensorTypeObj};
 use crate::transform::Pass;
 
@@ -48,8 +49,6 @@ struct StmtSimplifier {
     base: AnalyzerBase,
     /// Pure `Bind` values, substituted when proving a branch condition.
     non_inlined_bindings: HashMap<ObjectIdentity, Expr>,
-    alloc_tensor: Op,
-    decl_tensor: Op,
 }
 
 impl AnalyzerState for StmtSimplifier {
@@ -77,10 +76,10 @@ impl StmtSimplifier {
     /// A pure bound value is known to the analyzer and to later branch conditions.
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            if call.op.same_as(&self.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 return Ok(op.into());
             }
-            if call.op.same_as(&self.decl_tensor) {
+            if DECL_TENSOR.is(&call.op) {
                 let data = call.args.get(0)?;
                 let simplified: Expr = m.mutate_as(self, &data)?;
                 if simplified.same_as(&data) {
@@ -182,12 +181,6 @@ fn all_deep_equal(lhs: &Array<Expr>, rhs: &Array<Expr>) -> Result<bool> {
         }
     }
     Ok(true)
-}
-
-fn deep_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
-    tvm_ffi::cached_global_func!("prim.expr_deep_equal")
-        .call_tuple((lhs.clone(), rhs.clone()))?
-        .try_into()
 }
 
 fn stores_loaded_value(store: &TensorStore) -> Result<bool> {
@@ -297,8 +290,6 @@ pub fn stmt_simplify() -> Result<Pass> {
         let mut simplifier = StmtSimplifier {
             base: AnalyzerBase::new(Analyzer::new()?)?,
             non_inlined_bindings: HashMap::new(),
-            alloc_tensor: Op::get("tirx.alloc_tensor")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
         };
         simplifier.mark_tensor_param_shapes(&func)?;
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };

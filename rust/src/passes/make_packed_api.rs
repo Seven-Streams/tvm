@@ -27,21 +27,25 @@ use std::collections::HashMap;
 use tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 use tvm_ffi::{
     dispatch, structural_mutate, Any, Array, Map, Mutator, ObjectIdentity, ObjectRefCast,
-    ObjectRefCore, Result, String, Unchanged,
+    ObjectRefCore, Result, String, Unchanged, INTERNAL_ERROR,
 };
 
 use super::analyzer::is_const_int;
 use super::tvm_ffi_binder::{
-    i32_imm, repr, scalar, AbiBinder, FFI_ANY_TYPE_INDEX, FFI_ANY_UNION_VALUE, FFI_ANY_ZERO_PADDING,
+    i32_imm, scalar, AbiBinder, FFI_ANY_TYPE_INDEX, FFI_ANY_UNION_VALUE, FFI_ANY_ZERO_PADDING,
 };
-use super::util::{MutatorExt, dict_with, get_attr, internal, module_pass, module_with_function};
+use super::util::{MutatorExt, dict_with, get_attr, module_pass, module_with_function};
 use crate::ir::{
-    Bind, Call, DictAttrs, Evaluate, Expr, For, GlobalVarObj, If, IntImm, Op, PtrType, PtrTypeObj,
+    Bind, Call, DictAttrs, Evaluate, Expr, For, GlobalVarObj, If, IntImm, PtrType, PtrTypeObj,
     RegionStmt, Return, SeqStmt, Stmt, StringImm, Type, Var,
 };
-use crate::ops::{int_imm, prim_dtype, PrimOps};
+use crate::ops::{int_imm, prim_dtype, repr, undefined_vars, PrimOps};
 use crate::prim::Cast;
 use crate::target::Target;
+use crate::tirx::op::{
+    ABI_FIELD_SET, CALL_CPACKED, CALL_EXTERN, COMPUTE_SCOPE, DEVICE_CONTEXT, PARALLEL_LAUNCH,
+    THROW_LAST_ERROR,
+};
 use crate::tirx::Function;
 use crate::transform::Pass;
 
@@ -70,8 +74,6 @@ fn int_attr(value: Any) -> Result<i64> {
 struct ReturnRewriter {
     result: Var,
     in_parallel: i32,
-    parallel_launch: Op,
-    abi_field_set: Op,
 }
 
 #[dispatch(mutate)]
@@ -93,7 +95,7 @@ impl ReturnRewriter {
     }
 
     fn mutate_region(&mut self, op: RegionStmt, m: &mut Mutator) -> Result<Any> {
-        let parallel = op.op.same_as(&self.parallel_launch) as i32;
+        let parallel = PARALLEL_LAUNCH.is(&op.op) as i32;
         self.in_parallel += parallel;
         let result = m.default_mutate(self, &op);
         self.in_parallel -= parallel;
@@ -101,13 +103,14 @@ impl ReturnRewriter {
     }
 
     fn mutate_return(&mut self, op: Return) -> Result<Any> {
-        if self.in_parallel != 0 {
-            let message = format!(
-                "Check failed: in_parallel_ == 0 ({} vs. 0) : Return cannot be used in parallel scope.",
-                self.in_parallel
-            );
-            return Err(internal(&message));
-        }
+        check_cmp!(
+            self.in_parallel,
+            ==,
+            0,
+            INTERNAL_ERROR,
+            "in_parallel_ == 0",
+            "Return cannot be used in parallel scope."
+        );
         Ok(self.write_to_out(op.value.clone())?.into())
     }
 }
@@ -118,7 +121,7 @@ impl ReturnRewriter {
         let (type_index, value) = convert_for_ffi(value)?;
         let store = |field: i32, value: Expr| -> Result<Stmt> {
             let args = vec![self.result.clone().into(), i32_imm(0)?, i32_imm(field as i64)?, value];
-            let call = Call::new(scalar(INT, 32)?, self.abi_field_set.clone(), args)?;
+            let call = Call::new(scalar(INT, 32)?, ABI_FIELD_SET.get()?, args)?;
             Ok(Evaluate::new(call)?.into())
         };
         SeqStmt::new(vec![
@@ -145,7 +148,7 @@ fn convert_for_ffi(value: Expr) -> Result<(i64, Expr)> {
         3 if dtype.bits == 0 && dtype.lanes == 0 => (TypeIndex::kTVMFFINone as i64, value),
         _ => {
             let dtype = tvm_ffi::DLDataTypeExt::to_string(&dtype);
-            return Err(internal(&format!("data type {} not supported yet", dtype.as_str())));
+            tvm_ffi::bail!(INTERNAL_ERROR, "data type {} not supported yet", dtype.as_str());
         }
     })
 }
@@ -153,7 +156,6 @@ fn convert_for_ffi(value: Expr) -> Result<(i64, Expr)> {
 /// `SubroutineCallRewriter`: a call to a function with a packed API calls it by its symbol.
 struct SubroutineCallRewriter<'a> {
     methods: &'a HashMap<ObjectIdentity, String>,
-    call_cpacked: Op,
     made_change: bool,
 }
 
@@ -170,7 +172,7 @@ impl SubroutineCallRewriter<'_> {
                 let null_handle = zero.reinterpret(PtrType::void()?).expr()?;
                 args.push(null_handle);
                 self.made_change = true;
-                return Ok(Call::new(call.ty.clone(), self.call_cpacked.clone(), args)?.into());
+                return Ok(Call::new(call.ty.clone(), CALL_CPACKED.get()?, args)?.into());
             }
         }
         Ok(call.into())
@@ -180,11 +182,7 @@ impl SubroutineCallRewriter<'_> {
 impl SubroutineCallRewriter<'_> {
     /// `Apply`: the statement with its calls rewritten, if any was.
     fn apply(methods: &HashMap<ObjectIdentity, String>, stmt: SeqStmt) -> Result<Option<Stmt>> {
-        let mut rewriter = SubroutineCallRewriter {
-            methods,
-            call_cpacked: Op::get("tirx.call_cpacked")?,
-            made_change: false,
-        };
+        let mut rewriter = SubroutineCallRewriter { methods, made_change: false };
         let stmt: Stmt = structural_mutate(stmt, &mut rewriter)?.try_into()?;
         Ok(rewriter.made_change.then_some(stmt))
     }
@@ -204,12 +202,6 @@ fn requires_packed_api(func: &Function) -> Result<Option<String>> {
     }
 }
 
-fn device_type(target: &Target) -> Result<i64> {
-    tvm_ffi::cached_global_func!("target.TargetGetDeviceType")
-        .call_tuple((target.clone(),))?
-        .try_into()
-}
-
 fn no_attrs() -> DictAttrs {
     DictAttrs::new(Map::new())
 }
@@ -220,15 +212,15 @@ fn make_packed_function(func: Function) -> Result<Function> {
     let Some(symbol) = requires_packed_api(&func)? else { return Ok(func) };
     let name_hint = symbol.as_str().to_string();
     let Some(target) = get_attr(&func.attrs, "target")? else {
-        let message = format!(
-            "Check failed: (opt) is false: MakePackedAPI required the function to be annotated with \
-             tvm::attr::kTarget (target), but the function only has attributes {}",
+        tvm_ffi::bail!(
+            INTERNAL_ERROR,
+            "Check failed: (opt) is false: MakePackedAPI required the function to be annotated \
+             with tvm::attr::kTarget (target), but the function only has attributes {}",
             repr(&func.attrs)
         );
-        return Err(internal(&message));
     };
     let target: Target = target.try_into()?;
-    let target_device_type = device_type(&target)?;
+    let target_device_type = target.device_type()?;
     // A function without a host target has already been lowered.
     let Some(target_host) = target.host()? else { return Ok(func) };
     let target_host: Target = target_host.try_cast()?;
@@ -261,17 +253,11 @@ fn make_packed_function(func: Function) -> Result<Function> {
         Any::from(String::from(format!("{SYMBOL_PREFIX}{name_hint}"))),
     );
 
-    let mut rewriter = ReturnRewriter {
-        result: result.clone(),
-        in_parallel: 0,
-        parallel_launch: Op::get("tirx.parallel_launch")?,
-        abi_field_set: Op::get("tirx.abi_field_set")?,
-    };
+    let mut rewriter = ReturnRewriter { result: result.clone(), in_parallel: 0 };
     let body: Stmt = structural_mutate(body, &mut rewriter)?.try_into()?;
     let scope = StringImm::new(&format!("{name_hint}_compute_"))?.into();
-    let compute_scope = Op::get("tirx.compute_scope")?;
     let mut body: Stmt = RegionStmt::new(
-        compute_scope,
+        COMPUTE_SCOPE.get()?,
         Array::new(vec![scope]),
         Array::new(vec![]),
         no_attrs(),
@@ -285,9 +271,9 @@ fn make_packed_function(func: Function) -> Result<Function> {
             device_type.clone(),
             device_id.clone().into(),
         ];
-        let set_device = Call::new(int32.clone(), Op::get("tirx.call_extern")?, set_device_args)?;
+        let set_device = Call::new(int32.clone(), CALL_EXTERN.get()?, set_device_args)?;
         let set_device: Stmt = Bind::new(status.clone(), set_device)?.into();
-        let raise = Call::new(int32.clone(), Op::get("tirx.throw_last_error")?, vec![])?;
+        let raise = Call::new(int32.clone(), THROW_LAST_ERROR.get()?, vec![])?;
         let raise = SeqStmt::new(vec![Evaluate::new(raise)?.into()])?;
         let check_status: Stmt = If::new(status.not_equal(i32_imm(0)?), raise, None)?.into();
         body = SeqStmt::new(vec![set_device, check_status, body])?.into();
@@ -301,8 +287,8 @@ fn make_packed_function(func: Function) -> Result<Function> {
         body = SeqStmt::new(binding.asserts)?.into();
     }
     if need_set_device {
-        let context = Op::get("tirx.device_context")?;
         let args = Array::new(vec![device_type, device_id.into()]);
+        let context = DEVICE_CONTEXT.get()?;
         body = RegionStmt::new(context, args, Array::new(vec![]), no_attrs(), body)?.into();
     }
     if !binding.init_nest.is_empty() {
@@ -312,18 +298,17 @@ fn make_packed_function(func: Function) -> Result<Function> {
     let body = SeqStmt::from_stmt(body)?;
     let params = Array::new(vec![self_handle, packed_args, num_packed_args, result]);
 
-    let undefined: Array<Var> = tvm_ffi::cached_global_func!("tirx.analysis.UndefinedVars")
-        .call_tuple((body.clone(), params.clone()))?
-        .try_into()?;
-    if !undefined.is_empty() {
-        let message = format!(
-            "Check failed: undefined.size() == 0 ({} vs. 0) : In Function {name_hint} variables {} are \
-             used, but are not passed in as API arguments",
-            undefined.len(),
-            repr(&undefined)
-        );
-        return Err(internal(&message));
-    }
+    let undefined = undefined_vars(&body.clone().into(), &params)?;
+    check_cmp!(
+        undefined.len(),
+        ==,
+        0,
+        INTERNAL_ERROR,
+        "undefined.size() == 0",
+        "In Function {} variables {} are used, but are not passed in as API arguments",
+        name_hint,
+        repr(&undefined)
+    );
     Ok(func.with_attrs(attrs).with(|node| {
         node.body = Some(body);
         node.params = params;

@@ -31,10 +31,11 @@ use super::convert_ssa::convert_ssa_stmt;
 use super::side_effect::{side_effect, READ_STATE};
 use super::util::{function_pass, sequential};
 use crate::ir::{
-    Call, Expr, For, If, IntImmObj, Op, PrimTypeObj, RegionStmt, SeqStmt, Stmt, TensorLoad, Type,
-    Var,
+    Call, Expr, For, If, IntImmObj, PrimTypeObj, RegionStmt, SeqStmt, Stmt, TensorLoad, Type, Var,
 };
+use crate::prim::op::LIKELY;
 use crate::prim::{Cast, Div, FloorDiv, FloorMod, LShift, Mod, RShift};
+use crate::tirx::op::LAUNCH_THREAD;
 use crate::transform::Pass;
 
 /// A loop being rewritten: the conditions to hoist above it, outermost first.
@@ -58,8 +59,6 @@ struct IfHoister {
     else_depth: i32,
     active_loops: i32,
     split_in_nest: bool,
-    launch_thread: Op,
-    likely: Op,
 }
 
 #[dispatch(mutate)]
@@ -135,7 +134,7 @@ impl IfHoister {
 
     /// A launched thread is not entered.
     fn mutate_region(&mut self, op: RegionStmt, m: &mut Mutator) -> Result<Any> {
-        if op.op.same_as(&self.launch_thread) {
+        if LAUNCH_THREAD.is(&op.op) {
             return Ok(op.into());
         }
         self.scoped(|this| m.default_mutate(this, &op))
@@ -167,7 +166,6 @@ impl IfHoister {
             loops: scope.loops.len(),
             destination: 0,
             visited: HashSet::new(),
-            likely: &self.likely,
         };
         let blocked = structural_walk(condition, &mut walker, WalkOrder::PreOrder)?;
         Ok(if blocked.is_some() { scope.loops.len() } else { walker.destination })
@@ -181,7 +179,6 @@ struct LiftWalker<'a> {
     loops: usize,
     destination: usize,
     visited: HashSet<ObjectIdentity>,
-    likely: &'a Op,
 }
 
 #[dispatch(walk)]
@@ -239,7 +236,7 @@ impl LiftWalker<'_> {
 
     /// Only `likely` hints can be hoisted among calls.
     fn walk_call(&mut self, op: Call) -> WalkResult {
-        if !op.op.same_as(self.likely) {
+        if !LIKELY.is(&op.op) {
             return WalkResult::Interrupt;
         }
         self.advance(&op)
@@ -275,8 +272,6 @@ fn is_integer(ty: &Type) -> bool {
 }
 
 pub fn insert_hoisted_if() -> Result<Pass> {
-    let launch_thread = Op::get("tirx.launch_thread")?;
-    let likely = Op::get("prim.likely")?;
     function_pass("tirx.InsertHoistedIf", 0, move |func, _module, _context| {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         let mut hoister = IfHoister {
@@ -285,8 +280,6 @@ pub fn insert_hoisted_if() -> Result<Pass> {
             else_depth: 0,
             active_loops: 0,
             split_in_nest: false,
-            launch_thread: launch_thread.clone(),
-            likely: likely.clone(),
         };
         let body: Stmt = structural_mutate(body, &mut hoister)?.try_into()?;
         let body = convert_ssa_stmt(SeqStmt::from_stmt(body)?)?;

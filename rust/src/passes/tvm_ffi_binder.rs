@@ -30,23 +30,29 @@ use std::collections::HashMap;
 
 use tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 use tvm_ffi::{
-    AnyView, Array, BigInt, DLDataType, DLDataTypeExt, Error, ObjectIdentity, ObjectRefCast,
-    ObjectRefCore, Result, String, TYPE_ERROR,
+    Array, BigInt, DLDataType, DLDataTypeExt, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
+    INTERNAL_ERROR, TYPE_ERROR,
 };
 
-use super::util::internal;
 use super::analyzer::is_const_int;
 use crate::ir::{
-    AssertStmt, Bind, Call, Evaluate, Expr, FloatImmObj, If, IntImmObj, Op, PrimType, PrimTypeObj,
-    PtrType, PtrTypeObj, SeqStmt, Stmt, StringImm, Type, Var, VarObj,
+    AssertStmt, Bind, Call, Evaluate, Expr, FloatImmObj, If, IntImmObj, OpHandle, PrimType,
+    PrimTypeObj, PtrType, PtrTypeObj, SeqStmt, Stmt, StringImm, Type, Var, VarObj,
 };
-use crate::ops::{if_then_else, int32, int_imm, make_const, prim_dtype, prim_type, Ex, PrimOps};
+use crate::ops::{
+    if_then_else, int32, int_imm, make_const, prim_dtype, prim_type, repr, structural_equal, Ex,
+    PrimOps,
+};
+use crate::prim::op::IF_THEN_ELSE;
 use crate::prim::{
     AddObj, CastObj, DivObj, FloorDivObj, FloorModObj, MaxObj, MinObj, ModObj, MulObj, Not, Select,
     SubObj,
 };
 use crate::runtime::MemoryScope;
 use crate::sym::Analyzer;
+use crate::tirx::op::{
+    ABI_FIELD_GET, ASSUME_ALIGNED, DECL_TENSOR, HANDLE_ADD_BYTE_OFFSET, ISNULLPTR, REINTERPRET,
+};
 use crate::tirx::{TensorType, TensorTypeObj};
 
 // `TVMStructFieldKind` (`include/tvm/tirx/op/abi.h`).
@@ -103,18 +109,6 @@ pub(crate) fn text(value: &str) -> Result<StringImm> {
     StringImm::new(value)
 }
 
-/// How C++ streams a node (`ffi.ReprPrint`).
-pub(crate) fn repr<T>(value: &T) -> std::string::String
-where
-    for<'a> AnyView<'a>: From<&'a T>,
-{
-    tvm_ffi::cached_global_func!("ffi.ReprPrint")
-        .call_packed(&[AnyView::from(value)])
-        .and_then(String::try_from)
-        .map(|text| text.as_str().to_string())
-        .unwrap_or_default()
-}
-
 fn dtype_str(dtype: DLDataType) -> std::string::String {
     dtype.to_string().as_str().to_string()
 }
@@ -141,62 +135,37 @@ fn device_name(device_type: i64) -> Result<&'static str> {
         15 => "webgpu",
         16 => "hexagon",
         18 => "trn",
-        other => return Err(internal(&format!("unknown type = {other}"))),
+        other => tvm_ffi::bail!(INTERNAL_ERROR, "unknown type = {other}"),
     })
 }
 
 /// `APIType(t)` (`ir_utils.h`): the type a packed argument of type `t` travels as.
 fn api_type(ty: &PrimType) -> Result<PrimType> {
     let dtype = ty.dtype;
-    if dtype.code == 3 && dtype.bits == 0 && dtype.lanes == 0 {
-        let message =
-            "Check failed: (!t.IsVoid()) is false: Cannot pass void type through packed API.";
-        return Err(internal(message));
-    }
-    if dtype.lanes as i16 != 1 {
-        let message = format!(
-            "Check failed: t.lanes() == 1 ({} vs. 1) : Cannot pass vector type through packed API.",
-            dtype.lanes as i16
-        );
-        return Err(internal(&message));
-    }
+    let is_void = dtype.code == 3 && dtype.bits == 0 && dtype.lanes == 0;
+    check!(!is_void, INTERNAL_ERROR, "!t.IsVoid()", "Cannot pass void type through packed API.");
+    check_cmp!(
+        dtype.lanes as i16,
+        ==,
+        1,
+        INTERNAL_ERROR,
+        "t.lanes() == 1",
+        "Cannot pass vector type through packed API."
+    );
     match dtype.code {
         BOOL | UINT | INT => scalar(INT, 64),
         FLOAT | BFLOAT => scalar(FLOAT, 64),
-        _ => Err(internal(
-            "Check failed: (t.MatchesCode(DLDataTypeCode::kDLFloat, DLDataTypeCode::kDLBfloat)) is false: ",
+        _ => Err(error!(
+            INTERNAL_ERROR,
+            "Check failed: (t.MatchesCode(DLDataTypeCode::kDLFloat, DLDataTypeCode::kDLBfloat)) is \
+             false: "
         )),
     }
 }
 
-/// The ops the binder builds calls to.
-pub(crate) struct AbiOps {
-    pub abi_field_get: Op,
-    pub isnullptr: Op,
-    pub handle_add_byte_offset: Op,
-    pub if_then_else: Op,
-    pub reinterpret: Op,
-    pub decl_tensor: Op,
-    pub assume_aligned: Op,
-}
-
-impl AbiOps {
-    pub(crate) fn new() -> Result<Self> {
-        Ok(Self {
-            abi_field_get: Op::get("tirx.abi_field_get")?,
-            isnullptr: Op::get("tirx.isnullptr")?,
-            handle_add_byte_offset: Op::get("tirx.handle_add_byte_offset")?,
-            if_then_else: Op::get("prim.if_then_else")?,
-            reinterpret: Op::get("tirx.reinterpret")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
-            assume_aligned: Op::get("tirx.assume_aligned")?,
-        })
-    }
-}
-
 /// `Call(ty, op, args)`.
-fn call(ty: impl Into<Type>, op: &Op, args: Vec<Expr>) -> Result<Expr> {
-    Ok(Call::new(ty, op.clone(), args)?.into())
+fn call(ty: impl Into<Type>, op: &OpHandle, args: Vec<Expr>) -> Result<Expr> {
+    Ok(Call::new(ty, op.get()?, args)?.into())
 }
 
 /// One step of an `ffi::reflection::AccessPath`, from the root parameter array down.
@@ -253,7 +222,6 @@ pub(crate) struct AbiBinder {
     param_names: HashMap<i64, std::string::String>,
     when_calling: StringImm,
     signature: StringImm,
-    ops: AbiOps,
 }
 
 /// The tensor type of a tensor-typed variable (C++ `param.as<TensorVar>()`).
@@ -325,18 +293,13 @@ impl AbiBinder {
             param_names,
             when_calling: text(" when calling:\n  `")?,
             signature: text(&signature)?,
-            ops: AbiOps::new()?,
         };
         let num_args = params.len() as i64;
         let count = num_packed_args.equal(num_args).expr()?;
         let parts = binder.message(&["Expected ", &num_args.to_string(), " arguments"], &["`"])?;
         binder.emit_assert(count, "TypeError", parts)?;
         if num_args > 0 {
-            let null = call(
-                scalar(BOOL, 8)?,
-                &binder.ops.isnullptr,
-                vec![binder.packed_args.clone().into()],
-            )?;
+            let null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![binder.packed_args.clone().into()])?;
             let parts = binder.message(&["args pointer is NULL"], &["`"])?;
             binder.emit_assert((!Ex::from(null)).expr()?, "TypeError", parts)?;
         }
@@ -416,19 +379,17 @@ impl AbiBinder {
         path: &Path,
         with_lets: bool,
     ) -> Result<bool> {
-        if prim_dtype(arg)? != prim_dtype(value)? {
-            return Err(internal("Check failed: (arg.ty() == value.ty()) is false: "));
-        }
+        check!(prim_dtype(arg)? == prim_dtype(value)?, INTERNAL_ERROR, "arg.ty() == value.ty()");
         if arg.as_node::<VarObj>().is_none() {
             let condition = self.simplify(arg.equal(value))?;
             if is_const_int(&condition, 0) {
-                let message = format!(
+                tvm_ffi::bail!(
+                    INTERNAL_ERROR,
                     "Bind have an unmet assertion: {} == {} at {}",
                     repr(arg),
                     repr(value),
                     self.render(path)
                 );
-                return Err(internal(&message));
             }
             if !is_const_int(&condition, 1) {
                 self.pending.push(PendingAssert {
@@ -452,13 +413,13 @@ impl AbiBinder {
         let (previous, first_path) = (def.value.clone(), def.first_def_path.clone());
         let condition = self.simplify(previous.equal(value))?;
         if is_const_int(&condition, 0) {
-            let message = format!(
+            tvm_ffi::bail!(
+                INTERNAL_ERROR,
                 "Bind have an unmet assertion: {} == {} at {}",
                 repr(&previous),
                 repr(value),
                 self.render(path)
             );
-            return Err(internal(&message));
         }
         if !is_const_int(&condition, 1) {
             let (current, first) = (self.render(path), self.render(&first_path));
@@ -489,19 +450,11 @@ impl AbiBinder {
         path: &Path,
         with_lets: bool,
     ) -> Result<bool> {
-        let same_type: bool = tvm_ffi::cached_global_func!("ffi.StructuralEqual")
-            .call_packed(&[
-                AnyView::from(&arg.ty),
-                AnyView::from(&value.ty),
-                AnyView::from(&false),
-                AnyView::from(&false),
-            ])?
-            .try_into()?;
-        if !same_type {
-            return Err(internal(
-                "Check failed: (ffi::StructuralEqual()(arg->ty, value->ty)) is false: ",
-            ));
-        }
+        check!(
+            structural_equal(&arg.ty, &value.ty)?,
+            INTERNAL_ERROR,
+            "ffi::StructuralEqual()(arg->ty, value->ty)"
+        );
         let key = ObjectIdentity::of(arg);
         let Some(def) = self.var_defs.get(&key) else {
             self.var_defs
@@ -513,12 +466,12 @@ impl AbiBinder {
         };
         let (previous, first_path) = (def.value.clone(), def.first_def_path.clone());
         let uint64 = scalar(UINT, 64)?;
-        let previous = call(uint64.clone(), &self.ops.reinterpret, vec![previous])?;
-        let current = call(uint64, &self.ops.reinterpret, vec![value])?;
+        let previous = call(uint64.clone(), &REINTERPRET, vec![previous])?;
+        let current = call(uint64, &REINTERPRET, vec![value])?;
         let condition = self.simplify(previous.equal(&current))?;
         if is_const_int(&condition, 0) {
-            let message = format!("Bind has an unmet pointer assertion at {}", self.render(path));
-            return Err(internal(&message));
+            let at = self.render(path);
+            tvm_ffi::bail!(INTERNAL_ERROR, "Bind has an unmet pointer assertion at {at}");
         }
         if !is_const_int(&condition, 1) {
             let (current, first) = (self.render(path), self.render(&first_path));
@@ -613,21 +566,20 @@ impl AbiBinder {
         ];
         if let Ok(prim) = ty.clone().try_cast::<PrimType>() {
             let api = api_type(&prim)?;
-            let value = call(api.clone(), &self.ops.abi_field_get, args)?;
+            let value = call(api.clone(), &ABI_FIELD_GET, args)?;
             if api.dtype != prim.dtype {
                 return Ok(crate::prim::Cast::new(value, prim)?.into());
             }
             return Ok(value);
         }
-        if ty.as_node::<PtrTypeObj>().is_none() {
-            let message = format!(
-                "Check failed: (arg_type.as<PtrTypeNode>()) is false: Packed union values must have \
-                 primitive or pointer type, but got {}",
-                repr(ty)
-            );
-            return Err(Error::new(TYPE_ERROR, &message, ""));
-        }
-        call(ty.clone(), &self.ops.abi_field_get, args)
+        check!(
+            ty.as_node::<PtrTypeObj>().is_some(),
+            TYPE_ERROR,
+            "arg_type.as<PtrTypeNode>()",
+            "Packed union values must have primitive or pointer type, but got {}",
+            repr(ty)
+        );
+        call(ty.clone(), &ABI_FIELD_GET, args)
     }
 
     fn load_prim(&self, index: i64, ty: &PrimType) -> Result<Expr> {
@@ -649,11 +601,11 @@ impl AbiBinder {
         let value = self.load_union_value(index, &PtrType::void()?.into())?;
         let from_tensor = call(
             PtrType::void()?,
-            &self.ops.handle_add_byte_offset,
+            &HANDLE_ADD_BYTE_OFFSET,
             vec![value.clone(), i32_imm(OBJECT_CELL_OFFSET as i64)?],
         )?;
         let is_tensor = type_index.equal(TypeIndex::kTVMFFITensor as i32).expr()?;
-        call(PtrType::void()?, &self.ops.if_then_else, vec![is_tensor, from_tensor, value])
+        call(PtrType::void()?, &IF_THEN_ELSE, vec![is_tensor, from_tensor, value])
     }
 
     fn decode_bool(&mut self, index: i64, type_index: &Expr) -> Result<Expr> {
@@ -699,7 +651,7 @@ impl AbiBinder {
             i32_imm(index)?,
             i32_imm(FFI_ANY_TYPE_INDEX as i64)?,
         ];
-        let load = call(scalar(INT, 32)?, &self.ops.abi_field_get, args)?;
+        let load = call(scalar(INT, 32)?, &ABI_FIELD_GET, args)?;
         self.init_nest.push(Bind::new(type_index.clone().try_cast()?, load)?.into());
         let path = vec![Step::Item(index)];
         if param.ty.as_node::<TensorTypeObj>().is_some() {
@@ -711,7 +663,7 @@ impl AbiBinder {
         }
         if param.ty.as_node::<PtrTypeObj>().is_some() {
             let value = self.decode_opaque_handle(index, &type_index)?;
-            let pointer = call(param.ty.clone(), &self.ops.reinterpret, vec![value])?;
+            let pointer = call(param.ty.clone(), &REINTERPRET, vec![value])?;
             self.bind_pointer(&param, pointer, &path, true)?;
             return Ok(());
         }
@@ -720,11 +672,11 @@ impl AbiBinder {
             BOOL => self.decode_bool(index, &type_index)?,
             INT | UINT => self.decode_int(index, &type_index, &ty)?,
             FLOAT | BFLOAT => self.decode_float(index, &type_index, &ty)?,
-            _ => {
-                let condition =
-                    "dtype.MatchesCode(DLDataTypeCode::kDLFloat, DLDataTypeCode::kDLBfloat)";
-                return Err(internal(&format!("Check failed: ({condition}) is false: ")));
-            }
+            _ => tvm_ffi::bail!(
+                INTERNAL_ERROR,
+                "Check failed: (dtype.MatchesCode(DLDataTypeCode::kDLFloat, \
+                 DLDataTypeCode::kDLBfloat)) is false: "
+            ),
         };
         self.bind_scalar(&param.into(), &value, &path, true)?;
         Ok(())
@@ -746,7 +698,7 @@ impl AbiBinder {
             let ty: Type = tensor.clone().into();
             let declared = Call::new_full(
                 Some(ty.clone()),
-                self.ops.decl_tensor.clone().into(),
+                DECL_TENSOR.get()?.into(),
                 Array::new(vec![data]),
                 None,
                 Array::new(vec![ty]),
@@ -759,7 +711,7 @@ impl AbiBinder {
             }
             let alignment_args = vec![param.clone().into(), i32_imm(tensor.data_alignment as i64)?];
             let alignment: Stmt =
-                Evaluate::new(call(void()?, &self.ops.assume_aligned, alignment_args)?)?.into();
+                Evaluate::new(call(void()?, &ASSUME_ALIGNED, alignment_args)?)?.into();
             let aligned_storage =
                 self.simplify(size.not_equal(0).logical_and(self.direct_address()?))?;
             if is_const_int(&aligned_storage, 1) {
@@ -787,7 +739,7 @@ impl AbiBinder {
         let pointer_type = PtrType::new(scalar(INT, 64)?, MemoryScope::global()?)?;
         let ptr = Var::new(name, pointer_type.clone())?;
         let args = vec![handle.clone().into(), i32_imm(0)?, i32_imm(field as i64)?];
-        let load = call(pointer_type, &self.ops.abi_field_get, args)?;
+        let load = call(pointer_type, &ABI_FIELD_GET, args)?;
         self.init_nest.push(Bind::new(ptr.clone(), load)?.into());
         Ok(ptr)
     }
@@ -795,7 +747,7 @@ impl AbiBinder {
     /// `LoadInt64ArrayElem`: `ptr[index]` of a shape or strides array.
     fn load_element(&self, ptr: &Var, index: i64) -> Result<Expr> {
         let args = vec![ptr.clone().into(), i32_imm(index)?, i32_imm(INT64_ARRAY_ELEM as i64)?];
-        call(scalar(INT, 64)?, &self.ops.abi_field_get, args)
+        call(scalar(INT, 64)?, &ABI_FIELD_GET, args)
     }
 
     /// `BindCompactStrides`: without declared strides, given strides must be compact.
@@ -876,12 +828,12 @@ impl AbiBinder {
         };
 
         // Null pointer.
-        let null = call(scalar(BOOL, 8)?, &self.ops.isnullptr, vec![handle.clone().into()])?;
+        let null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![handle.clone().into()])?;
         self.emit_type_index_check(index, (!Ex::from(null)).expr()?, "Tensor")?;
 
         // ndim.
         let int32_ty = scalar(INT, 32)?;
-        let ndim = call(int32_ty.clone(), &self.ops.abi_field_get, field(DL_TENSOR_NDIM)?)?;
+        let ndim = call(int32_ty.clone(), &ABI_FIELD_GET, field(DL_TENSOR_NDIM)?)?;
         let rank = tensor.shape.len() as i64;
         let expected_ndim = Ex::from(int_imm(int32_ty.dtype, rank as i128)).equal(&ndim).expr()?;
         let parts = self.message(
@@ -893,11 +845,11 @@ impl AbiBinder {
         // dtype.
         let element = tensor.dtype.dtype;
         let (uint8, uint16) = (scalar(UINT, 8)?, scalar(UINT, 16)?);
-        let code = call(uint8.clone(), &self.ops.abi_field_get, field(DL_TENSOR_TYPE_CODE)?)?
+        let code = call(uint8.clone(), &ABI_FIELD_GET, field(DL_TENSOR_TYPE_CODE)?)?
             .equal(int_imm(uint8.dtype, element.code as i128)?);
-        let bits = call(uint8.clone(), &self.ops.abi_field_get, field(DL_TENSOR_TYPE_BITS)?)?
+        let bits = call(uint8.clone(), &ABI_FIELD_GET, field(DL_TENSOR_TYPE_BITS)?)?
             .equal(int_imm(uint8.dtype, element.bits as i128)?);
-        let lanes = call(uint16.clone(), &self.ops.abi_field_get, field(DL_TENSOR_TYPE_LANES)?)?
+        let lanes = call(uint16.clone(), &ABI_FIELD_GET, field(DL_TENSOR_TYPE_LANES)?)?
             .equal(int_imm(uint16.dtype, lanes_of(element)? as i128)?);
         let matches = code.logical_and(bits).logical_and(lanes).expr()?;
         let sub_byte =
@@ -925,8 +877,7 @@ impl AbiBinder {
         // strides.
         let strides_ptr =
             self.field_ptr(handle, DL_TENSOR_STRIDES, &format!("{arg_name}_strides"))?;
-        let strides_is_null =
-            call(scalar(BOOL, 8)?, &self.ops.isnullptr, vec![strides_ptr.clone().into()])?;
+        let strides_is_null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![strides_ptr.clone().into()])?;
         if tensor.strides.is_empty() {
             self.bind_compact_strides(tensor, &buf_name, &strides_ptr, &strides_is_null, path)?;
         } else {
@@ -941,25 +892,22 @@ impl AbiBinder {
             let expected: Expr =
                 crate::ops::big_int_imm(uint64.dtype, &offset.value * &BigInt::from(data_bytes))?
                     .into();
-            let actual =
-                call(uint64.clone(), &self.ops.abi_field_get, field(DL_TENSOR_BYTE_OFFSET)?)?;
+            let actual = call(uint64.clone(), &ABI_FIELD_GET, field(DL_TENSOR_BYTE_OFFSET)?)?;
             self.bind_scalar(&expected, &actual, &byte_offset_path, true)?;
         } else {
             let size = make_const(uint64.dtype, data_bytes)?;
-            let divisible =
-                call(uint64.clone(), &self.ops.abi_field_get, field(DL_TENSOR_BYTE_OFFSET)?)?
-                    .truncmod(&size)
-                    .equal(make_const(uint64.dtype, 0)?)
-                    .expr()?;
+            let divisible = call(uint64.clone(), &ABI_FIELD_GET, field(DL_TENSOR_BYTE_OFFSET)?)?
+                .truncmod(&size)
+                .equal(make_const(uint64.dtype, 0)?)
+                .expr()?;
             let parts =
                 Array::new(vec![text("Tensor byte offset must be divisible by its element size")?]);
             self.emit_assert(divisible, "ValueError", parts)?;
             let offset_ty: PrimType = tensor.elem_offset.ty.clone().try_cast()?;
-            let value =
-                call(uint64.clone(), &self.ops.abi_field_get, field(DL_TENSOR_BYTE_OFFSET)?)?
-                    .div(&size)
-                    .cast(&offset_ty)
-                    .expr()?;
+            let value = call(uint64.clone(), &ABI_FIELD_GET, field(DL_TENSOR_BYTE_OFFSET)?)?
+                .div(&size)
+                .cast(&offset_ty)
+                .expr()?;
             if self.bind_scalar(&tensor.elem_offset, &value, &byte_offset_path, true)?
                 && tensor.offset_factor > 1
             {
@@ -968,11 +916,8 @@ impl AbiBinder {
                 let zero = int_imm(offset_ty.dtype, 0)?;
                 let condition = self.simplify(offset.truncmod(&factor).equal(&zero))?;
                 if is_const_int(&condition, 0) {
-                    let message = format!(
-                        "Bind have an unmet assertion at {}",
-                        self.render(&byte_offset_path)
-                    );
-                    return Err(internal(&message));
+                    let at = self.render(&byte_offset_path);
+                    tvm_ffi::bail!(INTERNAL_ERROR, "Bind have an unmet assertion at {at}");
                 }
                 if !is_const_int(&condition, 1) {
                     let alignment = (tensor.offset_factor as i64 * data_bytes).to_string();
@@ -987,7 +932,7 @@ impl AbiBinder {
 
         // device.
         let actual_device_type =
-            call(int32_ty.clone(), &self.ops.abi_field_get, field(DL_TENSOR_DEVICE_TYPE)?)?;
+            call(int32_ty.clone(), &ABI_FIELD_GET, field(DL_TENSOR_DEVICE_TYPE)?)?;
         if let Some(device) = self.device_type.as_node::<IntImmObj>() {
             let device = device.value.to_i64().unwrap_or(0);
             let condition = self.simplify(Ex::from(i32_imm(device)?).equal(&actual_device_type))?;
@@ -1008,8 +953,7 @@ impl AbiBinder {
             )?;
         }
         let device_id = self.device_id.clone();
-        let actual_device_id =
-            call(int32_ty, &self.ops.abi_field_get, field(DL_TENSOR_DEVICE_ID)?)?;
+        let actual_device_id = call(int32_ty, &ABI_FIELD_GET, field(DL_TENSOR_DEVICE_ID)?)?;
         self.bind_scalar(
             &device_id,
             &actual_device_id,
@@ -1018,15 +962,15 @@ impl AbiBinder {
         )?;
 
         // data pointer.
-        let raw_data = call(PtrType::void()?, &self.ops.abi_field_get, field(DL_TENSOR_DATA)?)?;
+        let raw_data = call(PtrType::void()?, &ABI_FIELD_GET, field(DL_TENSOR_DATA)?)?;
         let data_ptr_type = tensor.data_ptr_type()?;
-        let typed_data = call(data_ptr_type, &self.ops.reinterpret, vec![raw_data])?;
+        let typed_data = call(data_ptr_type, &REINTERPRET, vec![raw_data])?;
         let mut alloc_size = Ex::from(int_imm(index_type(tensor)?.dtype, 1));
         for extent in tensor.shape.iter() {
             alloc_size *= extent;
         }
         let empty_alloc = alloc_size.equal(0).cast(scalar(BOOL, 8)?).expr()?;
-        let null = call(scalar(BOOL, 8)?, &self.ops.isnullptr, vec![typed_data.clone()])?;
+        let null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![typed_data.clone()])?;
         let non_null = Ex::from(&empty_alloc).logical_or(!Ex::from(null)).expr()?;
         let parts = self.message(
             &[&buf_name, " data pointer is NULL on argument #", &index_str],
@@ -1035,9 +979,8 @@ impl AbiBinder {
         self.asserts.push(AssertStmt::new(non_null, text("ValueError")?, parts)?.into());
         if tensor.data_alignment > 1 {
             let direct_address = self.direct_address()?;
-            let as_handle =
-                call(PtrType::void()?, &self.ops.reinterpret, vec![typed_data.clone()])?;
-            let as_int = call(uint64.clone(), &self.ops.reinterpret, vec![as_handle])?;
+            let as_handle = call(PtrType::void()?, &REINTERPRET, vec![typed_data.clone()])?;
+            let as_int = call(uint64.clone(), &REINTERPRET, vec![as_handle])?;
             let alignment = int_imm(uint64.dtype, tensor.data_alignment as i128)?;
             let aligned = as_int.truncmod(alignment).equal(int_imm(uint64.dtype, 0)?);
             let condition = Ex::from(&empty_alloc)
@@ -1074,9 +1017,10 @@ fn prim_var_name(expr: &Expr) -> Option<std::string::String> {
 /// `PrimType::lanes()`, which a scalable vector has none of.
 fn lanes_of(dtype: DLDataType) -> Result<i64> {
     match dtype.lanes as i16 {
-        lanes if lanes < 0 => {
-            Err(internal("Can't fetch the lanes of a scalable vector at a compile time."))
-        }
+        lanes if lanes < 0 => Err(error!(
+            INTERNAL_ERROR,
+            "Can't fetch the lanes of a scalable vector at a compile time."
+        )),
         lanes => Ok(lanes as i64),
     }
 }

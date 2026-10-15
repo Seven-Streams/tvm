@@ -37,20 +37,22 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    match_any, Any, Array, MutContextPolicy, MutateContext, MutateValue, ObjectIdentity,
-    ObjectRefCast, ObjectRefCore, Result, UnchangedOr,
+    bail, match_any, Any, Array, MutContextPolicy, MutateContext, MutateValue, ObjectIdentity,
+    ObjectRefCast, ObjectRefCore, Result, UnchangedOr, INTERNAL_ERROR, TYPE_ERROR,
 };
 
 use super::util::ContextExt;
 use crate::ir::{
-    Bind, Call, Expr, For, If, Op, PrimType, PrimTypeObj, RegionStmt, SeqStmt, TensorLoad,
-    TensorStore, Type, Var,
+    Bind, Call, Expr, For, If, PrimType, PrimTypeObj, RegionStmt, SeqStmt, TensorLoad, TensorStore,
+    Type, Var,
 };
 use crate::ops::{make_const, Ex, PrimOps};
+use crate::prim::op::{CLZ, IF_THEN_ELSE, POW};
 use crate::prim::{
     Add, BitwiseAnd, BitwiseNot, BitwiseOr, BitwiseXor, Broadcast, Div, FloorDiv, FloorMod, LShift,
     Let, Max, Min, Mod, Mul, RShift, Ramp, Select, Shuffle, Sub, EQ, GE, GT, LE, LT, NE,
 };
+use crate::tirx::op::LAUNCH_THREAD;
 use crate::tirx::{TensorType, TensorTypeObj};
 use tvm_ffi::{DLDataType, DLDataTypeExt};
 
@@ -68,26 +70,18 @@ pub struct DataTypeRewriterBase {
     pub clamp_shift_amounts: bool,
     /// The `VarRemapSet` substitutions, by the replaced variable.
     pub remap: HashMap<ObjectIdentity, Var>,
-    launch_thread: Op,
-    if_then_else: Op,
-    pow: Op,
-    clz: Op,
 }
 
 impl DataTypeRewriterBase {
     /// The members of `IndexDataTypeRewriter` (`index`) or `DataTypeLegalizer`.
-    pub fn new(index: bool) -> Result<Self> {
-        Ok(Self {
+    pub fn new(index: bool) -> Self {
+        Self {
             index,
             is_enabled: false,
             is_condition: false,
             clamp_shift_amounts: false,
             remap: HashMap::new(),
-            launch_thread: Op::get("tirx.launch_thread")?,
-            if_then_else: Op::get("prim.if_then_else")?,
-            pow: Op::get("prim.pow")?,
-            clz: Op::get("prim.clz")?,
-        })
+        }
     }
 
     /// `VarRemapSet(var, replacement)`.
@@ -152,7 +146,7 @@ fn rewrite<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, value: Any) -> Rewritt
             RegionStmt(op) => {
                 let base = ctx.state_mut().base();
                 let enabled = base.is_enabled;
-                if index && op.op.same_as(&base.launch_thread) {
+                if index && LAUNCH_THREAD.is(&op.op) {
                     base.is_enabled = true;
                 }
                 let result = legalize_region(ctx, op);
@@ -165,7 +159,7 @@ fn rewrite<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, value: Any) -> Rewritt
             For(op) => if index { index_for(ctx, op) } else { legalize_for(ctx, op) },
             Bind(op) => if index { index_bind(ctx, op) } else { legalize_bind(ctx, op) },
             Call(op) => {
-                if index && op.op.same_as(&ctx.state_mut().base().if_then_else) {
+                if index && IF_THEN_ELSE.is(&op.op) {
                     index_if_then_else(ctx, op)
                 } else {
                     legalize_call(ctx, op)
@@ -228,7 +222,7 @@ pub fn copy_with_type(var: &Var, ty: impl Into<Type>) -> Var {
 pub fn tensor_dtype(tensor: &Expr) -> Result<PrimType> {
     match tensor.ty.as_node::<TensorTypeObj>() {
         Some(ty) => Ok(ty.dtype.clone()),
-        None => Err(tvm_ffi::Error::new(tvm_ffi::TYPE_ERROR, "expected a tensor variable", "")),
+        None => bail!(TYPE_ERROR, "expected a tensor variable"),
     }
 }
 
@@ -242,9 +236,8 @@ fn cast(value: Expr, ty: &PrimType) -> Result<Expr> {
 /// A launched thread's extent takes the type of its thread variable.
 fn legalize_region<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: RegionStmt) -> Rewritten {
     let result = ctx.default_mutate(&op)?;
-    let launch_thread = ctx.state_mut().base().launch_thread.clone();
     let Ok(region) = RegionStmt::try_from(result.clone()) else { return changed(result) };
-    if !region.op.same_as(&launch_thread) {
+    if !LAUNCH_THREAD.is(&region.op) {
         return changed(result);
     }
     let var: Expr = region.body_params.get(0)?.into();
@@ -352,11 +345,12 @@ fn legalize_ramp<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Ramp) -> Rew
     if base.same_as(&op.base_) && stride.same_as(&op.stride) && base_ty.dtype == stride_ty.dtype {
         return unchanged();
     }
-    if base_ty.dtype.code != DL_INT || stride_ty.dtype.code != DL_INT {
-        let message = "Check failed: (base_dtype.MatchesCode(DLDataTypeCode::kDLInt) && \
-                       stride_dtype.MatchesCode(DLDataTypeCode::kDLInt)) is false: ";
-        return Err(tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, message, ""));
-    }
+    check!(
+        base_ty.dtype.code == DL_INT && stride_ty.dtype.code == DL_INT,
+        INTERNAL_ERROR,
+        "base_dtype.MatchesCode(DLDataTypeCode::kDLInt) && \
+         stride_dtype.MatchesCode(DLDataTypeCode::kDLInt)"
+    );
     let (base, stride) = widen(base, stride)?;
     changed(Ramp::new(base, stride, op.lanes.clone())?)
 }
@@ -456,11 +450,10 @@ fn legalize_call<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, before: Call) ->
     if call.ty.as_node::<PrimTypeObj>().is_none() {
         return changed(result);
     }
-    let base = ctx.state_mut().base();
-    if call.op.same_as(&base.pow) {
+    if POW.is(&call.op) {
         return changed(call.args.get(0)?.pow(call.args.get(1)?).expr()?);
     }
-    if call.op.same_as(&base.if_then_else) {
+    if IF_THEN_ELSE.is(&call.op) {
         let ty = prim_ty(&call.clone().into())?;
         let args = Array::new(vec![call.args.get(0)?, call.args.get(1)?, call.args.get(2)?]);
         let rebuilt = Call::new_full(
@@ -473,16 +466,16 @@ fn legalize_call<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, before: Call) ->
         )?;
         return changed(rebuilt);
     }
-    if call.op.same_as(&base.clz) {
+    if CLZ.is(&call.op) {
         let before_dtype = dtype(&before.args.get(0)?)?;
         let after_dtype = dtype(&call.args.get(0)?)?;
         for (when, d) in [("before", before_dtype), ("after", after_dtype)] {
             if !(matches!(d.code, 0 | 1) && matches!(d.bits, 32 | 64)) {
-                let message = format!(
+                bail!(
+                    INTERNAL_ERROR,
                     "clz only supports 32 or 64 bit integer types, but get type {when} legalizing: {}",
                     d.to_string().as_str()
                 );
-                return Err(tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, &message, ""));
             }
         }
         let e: Expr = call.into();

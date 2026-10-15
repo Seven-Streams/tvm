@@ -23,28 +23,35 @@
 //!
 //! The C++ `VecAllocAccess` and `SkipVectorize` are not used by the pass and are not ported.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use tvm_ffi::{
     dispatch, structural_map, structural_mutate, structural_walk, Any, AnyView, Array, BigInt,
-    DLDataType, DLDataTypeCode, DLDataTypeExt, DefRegionKind, Error, Function as FfiFunction, Map,
-    Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String, UnchangedOr, WalkOrder,
-    WalkResult,
+    DLDataType, DLDataTypeCode, DLDataTypeExt, DefRegionKind, Error, Map, Mutator, ObjectIdentity,
+    ObjectRefCast, ObjectRefCore, Result, String, UnchangedOr, WalkOrder, WalkResult,
+    INTERNAL_ERROR,
 };
 
-use super::util::{MutatorExt, function_pass, get_attr, internal};
+use super::util::{MutatorExt, function_pass, get_attr};
 use crate::ir::{
     Bind, Call, Evaluate, Expr, For, GlobalVar, If, IntImmObj, Op, OpAttrMap, OpaqueExpr, PrimType,
     PrimTypeObj, SeqStmt, Stmt, TensorLoad, TensorRegion, TensorStore, Tuple, TupleGetItem, Var,
     While,
 };
-use crate::ops::{int32, int_imm, make_const, prim_dtype, prim_type, unknown_loc, Ex, PrimOps};
+use crate::ops::{
+    deep_equal, int32, int_imm, make_const, prim_dtype, prim_type, repr, structural_equal,
+    unknown_loc, Ex, PrimOps,
+};
+use crate::prim::op::{IF_THEN_ELSE, VSCALE};
 use crate::prim::{
     Broadcast, BroadcastObj, Cast, FloorModObj, Let, Mul, Ramp, RampObj, Select, Shuffle, LTObj,
 };
 use crate::sym::Analyzer;
 use crate::target::Target;
+use crate::tirx::op::{
+    CALL_LLVM_PURE_INTRIN, GET_ACTIVE_LANE_MASK, MASKED_LOAD, MASKED_STORE, OPENCL_TEXTURE2D_LOAD,
+    OPENCL_TEXTURE2D_STORE, REINTERPRET,
+};
 use crate::tirx::TensorTypeObj;
 use crate::transform::{Pass, PassContext};
 
@@ -57,11 +64,6 @@ const FLOAT4_E2M1FN: u8 = DLDataTypeCode::kDLFloat4_e2m1fn as u8;
 
 // ---------------------------------------------------------------------------------------------
 // Types and shared helpers
-
-/// The error of a failed C++ `TVM_FFI_ICHECK`.
-fn check_failed(condition: &str, message: &str) -> Error {
-    internal(&format!("Check failed: ({condition}) is false: {message}"))
-}
 
 /// The lanes as C++ `PrimType` stores them: a scalable vector stores minus its vscale factor.
 fn encoded_lanes(dtype: DLDataType) -> i16 {
@@ -87,9 +89,10 @@ fn is_scalar(dtype: DLDataType) -> bool {
 /// C++ `PrimType::lanes()`, which a scalable vector has none of at compile time.
 fn lanes(dtype: DLDataType) -> Result<i32> {
     match encoded_lanes(dtype) {
-        lanes if lanes < 0 => {
-            Err(internal("Can't fetch the lanes of a scalable vector at a compile time."))
-        }
+        lanes if lanes < 0 => Err(error!(
+            INTERNAL_ERROR,
+            "Can't fetch the lanes of a scalable vector at a compile time."
+        )),
         lanes => Ok(lanes as i32),
     }
 }
@@ -108,30 +111,6 @@ fn with_lanes(dtype: DLDataType, lanes: i32, scalable: bool) -> DLDataType {
     DLDataType { lanes: encoded as i16 as u16, ..dtype }
 }
 
-thread_local! {
-    static GLOBALS: RefCell<HashMap<&'static str, FfiFunction>> = RefCell::new(HashMap::new());
-}
-
-/// `Op::Get(name)`, fetched once per thread as C++ keeps it in a `static`.
-fn op(name: &'static str) -> Result<Op> {
-    crate::ir::cached_op(name)
-}
-
-/// A global function, fetched once per thread.
-fn global(name: &'static str) -> Result<FfiFunction> {
-    if let Some(function) = GLOBALS.with(|globals| globals.borrow().get(name).cloned()) {
-        return Ok(function);
-    }
-    let function = FfiFunction::get_global(name)?;
-    GLOBALS.with(|globals| globals.borrow_mut().insert(name, function.clone()));
-    Ok(function)
-}
-
-/// The raw C++ constructor `prim::<Node>(a, b, loc)`, through its global `prim.<Node>`.
-fn raw_binary(name: &'static str, a: Expr, b: Expr, loc: &crate::ir::Location) -> Result<Expr> {
-    global(name)?.call_tuple((a, b, loc.clone()))?.try_into()
-}
-
 /// `Call(ty, op, args, attrs, ty_args, loc)`.
 fn call(
     ty: impl Into<crate::ir::Type>,
@@ -145,26 +124,15 @@ fn call(
     Ok(Call::new_full(Some(ty.into()), op, args, attrs, ty_args, loc)?.into())
 }
 
-/// `ffi::StructuralEqual()(lhs, rhs)`.
-fn structural_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
-    global("ffi.StructuralEqual")?
-        .call_packed(&[
-            AnyView::from(lhs),
-            AnyView::from(rhs),
-            AnyView::from(&false),
-            AnyView::from(&false),
-        ])?
-        .try_into()
-}
-
 /// `IsConstInt(x, value)`.
 fn is_const_int(x: &Expr, value: i64) -> bool {
     x.as_node::<IntImmObj>().is_some_and(|imm| imm.value == BigInt::from(value))
 }
 
 fn int_value(x: &Expr) -> Result<i64> {
-    let imm = x.as_node::<IntImmObj>().ok_or_else(|| internal("expected an IntImm"))?;
-    imm.value.to_i64().ok_or_else(|| internal("IntImm out of range"))
+    let imm =
+        x.as_node::<IntImmObj>().ok_or_else(|| error!(INTERNAL_ERROR, "expected an IntImm"))?;
+    imm.value.to_i64().ok_or_else(|| error!(INTERNAL_ERROR, "IntImm out of range"))
 }
 
 /// `CreateNewLanes`: `vscale() * n` for a scalable vector, `n` otherwise.
@@ -172,7 +140,7 @@ fn create_new_lanes(scalable: bool, lanes: i32) -> Result<Expr> {
     if scalable {
         let vscale = call(
             prim_type(int32_dtype())?,
-            op("prim.vscale")?.into(),
+            VSCALE.get()?.into(),
             vec![],
             None,
             Array::new(vec![]),
@@ -195,12 +163,12 @@ fn broadcast_to(e: Expr, lanes: i32, scalable: bool) -> Result<Expr> {
     }
     if let Some(broadcast) = e.as_node::<BroadcastObj>() {
         let broadcast_dtype = prim_dtype(&e)?;
-        if is_scalable(broadcast_dtype) != scalable {
-            return Err(check_failed(
-                "op->ty.as_or_throw<PrimType>().IsScalableVector() == is_scalable",
-                "Can't broadcast between scalable and fixed length vectors.",
-            ));
-        }
+        check!(
+            is_scalable(broadcast_dtype) == scalable,
+            INTERNAL_ERROR,
+            "op->ty.as_or_throw<PrimType>().IsScalableVector() == is_scalable",
+            "Can't broadcast between scalable and fixed length vectors.",
+        );
         let e_lanes = lanes_or_factor(broadcast_dtype)?;
         if lanes % e_lanes == 0 {
             return Ok(Broadcast::new(
@@ -210,24 +178,24 @@ fn broadcast_to(e: Expr, lanes: i32, scalable: bool) -> Result<Expr> {
             .into());
         }
     }
-    if !is_scalar(dtype) {
-        let message = format!(
-            "Cannot broadcast lanes={} is_scalable={} to {lanes}",
-            lanes_or_factor(dtype)?,
-            is_scalable(dtype) as i32
-        );
-        return Err(check_failed("e.ty().IsScalar()", &message));
-    }
+    check!(
+        is_scalar(dtype),
+        INTERNAL_ERROR,
+        "e.ty().IsScalar()",
+        "Cannot broadcast lanes={} is_scalable={} to {}",
+        lanes_or_factor(dtype)?,
+        is_scalable(dtype) as i32,
+        lanes,
+    );
     Ok(Broadcast::new(e, create_new_lanes(scalable, lanes)?)?.into())
 }
 
 /// `TargetHasRVV`: the target has the RISC-V vector extension.
 fn target_has_rvv(target: &Option<Target>) -> Result<bool> {
-    let Some(target) = target else { return Ok(false) };
-    let Ok(has_feature) = FfiFunction::get_global("codegen.target_has_feature") else {
-        return Ok(false);
-    };
-    has_feature.call_tuple((String::from("v"), target.clone()))?.try_into()
+    match target {
+        Some(target) => target.has_llvm_feature("v"),
+        None => Ok(false),
+    }
 }
 
 /// `TargetHasVLA`: AArch64 SVE or RISC-V V.
@@ -278,10 +246,9 @@ fn contains_call(stmt: &Stmt) -> Result<bool> {
 
 /// `IsVScaleCall` anywhere in `expr`.
 fn contains_vscale(expr: &Expr) -> Result<bool> {
-    let vscale = op("prim.vscale")?;
     let found = structural_walk(
         expr,
-        |call: Call| match call.op.same_as(&vscale) && call.ty.as_node::<PrimTypeObj>().is_some() {
+        |call: Call| match VSCALE.is(&call.op) && call.ty.as_node::<PrimTypeObj>().is_some() {
             true => WalkResult::Interrupt,
             false => WalkResult::Advance,
         },
@@ -340,11 +307,10 @@ impl TryPredicateTensorAccesses {
 
     fn mutate_call(&mut self, original: Call, m: &mut Mutator) -> Result<Any> {
         let call: Call = m.default_mutate_as(self, &original)?;
-        let (masked_load, masked_store) = (op("tirx.masked_load")?, op("tirx.masked_store")?);
-        if !call.op.same_as(&masked_load) && !call.op.same_as(&masked_store) {
+        if !MASKED_LOAD.is(&call.op) && !MASKED_STORE.is(&call.op) {
             return Ok(call.into());
         }
-        let is_load = call.op.same_as(&masked_load);
+        let is_load = MASKED_LOAD.is(&call.op);
         let args: Vec<Expr> = call.args.iter().collect();
         let first = if is_load { 1 } else { 2 };
         let indices: Vec<Expr> = args.iter().take(args.len() - 1).skip(first).cloned().collect();
@@ -427,7 +393,7 @@ impl TryPredicateTensorAccesses {
         );
         let mask = call(
             prim_type(mask_dtype)?,
-            op("tirx.get_active_lane_mask")?.into(),
+            GET_ACTIVE_LANE_MASK.get()?.into(),
             vec![base, limit],
             None,
             Array::new(vec![]),
@@ -445,7 +411,7 @@ impl TryPredicateTensorAccesses {
         args.push(mask);
         let masked = call(
             load.ty.clone(),
-            op("tirx.masked_load")?.into(),
+            MASKED_LOAD.get()?.into(),
             args,
             None,
             Array::new(vec![]),
@@ -463,7 +429,7 @@ impl TryPredicateTensorAccesses {
         let void = prim_type(DLDataType::try_from_str("void")?)?;
         let masked = call(
             void,
-            op("tirx.masked_store")?.into(),
+            MASKED_STORE.get()?.into(),
             args,
             None,
             Array::new(vec![]),
@@ -547,11 +513,13 @@ impl Vectorizer {
         }
         let (a_dtype, b_dtype) = (prim_dtype(&a)?, prim_dtype(&b)?);
         let (vector_a, vector_b) = (is_vector(a_dtype), is_vector(b_dtype));
-        if vector_a && vector_b && is_scalable(a_dtype) != is_scalable(b_dtype) {
-            return Err(check_failed(
+        if vector_a && vector_b {
+            check!(
+                is_scalable(a_dtype) == is_scalable(b_dtype),
+                INTERNAL_ERROR,
                 "a.ty().IsScalableVector() == b.ty().IsScalableVector()",
                 "Fixed length and scalable vectors can't be mixed in multiplication.",
-            ));
+            );
         }
         if vector_a || vector_b {
             if let Some(ramp) = a.as_node::<RampObj>() {
@@ -574,90 +542,174 @@ impl Vectorizer {
             return Ok(Mul::new(a, b)?.into());
         }
         // C++ falls back to `BinaryVec<Mul>`, which visits both operands again.
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.Mul", m)
+        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), Mul::new_full, m)
     }
 
     fn mutate_div(&mut self, op: crate::prim::Div, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.Div", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::Div::new_full,
+            m,
+        )
     }
 
     fn mutate_mod(&mut self, op: crate::prim::Mod, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.Mod", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::Mod::new_full,
+            m,
+        )
     }
 
     fn mutate_floordiv(&mut self, op: crate::prim::FloorDiv, m: &mut Mutator) -> Result<Any> {
         let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, "prim.FloorDiv", m)
+        self.binary(op.into(), a, b, loc, crate::prim::FloorDiv::new_full, m)
     }
 
     fn mutate_floormod(&mut self, op: crate::prim::FloorMod, m: &mut Mutator) -> Result<Any> {
         let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, "prim.FloorMod", m)
+        self.binary(op.into(), a, b, loc, crate::prim::FloorMod::new_full, m)
     }
 
     fn mutate_min(&mut self, op: crate::prim::Min, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.Min", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::Min::new_full,
+            m,
+        )
     }
 
     fn mutate_max(&mut self, op: crate::prim::Max, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.Max", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::Max::new_full,
+            m,
+        )
     }
 
     fn mutate_eq(&mut self, op: crate::prim::EQ, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.EQ", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::EQ::new_full,
+            m,
+        )
     }
 
     fn mutate_ne(&mut self, op: crate::prim::NE, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.NE", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::NE::new_full,
+            m,
+        )
     }
 
     fn mutate_lt(&mut self, op: crate::prim::LT, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.LT", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::LT::new_full,
+            m,
+        )
     }
 
     fn mutate_le(&mut self, op: crate::prim::LE, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.LE", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::LE::new_full,
+            m,
+        )
     }
 
     fn mutate_gt(&mut self, op: crate::prim::GT, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.GT", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::GT::new_full,
+            m,
+        )
     }
 
     fn mutate_ge(&mut self, op: crate::prim::GE, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.GE", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::GE::new_full,
+            m,
+        )
     }
 
     fn mutate_and(&mut self, op: crate::prim::And, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.And", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::And::new_full,
+            m,
+        )
     }
 
     fn mutate_or(&mut self, op: crate::prim::Or, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), "prim.Or", m)
+        self.binary(
+            op.clone().into(),
+            op.a.clone(),
+            op.b.clone(),
+            op.loc.clone(),
+            crate::prim::Or::new_full,
+            m,
+        )
     }
 
     fn mutate_lshift(&mut self, op: crate::prim::LShift, m: &mut Mutator) -> Result<Any> {
         let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, "prim.LShift", m)
+        self.binary(op.into(), a, b, loc, crate::prim::LShift::new_full, m)
     }
 
     fn mutate_rshift(&mut self, op: crate::prim::RShift, m: &mut Mutator) -> Result<Any> {
         let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, "prim.RShift", m)
+        self.binary(op.into(), a, b, loc, crate::prim::RShift::new_full, m)
     }
 
     fn mutate_bitwise_and(&mut self, op: crate::prim::BitwiseAnd, m: &mut Mutator) -> Result<Any> {
         let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, "prim.BitwiseAnd", m)
+        self.binary(op.into(), a, b, loc, crate::prim::BitwiseAnd::new_full, m)
     }
 
     fn mutate_bitwise_or(&mut self, op: crate::prim::BitwiseOr, m: &mut Mutator) -> Result<Any> {
         let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, "prim.BitwiseOr", m)
+        self.binary(op.into(), a, b, loc, crate::prim::BitwiseOr::new_full, m)
     }
 
     fn mutate_bitwise_xor(&mut self, op: crate::prim::BitwiseXor, m: &mut Mutator) -> Result<Any> {
         let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, "prim.BitwiseXor", m)
+        self.binary(op.into(), a, b, loc, crate::prim::BitwiseXor::new_full, m)
     }
 
     fn mutate_bitwise_not(&mut self, op: crate::prim::BitwiseNot, m: &mut Mutator) -> Result<Any> {
@@ -682,28 +734,28 @@ impl Vectorizer {
         let base: Expr = m.mutate_as(self, &op.base_)?;
         let stride: Expr = m.mutate_as(self, &op.stride)?;
         let (base_dtype, stride_dtype) = (prim_dtype(&base)?, prim_dtype(&stride)?);
-        if is_scalable(base_dtype) {
-            return Err(check_failed(
-                "!base.ty().IsScalableVector()",
-                "Creating scalable vectors from existing vectors is not supported.",
-            ));
-        }
-        if is_scalable(stride_dtype) {
-            return Err(check_failed(
-                "!stride.ty().IsScalableVector()",
-                "Ramp stride with scalable dtype is not supported",
-            ));
-        }
+        check!(
+            !is_scalable(base_dtype),
+            INTERNAL_ERROR,
+            "!base.ty().IsScalableVector()",
+            "Creating scalable vectors from existing vectors is not supported.",
+        );
+        check!(
+            !is_scalable(stride_dtype),
+            INTERNAL_ERROR,
+            "!stride.ty().IsScalableVector()",
+            "Ramp stride with scalable dtype is not supported",
+        );
         if is_fixed_vector(base_dtype) && is_scalar(stride_dtype) {
-            if op.lanes.as_node::<IntImmObj>().is_none() {
-                return Err(check_failed(
-                    "op->lanes->IsInstance<IntImmNode>()",
-                    "Vectorizing over existing scalable vectors is not supported.",
-                ));
-            }
+            check!(
+                op.lanes.as_node::<IntImmObj>().is_some(),
+                INTERNAL_ERROR,
+                "op->lanes->IsInstance<IntImmNode>()",
+                "Vectorizing over existing scalable vectors is not supported.",
+            );
             let base_ramp = base
                 .as_node::<RampObj>()
-                .ok_or_else(|| internal("a vector ramp base must be a Ramp"))?;
+                .ok_or_else(|| error!(INTERNAL_ERROR, "a vector ramp base must be a Ramp"))?;
             let op_lanes = int_value(&op.lanes)?;
             let base_ramp_lanes = int_value(&base_ramp.lanes)?;
             let step = make_const(stride_dtype, base_ramp_lanes)?;
@@ -794,16 +846,16 @@ impl Vectorizer {
             )?;
             return Ok(call.into());
         };
-        if is_op(&op.op, &op_lookup("prim.if_then_else")?) {
+        if IF_THEN_ELSE.is(&op.op) {
             return self.if_then_else(op, m);
         }
-        if is_op(&op.op, &op_lookup("tirx.opencl.texture2d_load")?) {
+        if OPENCL_TEXTURE2D_LOAD.is(&op.op) {
             return self.texture_load(op, ret, m);
         }
-        if is_op(&op.op, &op_lookup("tirx.opencl.texture2d_store")?) {
+        if OPENCL_TEXTURE2D_STORE.is(&op.op) {
             return self.texture_store(op, m);
         }
-        if is_op(&op.op, &op_lookup("tirx.reinterpret")?) {
+        if REINTERPRET.is(&op.op) {
             return self.reinterpret(op, m);
         }
         let vectorizable = match op.op.as_node::<crate::ir::OpObj>() {
@@ -834,7 +886,7 @@ impl Vectorizer {
         }
         let mut lanes = 0;
         let args: Vec<Expr> = op.args.iter().collect();
-        let new_args = if is_op(&op.op, &op_lookup("tirx.call_llvm_pure_intrin")?) {
+        let new_args = if CALL_LLVM_PURE_INTRIN.is(&op.op) {
             let (updated, _) = self.mutate_call_args(&args[1..], &mut lanes, m)?;
             std::iter::once(args[0].clone()).chain(updated).collect()
         } else {
@@ -868,12 +920,12 @@ impl Vectorizer {
         let value: Expr = m.mutate_as(self, &op.value)?;
         let key = ObjectIdentity::of(&op.var);
         if let Some(mapped) = self.remap.get(&key) {
-            if !deep_equal(mapped, &value)? {
-                return Err(check_failed(
-                    "deep_equal_(mapped.as_or_throw<PrimExpr>(), value)",
-                    "Let cannot bind the same var to two different values",
-                ));
-            }
+            check!(
+                deep_equal(mapped, &value)?,
+                INTERNAL_ERROR,
+                "deep_equal_(mapped.as_or_throw<PrimExpr>(), value)",
+                "Let cannot bind the same var to two different values",
+            );
         }
         if lanes_or_factor(prim_dtype(&value)?)? != lanes_or_factor(prim_dtype(&op.value)?)? {
             let new_var = Var::new(op.var.name.clone(), value.ty.clone())?;
@@ -890,18 +942,15 @@ impl Vectorizer {
     }
 
     fn mutate_shuffle(&mut self, op: Shuffle, m: &mut Mutator) -> Result<Any> {
-        if op.vectors.len() != 1 || op.indices.len() != 1 {
-            let message = format!(
-                "Cannot vectorize ShuffleNode with multiple vectors or indices: the vector size is \
-                 {} and the index size is {}",
-                op.vectors.len(),
-                op.indices.len()
-            );
-            return Err(check_failed(
-                "op->vectors.size() == 1 && op->indices.size() == 1",
-                &message,
-            ));
-        }
+        check!(
+            op.vectors.len() == 1 && op.indices.len() == 1,
+            INTERNAL_ERROR,
+            "op->vectors.size() == 1 && op->indices.size() == 1",
+            "Cannot vectorize ShuffleNode with multiple vectors or indices: the vector size is {} \
+             and the index size is {}",
+            op.vectors.len(),
+            op.indices.len(),
+        );
         let vectors: Vec<Expr> = op.vectors.iter().collect();
         let indices: Vec<Expr> = op.indices.iter().collect();
         let (_, vectors_changed) = self.mutate_array(&vectors, &mut 0, m)?;
@@ -912,9 +961,11 @@ impl Vectorizer {
         let var_lanes = int_value(&self.var_lanes)?;
         let vector_lanes = lanes(prim_dtype(&vectors[0])?)? as i64;
         let new_vec_length = var_lanes / vector_lanes;
-        if !shuffle_index_matches(&new_indices[0], var_lanes, vector_lanes) {
-            return Err(check_failed("f_check_index(updated_index)", ""));
-        }
+        check!(
+            shuffle_index_matches(&new_indices[0], var_lanes, vector_lanes),
+            INTERNAL_ERROR,
+            "f_check_index(updated_index)",
+        );
         if new_vec_length == 1 {
             let zero: Expr = int_imm(prim_dtype(&Expr::from(self.var.clone()))?, 0)?.into();
             let var = self.var.clone();
@@ -951,7 +1002,7 @@ impl Vectorizer {
     fn mutate_while(&mut self, op: While) -> Result<Any> {
         let original: Stmt = op.into();
         self.statement(original, |_| {
-            Err(internal("A while loop inside a vectorized loop not supported."))
+            Err(error!(INTERNAL_ERROR, "A while loop inside a vectorized loop not supported."))
         })
     }
 
@@ -971,45 +1022,17 @@ impl Vectorizer {
     }
 }
 
-/// How C++ prints a node in an error message (`ffi.ReprPrint`).
-fn repr<T>(value: &T) -> std::string::String
-where
-    for<'a> AnyView<'a>: From<&'a T>,
-{
-    tvm_ffi::cached_global_func!("ffi.ReprPrint")
-        .call_packed(&[AnyView::from(value)])
-        .and_then(String::try_from)
-        .map(|text| text.as_str().to_string())
-        .unwrap_or_default()
-}
-
 /// The error a C++ `Vectorizer` raises for a node it has no rule for.
 fn no_default<T>(node: &T) -> Error
 where
     for<'a> AnyView<'a>: From<&'a T>,
 {
     let key = crate::ops::type_key(AnyView::from(node).type_index());
-    internal(&format!("Do not have a default for {key}"))
-}
-
-/// An `Op` that may not be registered in this build (the OpenCL texture ops); `None` matches
-/// no callee.
-fn op_lookup(name: &'static str) -> Result<Option<Op>> {
-    Ok(op(name).ok())
-}
-
-/// Whether `callee` is the operator `op`.
-fn is_op(callee: &Expr, op: &Option<Op>) -> bool {
-    op.as_ref().is_some_and(|op| callee.same_as(op))
+    error!(INTERNAL_ERROR, "Do not have a default for {key}")
 }
 
 fn is_prim_vector(expr: &Expr) -> bool {
     expr.ty.as_node::<PrimTypeObj>().is_some_and(|ty| is_vector(ty.dtype))
-}
-
-/// `ExprDeepEqual()(lhs, rhs)`.
-fn deep_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
-    global("prim.expr_deep_equal")?.call_tuple((lhs.clone(), rhs.clone()))?.try_into()
 }
 
 /// The index patterns C++ accepts for a vectorized `Shuffle`: `Ramp(0, 1, lanes)`, or
@@ -1042,7 +1065,7 @@ impl Vectorizer {
         context: PassContext,
     ) -> Result<Self> {
         let vectorizable = Op::attr_map::<bool>("TVectorizable")?
-            .ok_or_else(|| internal("Attribute 'TVectorizable' is not registered"))?;
+            .ok_or_else(|| error!(INTERNAL_ERROR, "Attribute 'TVectorizable' is not registered"))?;
         let dtype = prim_dtype(&Expr::from(var.clone()))?;
         let ramp: Expr =
             Ramp::new(int_imm(dtype, 0)?, int_imm(dtype, 1)?, var_lanes.clone())?.into();
@@ -1067,9 +1090,7 @@ impl Vectorizer {
         original: Stmt,
         rewrite: impl FnOnce(&mut Self) -> Result<Any>,
     ) -> Result<Any> {
-        if self.need_scalarize {
-            return Err(check_failed("!need_scalarize_", ""));
-        }
+        check!(!self.need_scalarize, INTERNAL_ERROR, "!need_scalarize_");
         let result = rewrite(self)?;
         if self.need_scalarize {
             self.need_scalarize = false;
@@ -1130,14 +1151,14 @@ impl Vectorizer {
     }
 
     /// `BinaryVec<Node>`: both operands broadcast to the wider lanes, rebuilt by the raw
-    /// constructor `global`.
-    fn binary(
+    /// constructor `build` (`Node::new_full`).
+    fn binary<N: Into<Any>>(
         &mut self,
         original: Expr,
         a: Expr,
         b: Expr,
         loc: crate::ir::Location,
-        global: &'static str,
+        build: impl FnOnce(Expr, Expr, crate::ir::Location) -> Result<N>,
         m: &mut Mutator,
     ) -> Result<Any> {
         let new_a: Expr = m.mutate_as(self, &a)?;
@@ -1149,7 +1170,7 @@ impl Vectorizer {
         let lanes = lanes_or_factor(a_dtype)?.max(lanes_or_factor(b_dtype)?);
         let scalable = is_scalable(a_dtype) || is_scalable(b_dtype);
         let (a, b) = (broadcast_to(new_a, lanes, scalable)?, broadcast_to(new_b, lanes, scalable)?);
-        Ok(raw_binary(global, a, b, &loc)?.into())
+        Ok(build(a, b, loc)?.into())
     }
 
     /// `indices.Map(mutate)`: the mutated elements, and whether any changed.
@@ -1286,10 +1307,10 @@ impl Vectorizer {
 
     /// `GetTextureElementType`: the element type of a texture's pointer type.
     fn texture_bits(texture: &Expr) -> Result<i64> {
-        let pointer = texture
-            .ty
-            .as_node::<crate::ir::PtrTypeObj>()
-            .ok_or_else(|| check_failed("pointer_type", "Texture arguments must have PtrType"))?;
+        let pointer = texture.ty.as_node::<crate::ir::PtrTypeObj>().ok_or_else(|| {
+            let message = "Texture arguments must have PtrType";
+            error!(INTERNAL_ERROR, "Check failed: (pointer_type) is false: {message}")
+        })?;
         let element: PrimType = pointer.element_type.clone().try_cast()?;
         Ok(element.dtype.bits as i64)
     }
@@ -1299,12 +1320,12 @@ impl Vectorizer {
         let mut lane = 0;
         let (fcd, _) = self.mutate_array(&args[args.len() - 1..], &mut lane, m)?;
         let bits = Self::texture_bits(&args[0])?;
-        if lane as i64 * bits > int_value(&args[4])? {
-            return Err(check_failed(
-                "lane * dtype.bits() <= op->args[4].as<IntImmNode>()->value",
-                "Expected Data to be Read is lesser than or equal to Texture Load length",
-            ));
-        }
+        check!(
+            lane as i64 * bits <= int_value(&args[4])?,
+            INTERNAL_ERROR,
+            "lane * dtype.bits() <= op->args[4].as<IntImmNode>()->value",
+            "Expected Data to be Read is lesser than or equal to Texture Load length",
+        );
         let mut new_args = args[..args.len() - 1].to_vec();
         new_args.push(fcd[0].clone());
         let ty = prim_type(with_lanes(ret, lane, false))?;
@@ -1317,12 +1338,12 @@ impl Vectorizer {
         let mut lane = 0;
         let (value, _) = self.mutate_array(&args[args.len() - 1..], &mut lane, m)?;
         let bits = Self::texture_bits(&args[0])?;
-        if lane as i64 * bits != int_value(&args[4])? {
-            return Err(check_failed(
-                "lane * dtype.bits() == op->args[4].as<IntImmNode>()->value",
-                "Expected Data to be Written equal to Texture Store length",
-            ));
-        }
+        check!(
+            lane as i64 * bits == int_value(&args[4])?,
+            INTERNAL_ERROR,
+            "lane * dtype.bits() == op->args[4].as<IntImmNode>()->value",
+            "Expected Data to be Written equal to Texture Store length",
+        );
         let last = args.len() - 1;
         args[last] = value[0].clone();
         Ok(call(
@@ -1338,15 +1359,12 @@ impl Vectorizer {
 
     fn vectorize_for(&mut self, op: For, m: &mut Mutator) -> Result<Any> {
         // C++ also logs a warning for a vectorized loop nested in one; it keeps the loop.
-        if !is_const_int(&op.min, 0) {
-            return Err(check_failed("IsZero(op->min)", ""));
-        }
-        if is_vector(prim_dtype(&op.extent)?) {
-            return Err(check_failed(
-                "!op->extent.ty().IsScalableVector() && !op->extent.ty().IsFixedLengthVector()",
-                "",
-            ));
-        }
+        check!(is_const_int(&op.min, 0), INTERNAL_ERROR, "IsZero(op->min)");
+        check!(
+            !is_vector(prim_dtype(&op.extent)?),
+            INTERNAL_ERROR,
+            "!op->extent.ty().IsScalableVector() && !op->extent.ty().IsFixedLengthVector()",
+        );
         let extent: Expr = m.mutate_as(self, &op.extent)?;
         if is_vector(prim_dtype(&extent)?) {
             return Ok(self.scalarize(op.into())?.into());
@@ -1373,12 +1391,11 @@ impl Vectorizer {
     }
 
     fn vectorize_if(&mut self, op: If, m: &mut Mutator) -> Result<Any> {
-        if is_vector(prim_dtype(&op.condition)?) {
-            return Err(check_failed(
-                "!op->condition.ty().IsScalableVector() && !op->condition.ty().IsFixedLengthVector()",
-                "",
-            ));
-        }
+        check!(
+            !is_vector(prim_dtype(&op.condition)?),
+            INTERNAL_ERROR,
+            "!op->condition.ty().IsScalableVector() && !op->condition.ty().IsFixedLengthVector()",
+        );
         let condition: Expr = m.mutate_as(self, &op.condition)?;
         let cond_need_scalarize = std::mem::replace(&mut self.need_scalarize, false);
         let then_case = self.mutate_body(&op.then_case, m)?;
@@ -1419,12 +1436,12 @@ impl Vectorizer {
             return Ok(self.scalarize(op.into())?.into());
         }
         let key = ObjectIdentity::of(&op.var);
-        if self.remap.contains_key(&key) {
-            return Err(check_failed(
-                "VarRemapGet(op->var) == nullptr",
-                "SSA violation, a single var is binded twice",
-            ));
-        }
+        check!(
+            !self.remap.contains_key(&key),
+            INTERNAL_ERROR,
+            "VarRemapGet(op->var) == nullptr",
+            "SSA violation, a single var is binded twice",
+        );
         if lanes_or_factor(prim_dtype(&value)?)? != lanes_or_factor(prim_dtype(&op.value)?)? {
             let new_var = Var::new(op.var.name.clone(), value.ty.clone())?;
             self.remap.insert(key, new_var.clone().into());
@@ -1447,24 +1464,24 @@ impl Vectorizer {
             .dest
             .ty
             .as_node::<TensorTypeObj>()
-            .ok_or_else(|| internal("a store's destination is a tensor"))?;
+            .ok_or_else(|| error!(INTERNAL_ERROR, "a store's destination is a tensor"))?;
         let element = tensor.dtype.dtype;
-        if is_scalable(element) {
-            return Err(check_failed(
-                "!op->dest.as_or_throw<TensorVar>().dtype().IsScalableVector()",
-                "Vectorizing over scalable tensor elements is not supported in vectorizer.",
-            ));
-        }
+        check!(
+            !is_scalable(element),
+            INTERNAL_ERROR,
+            "!op->dest.as_or_throw<TensorVar>().dtype().IsScalableVector()",
+            "Vectorizing over scalable tensor elements is not supported in vectorizer.",
+        );
         let mut other_index_lanes = lanes(element)?;
         for index in &indices[..indices.len() - 1] {
             let dtype = prim_dtype(index)?;
             other_index_lanes *= lanes(dtype)?;
-            if is_scalable(dtype) {
-                return Err(check_failed(
-                    "!indices[i].ty().IsScalableVector()",
-                    "Only the last index can be scalable.",
-                ));
-            }
+            check!(
+                !is_scalable(dtype),
+                INTERNAL_ERROR,
+                "!indices[i].ty().IsScalableVector()",
+                "Only the last index can be scalable.",
+            );
         }
         let last = indices.len() - 1;
         let last_dtype = prim_dtype(&indices[last])?;
@@ -1472,17 +1489,17 @@ impl Vectorizer {
         let value_lanes = lanes_or_factor(prim_dtype(&value)?)?;
         let last_scalable = is_scalable(last_dtype);
         let total_lanes = index_lanes.max(value_lanes);
-        if total_lanes % other_index_lanes != 0 {
-            let name =
-                op.dest.as_node::<crate::ir::VarObj>().map(|var| var.name.as_str().to_string());
-            return Err(internal(&format!(
-                "Check failed: total_lanes % other_index_lanes == 0 ({} vs. 0) : When storing to \
-                 tensor {}, cannot produce {total_lanes} lanes of storage location by changing \
-                 the last index.",
-                total_lanes % other_index_lanes,
-                name.unwrap_or_default()
-            )));
-        }
+        check_cmp!(
+            total_lanes % other_index_lanes,
+            ==,
+            0,
+            INTERNAL_ERROR,
+            "total_lanes % other_index_lanes == 0",
+            "When storing to tensor {}, cannot produce {} lanes of storage location by changing \
+             the last index.",
+            op.dest.as_node::<crate::ir::VarObj>().map(|var| var.name.as_str()).unwrap_or_default(),
+            total_lanes,
+        );
         let last_index_lanes = total_lanes / other_index_lanes;
         indices[last] = broadcast_to(indices[last].clone(), last_index_lanes, last_scalable)?;
         let value = broadcast_to(value, total_lanes, last_scalable)?;
@@ -1565,32 +1582,31 @@ impl LoopVectorizer {
         if op.kind != FOR_VECTORIZED {
             return m.default_mutate(self, &op);
         }
-        if !is_const_int(&op.min, 0) {
-            return Err(check_failed("IsZero(op->min)", ""));
-        }
+        check!(is_const_int(&op.min, 0), INTERNAL_ERROR, "IsZero(op->min)");
         let extent = op.extent.as_node::<IntImmObj>().map(|imm| imm.value.clone());
         if let Some(value) = &extent {
             if *value > BigInt::from(1i64)
                 && target_has_rvv(&self.target)?
                 && !contains_call(&op.body.clone().into())?
             {
-                let value = value.to_i64().ok_or_else(|| internal("extent out of range"))?;
+                let value =
+                    value.to_i64().ok_or_else(|| error!(INTERNAL_ERROR, "extent out of range"))?;
                 return self.vectorize_for_rvv(op, value, m);
             }
         }
         if extent.as_ref().is_none_or(|value| *value < BigInt::from(1i64)) {
             let scalable = contains_vscale(&op.extent)?;
-            if !(scalable && target_has_vla(&self.target)?) {
-                let target = match &self.target {
+            check!(
+                scalable && target_has_vla(&self.target)?,
+                INTERNAL_ERROR,
+                "is_scalable_expr && TargetHasVLA(target_)",
+                "Failed to vectorize loop with extent {} for target {}",
+                repr(&op.extent),
+                match &self.target {
                     Some(target) => repr(target),
                     None => repr(&Any::default()),
-                };
-                let message = format!(
-                    "Failed to vectorize loop with extent {} for target {target}",
-                    repr(&op.extent)
-                );
-                return Err(check_failed("is_scalable_expr && TargetHasVLA(target_)", &message));
-            }
+                },
+            );
         }
         let body = preserve_unroll_policy(op.body.clone(), &op.annotations)?;
         let mut vectorizer = Vectorizer::new(

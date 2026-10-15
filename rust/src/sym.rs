@@ -703,6 +703,36 @@ impl Analyzer {
             .try_into()
     }
 
+    /// `const_int_bound.IsBound(var)`: whether a bound was set for `var`.
+    pub fn const_int_bound_is_bound(&self, var: &super::ir::Var) -> Result<bool> {
+        tvm_ffi::cached_global_func!("sym.AnalyzerConstIntBoundIsBound")
+            .call_tuple((self.clone(), var.clone()))?
+            .try_into()
+    }
+
+    /// `IterMapSimplify(indices, iters, predicate, level, *this, simplify_trivial_iterators)`:
+    /// the indices simplified as iterator maps of `iters` (`level` is the `IterMapLevel`), or
+    /// as they are when they are not.
+    pub fn iter_map_simplify(
+        &self,
+        indices: &tvm_ffi::Array<Expr>,
+        iters: tvm_ffi::Map<super::ir::Var, super::ir::Range>,
+        predicate: &Expr,
+        level: i32,
+        simplify_trivial_iterators: bool,
+    ) -> Result<tvm_ffi::Array<Expr>> {
+        tvm_ffi::cached_global_func!("sym.IterMapSimplify")
+            .call_tuple((
+                indices.clone(),
+                iters,
+                predicate.clone(),
+                level,
+                simplify_trivial_iterators,
+                self.clone(),
+            ))?
+            .try_into()
+    }
+
     /// `CanProveGreaterEqual(expr, lower_bound)`, which has no global: an `IntImm` is compared
     /// directly, anything else by the constant bound of its rewrite-simplified form.
     pub fn can_prove_greater_equal(&self, expr: &Expr, lower_bound: i64) -> Result<bool> {
@@ -775,6 +805,17 @@ impl Drop for ConstraintContext {
         // unwinding, a failure here is not reported.
         let _ = self.exit.call_tuple(());
     }
+}
+
+/// `DetectLinearEquation(expr, vars)`: the coefficients of `vars` and the constant term when
+/// `expr` is linear in them, otherwise no coefficients.
+pub fn detect_linear_equation(
+    expr: &Expr,
+    vars: &tvm_ffi::Array<super::ir::Var>,
+) -> Result<tvm_ffi::Array<Expr>> {
+    tvm_ffi::cached_global_func!("sym.DetectLinearEquation")
+        .call_tuple((expr.clone(), vars.clone()))?
+        .try_into()
 }
 
 /// `SymbolicLimits::pos_inf_`, the expression interval bounds use for +infinity.

@@ -71,6 +71,13 @@ pub fn sequential(passes: Vec<Pass>, name: &str) -> Result<Pass> {
         .try_into()
 }
 
+/// C++ `transform::PrintIR(header)`: a pass that prints the module and returns it unchanged.
+pub fn print_ir(header: &str) -> Result<Pass> {
+    tvm_ffi::cached_global_func!("transform.PrintIR")
+        .call_tuple((String::from(header),))?
+        .try_into()
+}
+
 /// The C++ pass a `tirx.transform.<Name>()` factory returns.
 pub fn native_pass(factory: &str) -> Result<Pass> {
     FfiFunction::get_global(factory)?.call_packed(&[])?.try_into()
@@ -195,9 +202,4 @@ pub fn dict_without(attrs: &DictAttrs, key: &str) -> DictAttrs {
     DictAttrs::new(
         attrs.dict.iter().filter(|(k, _)| k.as_str() != key).collect::<Map<String, Any>>(),
     )
-}
-
-/// An `InternalError`, what a failed C++ `TVM_FFI_ICHECK` or `TVM_FFI_THROW(InternalError)` raises.
-pub fn internal(message: &str) -> tvm_ffi::Error {
-    tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, message, "")
 }

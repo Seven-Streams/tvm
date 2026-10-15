@@ -28,17 +28,17 @@ use std::collections::{HashMap, HashSet};
 
 use tvm_ffi::{
     dispatch, structural_mutate, Any, Array, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore,
-    Result,
+    Result, INTERNAL_ERROR,
 };
 
 use super::analyzer::{is_const_int, AnalyzerBase, AnalyzerScope, AnalyzerState};
-use super::flattened_tensor::{
-    as_tensor_var, elem_offset, flattened_tensor, structural_equal, tensor_type,
-};
+use super::flattened_tensor::{as_tensor_var, elem_offset, flattened_tensor, tensor_type};
 use super::stmt_simplify::mark_global_non_neg_value;
 use super::util::{function_pass, int_imm, prim_dtype, MutatorExt};
-use crate::ir::{Bind, Call, CallObj, Expr, Op, SeqStmt, Stmt, TensorLoad, TensorStore, Var};
+use crate::ir::{Bind, Call, CallObj, Expr, SeqStmt, Stmt, TensorLoad, TensorStore, Var};
+use crate::ops::structural_equal;
 use crate::sym::Analyzer;
+use crate::tirx::op::{ALLOC_TENSOR, DECL_TENSOR, MASKED_LOAD, MASKED_STORE, TENSOR_DATA_PTR};
 use crate::tirx::{Function, Iter, TensorType, TileLayout};
 use crate::transform::Pass;
 
@@ -66,11 +66,6 @@ pub(crate) struct TensorFlattener {
     extern_tensors: HashSet<ObjectIdentity>,
     /// Tensors accessed in the body.
     tensors_used: HashSet<ObjectIdentity>,
-    alloc_tensor: Op,
-    decl_tensor: Op,
-    tensor_data_ptr: Op,
-    masked_load: Op,
-    masked_store: Op,
 }
 
 impl AnalyzerState for TensorFlattener {
@@ -98,10 +93,10 @@ impl TensorFlattener {
 
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            if call.op.same_as(&self.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 return self.mutate_alloc_tensor(op.clone(), op.value.clone().try_cast()?, m);
             }
-            if call.op.same_as(&self.decl_tensor) {
+            if DECL_TENSOR.is(&call.op) {
                 return self.mutate_decl_tensor(op.clone(), op.value.clone().try_cast()?, m);
             }
         }
@@ -127,8 +122,8 @@ impl TensorFlattener {
     }
 
     fn mutate_call(&mut self, call: Call, m: &mut Mutator) -> Result<Any> {
-        let is_load = call.op.same_as(&self.masked_load);
-        if is_load || call.op.same_as(&self.masked_store) {
+        let is_load = MASKED_LOAD.is(&call.op);
+        if is_load || MASKED_STORE.is(&call.op) {
             let original: Var = call.args.get(0)?.try_cast()?;
             let count = call.args.len();
             let mut indices = Vec::new();
@@ -153,7 +148,7 @@ impl TensorFlattener {
             )?;
             return Ok(call.into());
         }
-        if call.op.same_as(&self.tensor_data_ptr) && call.args.len() == 1 {
+        if TENSOR_DATA_PTR.is(&call.op) && call.args.len() == 1 {
             let arg = call.args.get(0)?;
             if let Ok(original) = arg.clone().try_cast::<Var>() {
                 if tensor_type(&original).is_ok() {
@@ -175,11 +170,6 @@ impl TensorFlattener {
             remap: HashMap::new(),
             extern_tensors: HashSet::new(),
             tensors_used: HashSet::new(),
-            alloc_tensor: Op::get("tirx.alloc_tensor")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
-            tensor_data_ptr: Op::get("tirx.tensor_data_ptr")?,
-            masked_load: Op::get("tirx.masked_load")?,
-            masked_store: Op::get("tirx.masked_store")?,
         })
     }
 
@@ -283,12 +273,12 @@ impl TensorFlattener {
 
     fn lookup(&self, buf: &Var) -> Result<&FlatInfo> {
         self.flat.get(&ObjectIdentity::of(buf)).ok_or_else(|| {
-            let message = format!(
+            error!(
+                INTERNAL_ERROR,
                 "Check failed: (it != flat_map_.end()) is false: Tensor {} is used before its \
                  definition (AllocTensor/DeclTensor/Function param)",
                 buf.name.as_str()
-            );
-            tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, &message, "")
+            )
         })
     }
 
@@ -337,7 +327,7 @@ impl TensorFlattener {
     /// `tensor_data_ptr(p)` of a parameter tensor `p`: such a source is kept as it is.
     fn is_extern_tensor_source(&self, data: &Expr) -> bool {
         let Some(call) = data.as_node::<CallObj>() else { return false };
-        if !call.op.same_as(&self.tensor_data_ptr) || call.args.len() != 1 {
+        if !TENSOR_DATA_PTR.is(&call.op) || call.args.len() != 1 {
             return false;
         }
         match call.args.get(0).ok().and_then(|arg| as_tensor_var(&arg)) {
@@ -397,7 +387,7 @@ fn flatten(func: Function) -> Result<Function> {
         let ty = flattened.ty.clone();
         let alias = Call::new_full(
             Some(ty.clone()),
-            pass.decl_tensor.clone().into(),
+            DECL_TENSOR.get()?.into(),
             Array::new(vec![param.tensor_data()?]),
             None,
             Array::new(vec![ty]),

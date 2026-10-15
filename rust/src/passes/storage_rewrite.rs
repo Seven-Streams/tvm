@@ -32,26 +32,32 @@
 
 use std::collections::HashMap;
 
-use tvm_ffi::object::ObjectRef;
 use tvm_ffi::{
     dispatch, structural_mutate, structural_walk, Any, Array, ContextPolicy, DLDataType,
-    DLDataTypeCode, DefRegionKind, Error, FieldGetter, Map, Mutator, ObjectCore, ObjectIdentity,
-    ObjectRefCast, ObjectRefCore, Result, String, StructuralView, VisitContext, VisitInterrupt,
-    WalkOrder, WalkResult, WalkWithContextPolicy, INTERNAL_ERROR, TYPE_ERROR, VALUE_ERROR,
+    DLDataTypeCode, DefRegionKind, Map, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore,
+    Result, String, StructuralView, VisitContext, VisitInterrupt, WalkOrder, WalkResult,
+    WalkWithContextPolicy, INTERNAL_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 
 use super::util::{function_pass, get_attr, MutatorExt};
 use crate::ir::{
     AssertStmtObj, Attrs, Bind, BindObj, Call, CallObj, DictAttrs, Evaluate, EvaluateObj, Expr,
-    For, ForObj, IfObj, IntImmObj, Op, PrimType, PrimTypeObj, PtrType, PtrTypeObj, RegionStmt,
+    For, ForObj, IfObj, IntImmObj, PrimType, PrimTypeObj, PtrType, PtrTypeObj, RegionStmt,
     RegionStmtObj, ReturnObj, SeqStmt, Stmt, StringImm, TensorLoad, TensorLoadObj, TensorStore,
     TensorStoreObj, Type, Var, WhileObj,
 };
-use crate::ops::{ex, int32, int_imm, make_const, prim_dtype, prim_type, unknown_loc, PrimOps};
+use crate::ops::{
+    deep_equal, ex, int32, int_imm, make_const, prim_dtype, prim_type, structural_equal,
+    unknown_loc, PrimOps,
+};
 use crate::prim::{Let, Ramp, RampObj, Shuffle};
-use crate::runtime::{MemoryScope, MemoryScopeObj};
+use crate::runtime::MemoryScope;
 use crate::sym::Analyzer;
 use crate::target::Target;
+use crate::tirx::op::{
+    ADDRESS_OF, ALLOC_TENSOR, DECL_TENSOR, LAUNCH_THREAD, MASKED_LOAD, MASKED_STORE,
+    PTR_BYTE_OFFSET, TENSOR_DATA_PTR,
+};
 use crate::tirx::{Function, Layout, TensorType, TensorTypeObj};
 use crate::transform::Pass;
 use crate::SameField;
@@ -62,63 +68,21 @@ const VOLATILE: &str = "tirx.volatile";
 const FOR_KIND_PARALLEL: i32 = 1;
 const FOR_KIND_VECTORIZED: i32 = 2;
 
-fn internal_error(message: impl AsRef<str>) -> Error {
-    Error::new(INTERNAL_ERROR, message.as_ref(), "")
+/// `expr` as a call to `alloc_tensor` or `decl_tensor`.
+fn tensor_binding(expr: &Expr) -> Option<&CallObj> {
+    expr.as_node::<CallObj>().filter(|call| ALLOC_TENSOR.is(&call.op) || DECL_TENSOR.is(&call.op))
 }
 
-/// C++ `TVM_FFI_ICHECK(cond) << message`.
-macro_rules! check {
-    ($cond:expr, $($message:tt)+) => {
-        if !($cond) {
-            return Err(internal_error(format!($($message)+)));
-        }
-    };
-}
-
-#[derive(Clone)]
-struct Ops {
-    alloc_tensor: Op,
-    decl_tensor: Op,
-    tensor_data_ptr: Op,
-    ptr_byte_offset: Op,
-    masked_load: Op,
-    masked_store: Op,
-    address_of: Op,
-    launch_thread: Op,
-}
-
-impl Ops {
-    fn get() -> Result<Self> {
-        Ok(Self {
-            alloc_tensor: Op::get("tirx.alloc_tensor")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
-            tensor_data_ptr: Op::get("tirx.tensor_data_ptr")?,
-            ptr_byte_offset: Op::get("tirx.ptr_byte_offset")?,
-            masked_load: Op::get("tirx.masked_load")?,
-            masked_store: Op::get("tirx.masked_store")?,
-            address_of: Op::get("tirx.address_of")?,
-            launch_thread: Op::get("tirx.launch_thread")?,
-        })
+/// C++ `GetBufferDataVar`: the variable `data` is, or the tensor of a `tensor_data_ptr`.
+fn buffer_data_var(data: &Expr) -> Option<Var> {
+    if let Ok(var) = data.clone().try_cast::<Var>() {
+        return Some(var);
     }
-
-    /// `expr` as a call to `alloc_tensor` or `decl_tensor`.
-    fn tensor_binding<'e>(&self, expr: &'e Expr) -> Option<&'e CallObj> {
-        expr.as_node::<CallObj>().filter(|call| {
-            call.op.same_as(&self.alloc_tensor) || call.op.same_as(&self.decl_tensor)
-        })
+    let call = data.as_node::<CallObj>()?;
+    if !TENSOR_DATA_PTR.is(&call.op) || call.args.len() != 1 {
+        return None;
     }
-
-    /// C++ `GetBufferDataVar`: the variable `data` is, or the tensor of a `tensor_data_ptr`.
-    fn buffer_data_var(&self, data: &Expr) -> Option<Var> {
-        if let Ok(var) = data.clone().try_cast::<Var>() {
-            return Some(var);
-        }
-        let call = data.as_node::<CallObj>()?;
-        if !call.op.same_as(&self.tensor_data_ptr) || call.args.len() != 1 {
-            return None;
-        }
-        call.args.get(0).ok()?.try_cast::<Var>().ok()
-    }
+    call.args.get(0).ok()?.try_cast::<Var>().ok()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -131,9 +95,10 @@ fn encoded_lanes(dtype: DLDataType) -> i16 {
 /// `PrimType::lanes()`: the fixed lane count; an error for a scalable vector.
 fn lanes(dtype: DLDataType) -> Result<i32> {
     match encoded_lanes(dtype) {
-        lanes if lanes < 0 => {
-            Err(internal_error("Can't fetch the lanes of a scalable vector at a compile time."))
-        }
+        lanes if lanes < 0 => Err(error!(
+            INTERNAL_ERROR,
+            "Can't fetch the lanes of a scalable vector at a compile time."
+        )),
         lanes => Ok(lanes as i32),
     }
 }
@@ -172,7 +137,7 @@ fn void_dtype() -> DLDataType {
 fn tensor_var(expr: &Expr) -> Result<Var> {
     match expr.clone().try_cast::<Var>() {
         Ok(var) if is_tensor(&var) => Ok(var),
-        _ => Err(Error::new(TYPE_ERROR, "expected a tensor variable", "")),
+        _ => Err(error!(TYPE_ERROR, "expected a tensor variable")),
     }
 }
 
@@ -240,25 +205,12 @@ fn is_const_int(expr: &Expr, value: i64) -> bool {
 
 /// An `IntImm` lane count as C++ `value.as<int>().value()`.
 fn int_value(expr: &Expr) -> Result<i32> {
-    let imm = expr.as_node::<IntImmObj>().ok_or_else(|| internal_error("expected an IntImm"))?;
+    let imm =
+        expr.as_node::<IntImmObj>().ok_or_else(|| error!(INTERNAL_ERROR, "expected an IntImm"))?;
     imm.value
         .to_i64()
         .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| internal_error("an IntImm out of the int range"))
-}
-
-/// `ffi::StructuralEqual()(lhs, rhs)`.
-fn structural_equal(lhs: &Type, rhs: &Type) -> Result<bool> {
-    tvm_ffi::cached_global_func!("ffi.StructuralEqual")
-        .call_tuple((lhs.clone(), rhs.clone(), false, false))?
-        .try_into()
-}
-
-/// `prim::ExprDeepEqual()(lhs, rhs)`.
-fn expr_deep_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
-    tvm_ffi::cached_global_func!("prim.expr_deep_equal")
-        .call_tuple((lhs.clone(), rhs.clone()))?
-        .try_into()
+        .ok_or_else(|| error!(INTERNAL_ERROR, "an IntImm out of the int range"))
 }
 
 /// `call.attrs` holds the volatile flag.
@@ -285,29 +237,17 @@ enum AllocProperty {
     SeparateAllocations,
 }
 
-/// `MemoryScope::alloc_property()`: the scope's `runtime.memory_alloc_property` column in the
-/// enum state of `runtime.MemoryScope`, `Normal` when unset.
+/// `MemoryScope::alloc_property()`: the scope's `runtime.memory_alloc_property` enum attribute,
+/// `Normal` when unset.
 fn alloc_property(scope: &MemoryScope) -> Result<AllocProperty> {
-    let state = tvm_ffi::get_type_attr(MemoryScopeObj::type_index(), "__ffi_enum__")
-        .ok_or_else(|| internal_error("runtime.MemoryScope has no enum state"))?;
-    let getter = FieldGetter::new(state.type_index(), "attrs")?;
-    let state: ObjectRef = state.try_into()?;
-    let columns = getter.get_any(&**ObjectRefCore::data(&state))?;
-    let count = tvm_ffi::cached_global_func!("ffi.DictCount");
-    let get = tvm_ffi::cached_global_func!("ffi.DictGetItem");
-    let key = String::from("runtime.memory_alloc_property");
-    if i64::try_from(count.call_tuple((columns.clone(), key.clone()))?)? == 0 {
+    let Some(property) = scope.attr("runtime.memory_alloc_property")? else {
         return Ok(AllocProperty::Normal);
-    }
-    let column = get.call_tuple((columns, key))?;
-    if i64::try_from(count.call_tuple((column.clone(), scope.clone()))?)? == 0 {
-        return Ok(AllocProperty::Normal);
-    }
-    match i64::try_from(get.call_tuple((column, scope.clone()))?)? {
+    };
+    match i64::try_from(property)? {
         0 => Ok(AllocProperty::Normal),
         1 => Ok(AllocProperty::SingleAllocation),
         2 => Ok(AllocProperty::SeparateAllocations),
-        _ => Err(Error::new(VALUE_ERROR, "Invalid memory allocation property", "")),
+        _ => Err(error!(VALUE_ERROR, "Invalid memory allocation property")),
     }
 }
 
@@ -331,14 +271,15 @@ impl TensorAliases {
 
     /// The C++ `RegisterTensorAlias`: `tensor` shares the root of the tensor whose data it
     /// declares, or is a root itself.
-    fn register(&mut self, ops: &Ops, tensor: &Var, data: &Expr) -> Result<()> {
+    fn register(&mut self, tensor: &Var, data: &Expr) -> Result<()> {
         let mut root = tensor.clone();
-        if let Some(source) = ops.buffer_data_var(data).filter(is_tensor) {
+        if let Some(source) = buffer_data_var(data).filter(is_tensor) {
             let Some(source_root) = self.get(&source) else {
-                return Err(internal_error(format!(
+                tvm_ffi::bail!(
+                    INTERNAL_ERROR,
                     "Tensor alias source {} must be registered before its DeclTensor alias",
                     source.name.as_str()
-                )));
+                );
             };
             root = source_root;
         }
@@ -372,7 +313,6 @@ struct AllocEntry {
 /// end entry, and an access to an allocation counts at the entry of the scope it was allocated
 /// in, so its lifetime never ends inside a nested scope.
 struct LinearAccessPatternFinder {
-    ops: Ops,
     linear_seq: Vec<StmtEntry>,
     alloc_info: HashMap<ObjectIdentity, AllocEntry>,
     aliases: TensorAliases,
@@ -382,13 +322,12 @@ struct LinearAccessPatternFinder {
 }
 
 impl LinearAccessPatternFinder {
-    fn new(ops: Ops, params: &Array<Var>) -> Self {
+    fn new(params: &Array<Var>) -> Self {
         let mut aliases = TensorAliases::default();
         for param in params.iter().filter(is_tensor) {
             aliases.set(&param, &param);
         }
         Self {
-            ops,
             linear_seq: Vec::new(),
             alloc_info: HashMap::new(),
             aliases,
@@ -400,7 +339,7 @@ impl LinearAccessPatternFinder {
     /// Touch the allocation `buf`, if it is one, at the scope it was allocated in.
     fn touch(&mut self, buf: ObjectIdentity, name: &str) -> Result<Option<usize>> {
         let Some(entry) = self.alloc_info.get(&buf) else { return Ok(None) };
-        check!(entry.level < self.scope.len(), " buf={name}");
+        tvm_ffi::ensure!(entry.level < self.scope.len(), INTERNAL_ERROR, " buf={name}");
         let ndim = entry.num_physical_dimensions;
         self.scope[entry.level].push(buf);
         Ok(Some(ndim))
@@ -411,8 +350,9 @@ impl LinearAccessPatternFinder {
         let tensor = tensor_var(tensor)?;
         let root = self.aliases.root(&tensor);
         if let Some(ndim) = self.touch(ObjectIdentity::of(&root), tensor.name.as_str())? {
-            check!(
+            tvm_ffi::ensure!(
                 ndim == 1,
+                INTERNAL_ERROR,
                 "TensorVar {} is allocated with {ndim} physical dimensions, but is accessed as \
                  having 1 physical dimension",
                 tensor.name.as_str()
@@ -464,7 +404,11 @@ impl AccessScopes {
         let state = ctx.state_mut();
         let touched = state.scope.pop().expect("the scope is open");
         let end = state.linear_seq.len();
-        check!(end > begin, "a scope's end entry follows its begin entry");
+        tvm_ffi::ensure!(
+            end > begin,
+            INTERNAL_ERROR,
+            "a scope's end entry follows its begin entry"
+        );
         let offset = (end - begin) as i64;
         state.linear_seq.push(StmtEntry { stmt, scope_pair_offset: -offset, touched });
         state.linear_seq[begin].scope_pair_offset = offset;
@@ -478,7 +422,7 @@ impl AccessScopes {
         op: Bind,
     ) -> Result<Option<VisitInterrupt>> {
         ctx.state_mut().scope.push(Vec::new());
-        if let Some(call) = ctx.state().ops.tensor_binding(&op.value) {
+        if let Some(call) = tensor_binding(&op.value) {
             let attrs = call.attrs.clone();
             ctx.visit(&attrs)?;
         }
@@ -519,7 +463,7 @@ impl ContextPolicy<LinearAccessPatternFinder> for AccessScopes {
         // Hardware thread axes share the allocation scope of the outermost one; virtual threads
         // and other regions open their own.
         if let Some(region) = value.cast::<RegionStmt>() {
-            if region.op.same_as(&ctx.state().ops.launch_thread) {
+            if LAUNCH_THREAD.is(&region.op) {
                 let tag: StringImm = region.args.get(0)?.try_cast()?;
                 if !tag.value.as_str().starts_with("vthread") {
                     if ctx.state().in_thread_env {
@@ -541,9 +485,8 @@ impl ContextPolicy<LinearAccessPatternFinder> for AccessScopes {
             return Self::visit_new_scope(ctx, value.cast::<Stmt>().expect("a statement"));
         }
         if let Some(op) = value.cast::<Bind>() {
-            let ops = ctx.state().ops.clone();
             if let Some(call) = op.value.as_node::<CallObj>() {
-                if call.op.same_as(&ops.alloc_tensor) {
+                if ALLOC_TENSOR.is(&call.op) {
                     let ndim = declared_type(call)?.shape.len();
                     let state = ctx.state_mut();
                     let level = state.scope.len();
@@ -552,10 +495,10 @@ impl ContextPolicy<LinearAccessPatternFinder> for AccessScopes {
                         ObjectIdentity::of(&op.var),
                         AllocEntry { num_physical_dimensions: ndim, level, alloc: op.clone() },
                     );
-                } else if call.op.same_as(&ops.decl_tensor) {
+                } else if DECL_TENSOR.is(&call.op) {
                     let tensor = tensor_var(&op.var.clone().into())?;
                     let data = call.args.get(0)?;
-                    ctx.state_mut().aliases.register(&ops, &tensor, &data)?;
+                    ctx.state_mut().aliases.register(&tensor, &data)?;
                 }
             }
             return Self::visit_binding(ctx, op);
@@ -573,7 +516,6 @@ impl ContextPolicy<LinearAccessPatternFinder> for AccessScopes {
 /// Like the C++ check, this cannot see a location written more than once
 /// (`A[0] = B[0] + 1; A[0] = B[0] + 1`); the code generators producing the IR rule that out.
 struct InplaceOpVerifier {
-    ops: Ops,
     dst: ObjectIdentity,
     src: ObjectIdentity,
     result: bool,
@@ -585,7 +527,7 @@ struct InplaceOpVerifier {
 
 impl InplaceOpVerifier {
     /// Run the check on `stmt`, which must be a loop, a branch, or a store.
-    fn check(ops: &Ops, stmt: &Stmt, dst: &ObjectIdentity, src: &ObjectIdentity) -> Result<bool> {
+    fn check(stmt: &Stmt, dst: &ObjectIdentity, src: &ObjectIdentity) -> Result<bool> {
         let checked = stmt.as_node::<ForObj>().is_some()
             || stmt.as_node::<IfObj>().is_some()
             || stmt.as_node::<WhileObj>().is_some()
@@ -593,14 +535,8 @@ impl InplaceOpVerifier {
         if !checked {
             return Ok(false);
         }
-        let verifier = Self {
-            ops: ops.clone(),
-            dst: dst.clone(),
-            src: src.clone(),
-            result: true,
-            mem_nest: 0,
-            store: None,
-        };
+        let verifier =
+            Self { dst: dst.clone(), src: src.clone(), result: true, mem_nest: 0, store: None };
         let mut walk = WalkWithContextPolicy::new(verifier, InplaceAccesses);
         structural_walk(stmt, &mut walk, WalkOrder::PreOrder)?;
         Ok(walk.into_state().result)
@@ -653,9 +589,8 @@ impl ContextPolicy<InplaceOpVerifier> for InplaceAccesses {
             return ctx.visit(&op.value);
         }
         if let Some(op) = value.as_node::<BindObj>() {
-            let alloc_tensor = &ctx.state().ops.alloc_tensor;
             let volatile = match op.value.as_node::<CallObj>() {
-                Some(call) => call.op.same_as(alloc_tensor) && is_volatile(call)?,
+                Some(call) => ALLOC_TENSOR.is(&call.op) && is_volatile(call)?,
                 None => false,
             };
             // A volatile allocation is never in place.
@@ -676,12 +611,13 @@ impl ContextPolicy<InplaceOpVerifier> for InplaceAccesses {
                 if prim_dtype(&store.value)? != prim_dtype(&op.clone().into())? {
                     return Ok(state.fail());
                 }
-                check!(
+                tvm_ffi::ensure!(
                     store.indices.len() == op.indices.len(),
+                    INTERNAL_ERROR,
                     "Store/Load occur to the same buffer with differing number of indices"
                 );
                 for (stored, loaded) in store.indices.iter().zip(op.indices.iter()) {
-                    if !expr_deep_equal(&stored, &loaded)? {
+                    if !deep_equal(&stored, &loaded)? {
                         return Ok(state.fail());
                     }
                 }
@@ -733,7 +669,6 @@ struct EventEntry {
 /// updates write over their source, and single-allocation scopes pack into one buffer that the
 /// code generator casts from.
 struct StoragePlanRewriter {
-    ops: Ops,
     detect_inplace: bool,
     thread_scope: Option<ObjectIdentity>,
     thread_scope_stack: Vec<Option<ObjectIdentity>>,
@@ -767,7 +702,7 @@ fn requires_exact_allocation(call: &CallObj) -> Result<bool> {
     if !call.args.is_empty() {
         return Ok(true);
     }
-    let attrs = call.attrs.clone().ok_or_else(|| internal_error("bad optional access"))?;
+    let attrs = call.attrs.clone().ok_or_else(|| error!(INTERNAL_ERROR, "bad optional access"))?;
     let attrs: DictAttrs = attrs.try_cast()?;
     Ok(attrs.dict.iter().any(|(key, _)| key.as_str() != VOLATILE))
 }
@@ -790,9 +725,8 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 }
 
 impl StoragePlanRewriter {
-    fn new(ops: Ops) -> Result<Self> {
+    fn new() -> Result<Self> {
         Ok(Self {
-            ops,
             detect_inplace: false,
             thread_scope: None,
             thread_scope_stack: Vec::new(),
@@ -818,7 +752,7 @@ impl StoragePlanRewriter {
         reuse_require_exact_matched_dtype: bool,
     ) -> Result<SeqStmt> {
         self.detect_inplace = detect_inplace;
-        let finder = LinearAccessPatternFinder::new(self.ops.clone(), params);
+        let finder = LinearAccessPatternFinder::new(params);
         let mut walk = WalkWithContextPolicy::new(finder, AccessScopes);
         structural_walk(&body, &mut walk, WalkOrder::PreOrder)?;
         let finder = walk.into_state();
@@ -851,7 +785,10 @@ impl StoragePlanRewriter {
     }
 
     fn alloc_var(&self, e: usize) -> Result<Var> {
-        self.alloc_vec[e].alloc_var.clone().ok_or_else(|| internal_error("an unplanned allocation"))
+        self.alloc_vec[e]
+            .alloc_var
+            .clone()
+            .ok_or_else(|| error!(INTERNAL_ERROR, "an unplanned allocation"))
     }
 
     /// The allocations of `entries` placed before `body`, outermost first.
@@ -871,8 +808,9 @@ impl StoragePlanRewriter {
     fn remap_tensor(&mut self, buf: &Var, backing: &Var) -> Result<Var> {
         if let Some(mapped) = self.remap.get(&ObjectIdentity::of(buf)) {
             let previous = &self.remapped_backing[&ObjectIdentity::of(mapped)];
-            check!(
+            tvm_ffi::ensure!(
                 previous.same_as(backing),
+                INTERNAL_ERROR,
                 "Cannot remap tensor {} to use backing array {}, previously used backing array {}",
                 buf.name.as_str(),
                 backing.name.as_str(),
@@ -897,13 +835,18 @@ impl StoragePlanRewriter {
     fn remap_indices(&self, tensor: &Var, indices: &Array<Expr>, e: usize) -> Result<Array<Expr>> {
         let bits_offset = self.alloc_vec[e].bits_offset;
         let mut indices: Vec<Expr> = indices.iter().collect();
-        let last = indices.pop().ok_or_else(|| internal_error("an access without indices"))?;
+        let last =
+            indices.pop().ok_or_else(|| error!(INTERNAL_ERROR, "an access without indices"))?;
         if bits_offset == 0 {
             indices.push(last);
             return Ok(Array::new(indices));
         }
         let elem_bits = dtype_of(&tensor_type(tensor)?).bits as u64;
-        check!(bits_offset.is_multiple_of(elem_bits), "the offset is a whole number of elements");
+        tvm_ffi::ensure!(
+            bits_offset.is_multiple_of(elem_bits),
+            INTERNAL_ERROR,
+            "the offset is a whole number of elements"
+        );
         let offset = make_const(prim_dtype(&last)?, (bits_offset / elem_bits) as i64)?;
         indices.push((ex(offset) + &last).expr()?);
         Ok(Array::new(indices))
@@ -947,7 +890,7 @@ impl StoragePlanRewriter {
             DictAttrs::new(annotations.into_iter().collect::<Map<String, Any>>()).into();
         let call = Call::new_full(
             Some(ty.clone()),
-            self.ops.alloc_tensor.clone().into(),
+            ALLOC_TENSOR.get()?.into(),
             Array::new(vec![]),
             Some(attrs),
             Array::new(vec![ty]),
@@ -998,7 +941,11 @@ impl StoragePlanRewriter {
             let attached = |e: &usize| alloc_vec[*e].attach_scope.as_ref() == Some(&op);
             self.const_free_map.retain(|(_, e)| !attached(e));
             self.sym_free_list.retain(|e| !attached(e));
-            check!(!self.thread_scope_stack.is_empty(), "a thread scope is open");
+            tvm_ffi::ensure!(
+                !self.thread_scope_stack.is_empty(),
+                INTERNAL_ERROR,
+                "a thread scope is open"
+            );
             self.thread_scope = self.thread_scope_stack.pop().expect("checked");
         } else {
             self.thread_scope_stack.push(self.thread_scope.take());
@@ -1025,9 +972,9 @@ impl StoragePlanRewriter {
             if let (Some(gen), true) = (&gen, s.scope_pair_offset >= 0) {
                 let detect_inplace = self.detect_inplace && gen.len() <= 2;
                 for var in gen {
-                    let entry = alloc_info
-                        .get(var)
-                        .ok_or_else(|| internal_error("a touched tensor has an allocation"))?;
+                    let entry = alloc_info.get(var).ok_or_else(|| {
+                        error!(INTERNAL_ERROR, "a touched tensor has an allocation")
+                    })?;
                     let alloc = &entry.alloc;
                     let call = alloc.value.as_node::<CallObj>().expect("an alloc_tensor call");
                     let ty = declared_type(call)?;
@@ -1053,7 +1000,7 @@ impl StoragePlanRewriter {
                                 && candidate.attach_scope == self.thread_scope
                                 && !is_scalable_vector(element_type)
                                 && candidate.elem_type == with_lanes(element_type, 1)
-                                && InplaceOpVerifier::check(&self.ops, &s.stmt, var, src)?
+                                && InplaceOpVerifier::check(&s.stmt, var, src)?
                             {
                                 let const_nbits = (var_size as u64)
                                     .wrapping_mul(element_type.bits as u64)
@@ -1080,8 +1027,10 @@ impl StoragePlanRewriter {
                         )?,
                     };
                     self.alloc_vec[dst_entry].allocs.push(alloc.clone());
-                    let attrs =
-                        call.attrs.clone().ok_or_else(|| internal_error("bad optional access"))?;
+                    let attrs = call
+                        .attrs
+                        .clone()
+                        .ok_or_else(|| error!(INTERNAL_ERROR, "bad optional access"))?;
                     let attrs: DictAttrs = attrs.try_cast()?;
                     if get_attr(&attrs, VOLATILE)?.is_some() {
                         self.alloc_vec[dst_entry].is_volatile = true;
@@ -1250,9 +1199,10 @@ impl StoragePlanRewriter {
 
     /// Simulated free: the entry becomes available for reuse.
     fn free(&mut self, var: &ObjectIdentity) -> Result<()> {
-        let &(_, e) = self.alloc_map.get(var).ok_or_else(|| internal_error("a freed tensor"))?;
+        let &(_, e) =
+            self.alloc_map.get(var).ok_or_else(|| error!(INTERNAL_ERROR, "a freed tensor"))?;
         let entry = &self.alloc_vec[e];
-        check!(!entry.allocs.is_empty(), "a freed entry has allocations");
+        tvm_ffi::ensure!(!entry.allocs.is_empty(), INTERNAL_ERROR, "a freed entry has allocations");
         if entry.requires_exact_allocation {
             return Ok(());
         }
@@ -1378,8 +1328,16 @@ impl StoragePlanRewriter {
     fn allocate(&mut self, e: usize) -> Result<()> {
         let entry = &self.alloc_vec[e];
         if entry.requires_exact_allocation {
-            check!(entry.allocs.len() == 1, "an exact allocation is not shared");
-            check!(entry.merged_children.is_empty(), "an exact allocation is not packed");
+            tvm_ffi::ensure!(
+                entry.allocs.len() == 1,
+                INTERNAL_ERROR,
+                "an exact allocation is not shared"
+            );
+            tvm_ffi::ensure!(
+                entry.merged_children.is_empty(),
+                INTERNAL_ERROR,
+                "an exact allocation is not packed"
+            );
             // The original binding stays in place, metadata included.
             self.alloc_vec[e].alloc_var = Some(entry.allocs[0].var.clone());
             return Ok(());
@@ -1423,7 +1381,7 @@ impl StoragePlanRewriter {
             }
             let mut same_shape = true;
             for (extent, first_extent) in ty.shape.iter().zip(first_type.shape.iter()) {
-                if !expr_deep_equal(&extent, &first_extent)? {
+                if !deep_equal(&extent, &first_extent)? {
                     same_shape = false;
                     break;
                 }
@@ -1443,8 +1401,9 @@ impl StoragePlanRewriter {
         // One allocation large enough for every member, in units of the widest element.
         let mut max_size: Option<Expr> = None;
         for (op, ty) in allocs.iter().zip(&types) {
-            check!(
+            tvm_ffi::ensure!(
                 ty.shape.len() == 1,
+                INTERNAL_ERROR,
                 "TensorVar var {} was identified as a re-usable allocation, but has {} physical \
                  dimensions.  Currently, only flat 1-d memory spaces should be identified as \
                  re-usable allocations.",
@@ -1496,11 +1455,16 @@ impl StoragePlanRewriter {
     /// offset aligned to the group's packing alignment.
     fn new_alloc_merged(&mut self, e: usize) -> Result<()> {
         let entry = &self.alloc_vec[e];
-        check!(
+        tvm_ffi::ensure!(
             alloc_property(&entry.scope)? == AllocProperty::SingleAllocation,
+            INTERNAL_ERROR,
             "only single-allocation scopes are packed"
         );
-        check!(entry.const_nbits != 0, "a packed entry has a constant size");
+        tvm_ffi::ensure!(
+            entry.const_nbits != 0,
+            INTERNAL_ERROR,
+            "a packed entry has a constant size"
+        );
         let align = entry.packing_alignment_bits;
         let round_up = |bits: u64| {
             if bits.is_multiple_of(align) {
@@ -1514,8 +1478,12 @@ impl StoragePlanRewriter {
         let children = entry.merged_children.clone();
         for &child in &children {
             let child = &mut self.alloc_vec[child];
-            check!(child.const_nbits != 0, "a packed child has a constant size");
-            check!(total_bits != 0, "a packed child follows its parent");
+            tvm_ffi::ensure!(
+                child.const_nbits != 0,
+                INTERNAL_ERROR,
+                "a packed child has a constant size"
+            );
+            tvm_ffi::ensure!(total_bits != 0, INTERNAL_ERROR, "a packed child follows its parent");
             child.bits_offset = total_bits;
             child.alloc_var = Some(first.var.clone());
             total_bits = round_up(total_bits + child.const_nbits);
@@ -1589,7 +1557,7 @@ impl StoragePlanRewriter {
         let ty = tensor.ty.clone();
         let view = Call::new_full(
             Some(ty.clone()),
-            self.ops.decl_tensor.clone().into(),
+            DECL_TENSOR.get()?.into(),
             Array::new(vec![backing.tensor_data()?]),
             attrs,
             Array::new(vec![ty]),
@@ -1600,7 +1568,7 @@ impl StoragePlanRewriter {
 
     /// A masked load or store accesses its tensor like a load or store.
     fn mutate_masked(&mut self, op: &Call, m: &mut Mutator) -> Result<Any> {
-        let is_load = op.op.same_as(&self.ops.masked_load);
+        let is_load = MASKED_LOAD.is(&op.op);
         let tensor = tensor_var(&op.args.get(0)?)?;
         let args: Vec<Expr> = op.args.iter().collect();
         let value: Option<Expr> = if is_load { None } else { Some(m.mutate_as(self, &args[1])?) };
@@ -1679,7 +1647,7 @@ impl StoragePlanRewriter {
     }
 
     fn mutate_call(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
-        if op.op.same_as(&self.ops.alloc_tensor) || op.op.same_as(&self.ops.decl_tensor) {
+        if ALLOC_TENSOR.is(&op.op) || DECL_TENSOR.is(&op.op) {
             // Call attrs are opaque to the default descent, but retained storage metadata can
             // refer to remapped bindings.
             let attrs: Option<Attrs> = m.mutate_as(self, &op.attrs)?;
@@ -1689,13 +1657,14 @@ impl StoragePlanRewriter {
             }
             return Ok(call.with_attrs(attrs).into());
         }
-        if op.op.same_as(&self.ops.tensor_data_ptr) && op.args.len() == 1 {
+        if TENSOR_DATA_PTR.is(&op.op) && op.args.len() == 1 {
             if let Ok(var) = op.args.get(0)?.try_cast::<Var>() {
                 let root = self.aliases.root(&var);
                 if let Some(&(_, e)) = self.alloc_map.get(&ObjectIdentity::of(&root)) {
                     let bits_offset = self.alloc_vec[e].bits_offset;
-                    check!(
+                    tvm_ffi::ensure!(
                         bits_offset.is_multiple_of(8),
+                        INTERNAL_ERROR,
                         "a packed offset is a whole number of bytes"
                     );
                     let data = self.alloc_var(e)?.tensor_data()?;
@@ -1705,7 +1674,7 @@ impl StoragePlanRewriter {
                         let offset = int_imm(int64, (bits_offset / 8) as i128)?;
                         let call = Call::new_full(
                             Some(op.ty.clone()),
-                            self.ops.ptr_byte_offset.clone().into(),
+                            PTR_BYTE_OFFSET.get()?.into(),
                             Array::new(vec![data, offset.into()]),
                             None,
                             Array::new(vec![]),
@@ -1717,7 +1686,7 @@ impl StoragePlanRewriter {
                 }
             }
         }
-        if op.op.same_as(&self.ops.masked_load) || op.op.same_as(&self.ops.masked_store) {
+        if MASKED_LOAD.is(&op.op) || MASKED_STORE.is(&op.op) {
             return self.mutate_masked(&op, m);
         }
         m.default_mutate(self, &op)
@@ -1738,7 +1707,11 @@ impl StoragePlanRewriter {
 
     /// Allocations attached to a parallel loop open its body.
     fn mutate_for(&mut self, op: For, m: &mut Mutator) -> Result<Any> {
-        check!(op.kind != FOR_KIND_VECTORIZED, "VectorizeLoop before LiftStorageAlloc");
+        tvm_ffi::ensure!(
+            op.kind != FOR_KIND_VECTORIZED,
+            INTERNAL_ERROR,
+            "VectorizeLoop before LiftStorageAlloc"
+        );
         let Some(entries) = self.attach_map.get(&Some(ObjectIdentity::of(&op))).cloned() else {
             return m.default_mutate(self, &op);
         };
@@ -1759,10 +1732,10 @@ impl StoragePlanRewriter {
 
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            if call.op.same_as(&self.ops.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 return self.mutate_alloc_tensor(&op, call, m);
             }
-            if call.op.same_as(&self.ops.decl_tensor) {
+            if DECL_TENSOR.is(&call.op) {
                 return self.mutate_decl_tensor(&op, call, m);
             }
         }
@@ -1831,7 +1804,6 @@ impl BufferVarInfo {
 
 /// Records how each buffer and pointer is declared and accessed.
 struct VectorTypeAccessChecker {
-    ops: Ops,
     info_map: HashMap<ObjectIdentity, BufferVarInfo>,
     aliases: TensorAliases,
     /// A pointer without an element type takes the type it is accessed as.
@@ -1842,13 +1814,11 @@ struct VectorTypeAccessChecker {
 
 impl VectorTypeAccessChecker {
     fn new(
-        ops: Ops,
         params: &Array<Var>,
         allow_untyped_pointers: bool,
         detect_scalar_read_patterns: bool,
     ) -> Result<Self> {
         let mut checker = Self {
-            ops,
             info_map: HashMap::new(),
             aliases: TensorAliases::default(),
             allow_untyped_pointers,
@@ -1892,8 +1862,9 @@ impl VectorTypeAccessChecker {
         declaration_location: u32,
     ) -> Result<()> {
         let id = ObjectIdentity::of(buffer);
-        check!(
+        tvm_ffi::ensure!(
             !self.info_map.contains_key(&id),
+            INTERNAL_ERROR,
             "Array declaration of {} occurred multiple times.",
             buffer.name.as_str()
         );
@@ -1937,10 +1908,11 @@ impl VectorTypeAccessChecker {
         }
         let allow_untyped_pointers = self.allow_untyped_pointers;
         let Some(var_info) = self.info_map.get_mut(&id) else {
-            return Err(internal_error(format!(
+            tvm_ffi::bail!(
+                INTERNAL_ERROR,
                 "Load/Store of buffer {} occurred before its declaration.",
                 buffer.name.as_str()
-            )));
+            );
         };
         // Scalable accesses are neither checked nor rewritten.
         if is_scalable_vector(value_dtype) {
@@ -1948,8 +1920,9 @@ impl VectorTypeAccessChecker {
         }
         let value_dtype = storage_dtype(value_dtype)?;
         if is_void(var_info.element_dtype) {
-            check!(
+            tvm_ffi::ensure!(
                 allow_untyped_pointers,
+                INTERNAL_ERROR,
                 "Variable {} was missing a type annotation in its declaration",
                 buffer.name.as_str()
             );
@@ -1957,8 +1930,9 @@ impl VectorTypeAccessChecker {
         }
         let indices: Vec<Expr> = indices.iter().collect();
         for index in indices.iter().take(indices.len().saturating_sub(1)) {
-            check!(
+            tvm_ffi::ensure!(
                 encoded_lanes(prim_dtype(index)?) == 1,
+                INTERNAL_ERROR,
                 "Only the last index of a buffer access may be a vector type."
             );
         }
@@ -1971,7 +1945,11 @@ impl VectorTypeAccessChecker {
         // A previous rewrite without index rewriting leaves a vector element type accessed by
         // vector indices.
         if index_lanes * lanes(var_info.element_dtype)? != lanes(value_dtype)? {
-            check!(index_lanes == lanes(value_dtype)?, "the index lanes match the value lanes");
+            tvm_ffi::ensure!(
+                index_lanes == lanes(value_dtype)?,
+                INTERNAL_ERROR,
+                "the index lanes match the value lanes"
+            );
             lanes_used = 1;
             var_info.element_dtype = with_lanes(var_info.element_dtype, 1);
         }
@@ -2030,11 +2008,11 @@ impl VectorTypeAccessChecker {
 
     /// Masked accesses, and the address of a load (an access, though not a read).
     fn walk_call(&mut self, op: Call) -> Result<WalkResult> {
-        let is_load = op.op.same_as(&self.ops.masked_load);
-        if is_load || op.op.same_as(&self.ops.masked_store) {
+        let is_load = MASKED_LOAD.is(&op.op);
+        if is_load || MASKED_STORE.is(&op.op) {
             let (dtype, indices) = self.masked_access(&op, is_load)?;
             self.on_array_access(dtype, &op.args.get(0)?, &indices, is_load)?;
-        } else if op.op.same_as(&self.ops.address_of) {
+        } else if ADDRESS_OF.is(&op.op) {
             if let Ok(load) = op.args.get(0)?.try_cast::<TensorLoad>() {
                 let dtype = prim_dtype(&load.clone().into())?;
                 self.on_array_access(dtype, &load.source, &load.indices, false)?;
@@ -2050,15 +2028,14 @@ impl VectorTypeAccessChecker {
 
     fn walk_bind(&mut self, op: Bind) -> Result<WalkResult> {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            if call.op.same_as(&self.ops.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 self.aliases.set(&op.var, &op.var);
                 self.declare_tensor(&op.var, call, ALLOC_TENSOR_CALL)?;
                 return Ok(WalkResult::Advance);
             }
-            if call.op.same_as(&self.ops.decl_tensor) {
+            if DECL_TENSOR.is(&call.op) {
                 let tensor = tensor_var(&op.var.clone().into())?;
-                let ops = self.ops.clone();
-                self.aliases.register(&ops, &tensor, &call.args.get(0)?)?;
+                self.aliases.register(&tensor, &call.args.get(0)?)?;
                 self.declare_tensor(&op.var, call, DECL_TENSOR_CALL)?;
                 return Ok(WalkResult::Advance);
             }
@@ -2078,7 +2055,7 @@ impl ContextPolicy<VectorTypeAccessChecker> for AddressOfOperand {
         ctx: &mut VisitContext<'_, VectorTypeAccessChecker>,
     ) -> Result<Option<VisitInterrupt>> {
         if let Some(call) = value.as_node::<CallObj>() {
-            if call.op.same_as(&ctx.state().ops.address_of) {
+            if ADDRESS_OF.is(&call.op) {
                 if let Ok(load) = call.args.get(0)?.try_cast::<TensorLoad>() {
                     let kind = ctx.def_region_kind();
                     return ctx.default_visit_children(&load, kind);
@@ -2102,7 +2079,11 @@ impl RewriteInfo {
     fn factor(&self) -> Result<i32> {
         let old_lanes = lanes(self.old_element_dtype)?;
         let new_lanes = lanes(self.new_element_dtype)?;
-        check!(new_lanes % old_lanes == 0, "the new lanes are a multiple of the old");
+        tvm_ffi::ensure!(
+            new_lanes % old_lanes == 0,
+            INTERNAL_ERROR,
+            "the new lanes are a multiple of the old"
+        );
         Ok(new_lanes / old_lanes)
     }
 }
@@ -2164,7 +2145,6 @@ impl RewriteOptions {
 /// `float16* a` retyped to `float16x4* a`, `a[Ramp(i, 1, 4)]` becomes `a[i / 4]`, and a scalar
 /// read `a[i]` becomes a shuffle out of `a[i / 4]`.
 struct VectorTypeRewriter {
-    ops: Ops,
     rewrite_indices: bool,
     rewrite_map: HashMap<ObjectIdentity, RewriteInfo>,
     aliases: TensorAliases,
@@ -2185,7 +2165,6 @@ fn divided_shape(shape: &Array<Expr>, factor: i32) -> Result<Array<Expr>> {
 
 impl VectorTypeRewriter {
     fn new(
-        ops: Ops,
         info_map: &HashMap<ObjectIdentity, BufferVarInfo>,
         aliases: TensorAliases,
         options: RewriteOptions,
@@ -2211,7 +2190,7 @@ impl VectorTypeRewriter {
                     let pointer = old
                         .ty
                         .as_node::<PtrTypeObj>()
-                        .ok_or_else(|| Error::new(TYPE_ERROR, "expected a pointer variable", ""))?;
+                        .ok_or_else(|| error!(TYPE_ERROR, "expected a pointer variable"))?;
                     let ty = PtrType::new(prim_type(preferred)?, pointer.scope.clone())?;
                     Var::new_full(old.name.clone(), ty, old.loc.clone())?
                 }
@@ -2227,7 +2206,6 @@ impl VectorTypeRewriter {
             );
         }
         Ok(Self {
-            ops,
             rewrite_indices: options.rewrite_indices,
             rewrite_map,
             aliases,
@@ -2251,7 +2229,8 @@ impl VectorTypeRewriter {
             return Ok(None);
         };
         let mut indices: Vec<Expr> = indices.iter().collect();
-        let last_dim_index = indices.last().cloned().ok_or_else(|| internal_error("no indices"))?;
+        let last_dim_index =
+            indices.last().cloned().ok_or_else(|| error!(INTERNAL_ERROR, "no indices"))?;
         let index_dtype = prim_dtype(&last_dim_index)?;
         // Scalable accesses are neither checked nor rewritten.
         if is_scalable_vector(dtype_of(&tensor_type(tensor)?)) || is_scalable_vector(index_dtype) {
@@ -2267,7 +2246,11 @@ impl VectorTypeRewriter {
             let base_lanes = make_const(prim_dtype(&ramp.base_)?, lanes as i64)?;
             let mut new_index = ramp.base_.div(base_lanes).expr()?;
             if lanes != factor {
-                check!(factor != 0 && lanes % factor == 0, "the ramp covers whole elements");
+                tvm_ffi::ensure!(
+                    factor != 0 && lanes % factor == 0,
+                    INTERNAL_ERROR,
+                    "the ramp covers whole elements"
+                );
                 let new_lanes = lanes / factor;
                 new_index = Ramp::new_full(
                     ex(&new_index) * new_lanes,
@@ -2281,7 +2264,11 @@ impl VectorTypeRewriter {
         } else if lanes(index_dtype)? == 1 && info.factor()? > 1 {
             let factor = info.factor()? as i64;
             let me = self.analyzer.modular_set(&last_dim_index)?;
-            check!(me.coeff == 0 || factor % me.coeff == 0, "the index reads within one element");
+            tvm_ffi::ensure!(
+                me.coeff == 0 || factor % me.coeff == 0,
+                INTERNAL_ERROR,
+                "the index reads within one element"
+            );
             let divisor = make_const(index_dtype, factor)?;
             *indices.last_mut().expect("non-empty") = last_dim_index.div(divisor).expr()?;
             shuffle_index = me.base_ % factor;
@@ -2332,8 +2319,8 @@ impl VectorTypeRewriter {
 
     /// Masked accesses rewrite like loads and stores; neither can take a scalar shuffle.
     fn rewrite_masked_call(&mut self, op: &Call, m: &mut Mutator) -> Result<Option<Any>> {
-        let is_load = op.op.same_as(&self.ops.masked_load);
-        if !is_load && !op.op.same_as(&self.ops.masked_store) {
+        let is_load = MASKED_LOAD.is(&op.op);
+        if !is_load && !MASKED_STORE.is(&op.op) {
             return Ok(None);
         }
         let tensor = tensor_var(&op.args.get(0)?)?;
@@ -2350,8 +2337,9 @@ impl VectorTypeRewriter {
             None => {
                 let access = TensorLoad::new_full(tensor, indices, op.loc.clone())?;
                 let (modified, shuffle_index) = self.visit_load(access)?;
-                check!(
+                tvm_ffi::ensure!(
                     shuffle_index < 0,
+                    INTERNAL_ERROR,
                     "A masked vector load cannot be rewritten into a scalar shuffle."
                 );
                 let mut args = vec![modified.source.clone()];
@@ -2369,8 +2357,9 @@ impl VectorTypeRewriter {
             Some(value) => {
                 let access = TensorStore::new_full(tensor, indices, value, op.loc.clone())?;
                 let (modified, shuffle_index) = self.visit_store(access)?;
-                check!(
+                tvm_ffi::ensure!(
                     shuffle_index < 0,
+                    INTERNAL_ERROR,
                     "A masked vector store cannot be rewritten into a scalar shuffle."
                 );
                 let mut args = vec![modified.dest.clone(), modified.value.clone()];
@@ -2405,7 +2394,7 @@ impl VectorTypeRewriter {
         let ty = new_buf.ty.clone();
         let call = Call::new_full(
             Some(ty.clone()),
-            self.ops.alloc_tensor.clone().into(),
+            ALLOC_TENSOR.get()?.into(),
             Array::new(args),
             attrs,
             Array::new(vec![ty]),
@@ -2426,7 +2415,7 @@ impl VectorTypeRewriter {
         let ty = tensor.ty.clone();
         let call = Call::new_full(
             Some(ty.clone()),
-            self.ops.decl_tensor.clone().into(),
+            DECL_TENSOR.get()?.into(),
             Array::new(vec![data]),
             attrs,
             Array::new(vec![ty]),
@@ -2474,7 +2463,11 @@ impl VectorTypeRewriter {
             TensorStore::new_full(op.dest.clone(), &indices, value, op.loc.clone())?
         };
         let (modified, shuffle_index) = self.visit_store(node)?;
-        check!(shuffle_index < 0, "a store is not rewritten into a shuffle");
+        tvm_ffi::ensure!(
+            shuffle_index < 0,
+            INTERNAL_ERROR,
+            "a store is not rewritten into a shuffle"
+        );
         Ok(modified.into())
     }
 
@@ -2482,7 +2475,7 @@ impl VectorTypeRewriter {
         if let Some(rewritten) = self.rewrite_masked_call(&op, m)? {
             return Ok(rewritten);
         }
-        if op.op.same_as(&self.ops.tensor_data_ptr) && op.args.len() == 1 {
+        if TENSOR_DATA_PTR.is(&op.op) && op.args.len() == 1 {
             if let Ok(var) = op.args.get(0)?.try_cast::<Var>() {
                 if is_tensor(&var) {
                     let tensor = self.remap_tensor(&var)?;
@@ -2496,10 +2489,10 @@ impl VectorTypeRewriter {
     /// A retyped pointer binding takes the new variable; its value's type follows.
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            if call.op.same_as(&self.ops.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 return self.mutate_alloc_tensor(&op, call, m);
             }
-            if call.op.same_as(&self.ops.decl_tensor) {
+            if DECL_TENSOR.is(&call.op) {
                 return self.mutate_decl_tensor(&op, call, m);
             }
         }
@@ -2533,7 +2526,6 @@ impl VectorTypeRewriter {
 /// `tensor_data_ptr` projections.
 struct PointerVarSubstituter {
     remap: HashMap<ObjectIdentity, Var>,
-    tensor_data_ptr: Op,
 }
 
 #[dispatch(mutate)]
@@ -2547,7 +2539,7 @@ impl PointerVarSubstituter {
 
     fn mutate_call(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
         let call: Call = m.default_mutate_as(self, &op)?;
-        if !call.op.same_as(&self.tensor_data_ptr) || call.args.len() != 1 {
+        if !TENSOR_DATA_PTR.is(&call.op) || call.args.len() != 1 {
             return Ok(call.into());
         }
         let ty: Type = tensor_type(&tensor_var(&call.args.get(0)?)?)?.data_ptr_type()?.into();
@@ -2568,13 +2560,8 @@ impl PointerVarSubstituter {
 
 /// `PointerValueTypeRewrite(f, ...)`: retype the buffers of `func` whose accesses agree on a
 /// vector type.
-fn rewrite_pointer_value_types(
-    func: Function,
-    ops: &Ops,
-    options: RewriteOptions,
-) -> Result<Function> {
+fn rewrite_pointer_value_types(func: Function, options: RewriteOptions) -> Result<Function> {
     let checker = VectorTypeAccessChecker::new(
-        ops.clone(),
         &func.params,
         options.allow_untyped_pointers,
         options.rewrite_scalar_read_to_vector_shuffle,
@@ -2582,8 +2569,7 @@ fn rewrite_pointer_value_types(
     let mut walk = WalkWithContextPolicy::new(checker, AddressOfOperand);
     structural_walk(&func.body, &mut walk, WalkOrder::PreOrder)?;
     let checker = walk.into_state();
-    let mut rewriter =
-        VectorTypeRewriter::new(ops.clone(), &checker.info_map, checker.aliases, options)?;
+    let mut rewriter = VectorTypeRewriter::new(&checker.info_map, checker.aliases, options)?;
     let body: Option<SeqStmt> = match &func.body {
         Some(body) => Some(structural_mutate(body.clone(), &mut rewriter)?.try_into()?),
         None => None,
@@ -2594,7 +2580,6 @@ fn rewrite_pointer_value_types(
             .values()
             .map(|info| (ObjectIdentity::of(&info.old_tensor_var), info.new_tensor_var.clone()))
             .collect(),
-        tensor_data_ptr: ops.tensor_data_ptr.clone(),
     };
     let body: Option<SeqStmt> = match body {
         Some(body) => Some(structural_mutate(body, &mut substituter)?.try_into()?),
@@ -2615,8 +2600,7 @@ fn rewrite_pointer_value_types(
 }
 
 pub fn storage_rewrite() -> Result<Pass> {
-    let ops = Ops::get()?;
-    function_pass("tirx.StorageRewrite", 0, move |func, _module, context| {
+    function_pass("tirx.StorageRewrite", 0, |func, _module, context| {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         // With merged static shared memory, MergeSharedMemoryAllocations does the reuse.
         let merge_static_smem =
@@ -2630,7 +2614,7 @@ pub fn storage_rewrite() -> Result<Pass> {
             }
             None => false,
         };
-        let body = StoragePlanRewriter::new(ops.clone())?.rewrite(
+        let body = StoragePlanRewriter::new()?.rewrite(
             body,
             &func.params,
             true,
@@ -2638,16 +2622,15 @@ pub fn storage_rewrite() -> Result<Pass> {
             reuse_require_exact_matched_dtype,
         )?;
         let func = func.with_body(Some(body));
-        rewrite_pointer_value_types(func, &ops, RewriteOptions::AFTER_STORAGE_REWRITE).map(Some)
+        rewrite_pointer_value_types(func, RewriteOptions::AFTER_STORAGE_REWRITE).map(Some)
     })
 }
 
 pub fn pointer_value_type_rewrite() -> Result<Pass> {
-    let ops = Ops::get()?;
-    function_pass("tirx.PointerValueTypeRewrite", 0, move |func, _module, _context| {
+    function_pass("tirx.PointerValueTypeRewrite", 0, |func, _module, _context| {
         if func.body.is_none() {
             return Ok(Some(func));
         }
-        rewrite_pointer_value_types(func, &ops, RewriteOptions::PASS).map(Some)
+        rewrite_pointer_value_types(func, RewriteOptions::PASS).map(Some)
     })
 }

@@ -25,17 +25,17 @@ use std::collections::HashMap;
 
 use tvm_ffi::{
     dispatch, structural_mutate, Any, Array, Map, Mutator, ObjectIdentity, ObjectRefCast,
-    ObjectRefCore, Result, String,
+    ObjectRefCore, Result, INTERNAL_ERROR,
 };
 
 use super::analyzer::{AnalyzerBase, AnalyzerScope, AnalyzerState};
-use super::flattened_tensor::{
-    as_tensor_var, elem_offset, flattened_tensor, structural_equal, tensor_type,
-};
+use super::flattened_tensor::{as_tensor_var, elem_offset, flattened_tensor, tensor_type};
 use super::util::{function_pass, get_attr, int_imm, prim_dtype, MutatorExt};
-use crate::ir::{Bind, Call, CallObj, Expr, Op, SeqStmt, Stmt, TensorLoad, TensorStore, Var};
-use crate::ops::{int32, unknown_loc, Ex, PrimOps};
+use crate::ir::{Bind, Call, CallObj, Expr, SeqStmt, Stmt, TensorLoad, TensorStore, Var};
+use crate::ops::{int32, structural_equal, unknown_loc, Ex, PrimOps};
 use crate::sym::Analyzer;
+use crate::target::Target;
+use crate::tirx::op::{ALLOC_TENSOR, CUDA_DECL_TMEM, DECL_TENSOR, REINTERPRET, TENSOR_DATA_PTR};
 use crate::tirx::{Axis, ComposeLayout, Layout, TensorType, TileLayout};
 use crate::transform::Pass;
 
@@ -52,11 +52,6 @@ struct LayoutApplier {
     remap: HashMap<ObjectIdentity, Var>,
     /// The storage root each tensor aliases, recorded at its definition.
     tensor_aliases: HashMap<ObjectIdentity, Var>,
-    alloc_tensor: Op,
-    decl_tensor: Op,
-    decl_tmem: Op,
-    reinterpret: Op,
-    tensor_data_ptr: Op,
 }
 
 impl AnalyzerState for LayoutApplier {
@@ -84,18 +79,18 @@ impl LayoutApplier {
 
     /// `tensor_data_ptr(t)` projects the storage root of `t`.
     fn mutate_call(&mut self, call: Call, m: &mut Mutator) -> Result<Any> {
-        if call.op.same_as(&self.tensor_data_ptr) && call.args.len() == 1 {
+        if TENSOR_DATA_PTR.is(&call.op) && call.args.len() == 1 {
             let arg = call.args.get(0)?;
             if let Ok(tensor) = arg.clone().try_cast::<Var>() {
                 if tensor_type(&tensor).is_ok() {
                     let Some(root) = self.tensor_aliases.get(&ObjectIdentity::of(&tensor)) else {
-                        let message = format!(
+                        tvm_ffi::bail!(
+                            INTERNAL_ERROR,
                             "Check failed: (root_opt.has_value()) is false: tensor_data_ptr \
                              projects {}, which has no visible definition \
                              (AllocTensor/DeclTensor/Function parameter) at this point",
                             tensor.name.as_str()
                         );
-                        return Err(tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, &message, ""));
                     };
                     let mut root = root.clone();
                     if let Some(mapped) = self.remap.get(&ObjectIdentity::of(&root)) {
@@ -112,29 +107,26 @@ impl LayoutApplier {
         let var = op.var.clone();
         // `Bind(t, source)` of a tensor declares `t` over the source's data.
         if let Some((source, _)) = as_tensor_var(&op.value) {
-            let declaration = self.declaration(&var, source.tensor_data()?)?;
+            let declaration = declaration(&var, source.tensor_data()?)?;
             let binding = Bind::new_full(var, declaration.clone(), op.loc.clone())?;
             let result = self.mutate_decl_tensor(&binding, &declaration, m)?;
             return Ok(result.unwrap_or(binding).into());
         }
         if op.value.as_node::<CallObj>().is_some() {
             let call: Call = op.value.clone().try_cast()?;
-            if call.op.same_as(&self.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 return self.mutate_alloc_tensor(&op, &call, m);
             }
-            if call.op.same_as(&self.decl_tensor) {
+            if DECL_TENSOR.is(&call.op) {
                 return Ok(self.mutate_decl_tensor(&op, &call, m)?.unwrap_or(op).into());
             }
-            if call.op.same_as(&self.decl_tmem) {
+            if CUDA_DECL_TMEM.is(&call.op) {
                 // TMEM is allocated by the pool; keep an explicit backing pointer so data
                 // projections work for views and parameters too.
                 let ty = tensor_type(&var)?;
-                let pointer = Call::new(
-                    ty.data_ptr_type()?,
-                    self.reinterpret.clone(),
-                    vec![call.args.get(0)?],
-                )?;
-                let declaration = self.declaration(&var, pointer.into())?;
+                let pointer =
+                    Call::new(ty.data_ptr_type()?, REINTERPRET.get()?, vec![call.args.get(0)?])?;
+                let declaration = declaration(&var, pointer.into())?;
                 let binding = Bind::new_full(var, declaration.clone(), op.loc.clone())?;
                 let result = self.mutate_decl_tensor(&binding, &declaration, m)?;
                 return Ok(result.unwrap_or(binding).into());
@@ -163,35 +155,13 @@ impl LayoutApplier {
     }
 }
 
-fn axis_is(predicate: &str, axis: &Axis) -> Result<bool> {
-    tvm_ffi::Function::get_global(predicate)?.call_tuple((axis.clone(),))?.try_into()
-}
-
 impl LayoutApplier {
     fn new(analyzer: Analyzer) -> Result<Self> {
         Ok(Self {
             base: AnalyzerBase::new(analyzer)?,
             remap: HashMap::new(),
             tensor_aliases: HashMap::new(),
-            alloc_tensor: Op::get("tirx.alloc_tensor")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
-            decl_tmem: Op::get("tirx.cuda.decl_tmem")?,
-            reinterpret: Op::get("tirx.reinterpret")?,
-            tensor_data_ptr: Op::get("tirx.tensor_data_ptr")?,
         })
-    }
-
-    /// `Call(t.ty, decl_tensor, {data}, {}, {t.ty})`.
-    fn declaration(&self, tensor: &Var, data: Expr) -> Result<Call> {
-        let ty = tensor.ty.clone();
-        Call::new_full(
-            Some(ty.clone()),
-            self.decl_tensor.clone().into(),
-            Array::new(vec![data]),
-            None,
-            Array::new(vec![ty]),
-            unknown_loc()?,
-        )
     }
 
     /// `Mutate(expr)` at `site`.
@@ -212,7 +182,7 @@ impl LayoutApplier {
         let ty = tensor.ty.clone();
         let value = Call::new_full(
             Some(ty.clone()),
-            self.alloc_tensor.clone().into(),
+            ALLOC_TENSOR.get()?.into(),
             Array::new(args),
             call.attrs.clone(),
             Array::new(vec![ty]),
@@ -238,7 +208,7 @@ impl LayoutApplier {
         let ty = tensor.ty.clone();
         let value = Call::new_full(
             Some(ty.clone()),
-            self.decl_tensor.clone().into(),
+            DECL_TENSOR.get()?.into(),
             Array::new(vec![data]),
             call.attrs.clone(),
             Array::new(vec![ty]),
@@ -251,18 +221,18 @@ impl LayoutApplier {
     fn register_alias(&mut self, tensor: &Var, data: &Expr) -> Result<()> {
         let mut root = tensor.clone();
         if let Some(call) = data.as_node::<CallObj>() {
-            if call.op.same_as(&self.tensor_data_ptr) && call.args.len() == 1 {
+            if TENSOR_DATA_PTR.is(&call.op) && call.args.len() == 1 {
                 if let Ok(source) = call.args.get(0)?.try_cast::<Var>() {
                     if tensor_type(&source).is_ok() {
                         let Some(source_root) =
                             self.tensor_aliases.get(&ObjectIdentity::of(&source))
                         else {
-                            let message = format!(
+                            tvm_ffi::bail!(
+                                INTERNAL_ERROR,
                                 "Check failed: (source_root.has_value()) is false: Tensor alias \
                                  source {} must be registered before its DeclTensor alias",
                                 source.name.as_str()
                             );
-                            return Err(tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, &message, ""));
                         };
                         root = source_root.clone();
                     }
@@ -289,13 +259,13 @@ impl LayoutApplier {
                 let analyzer = Analyzer::new()?;
                 let mut span = Ex::from(int32(1));
                 for iter in tile.shard()?.iter().chain(tile.replica()?.iter()) {
-                    if axis_is("tirx.AxisIsMemoryAxis", &iter.axis)? {
+                    if iter.axis.is_memory_axis()? {
                         span += (Ex::from(&iter.extent) - 1) * &iter.stride;
                     }
                 }
                 let offset: Map<Axis, Expr> = tile.offset()?;
                 for (axis, offset) in offset.iter() {
-                    if axis_is("tirx.AxisIsMemoryAxis", &axis)? {
+                    if axis.is_memory_axis()? {
                         span += &offset;
                     }
                 }
@@ -306,20 +276,14 @@ impl LayoutApplier {
                 // A swizzle permutes addresses: round the memory span to a block whose upper bits
                 // the swizzle cannot change.
                 let tile_layout = compose.tile_layout()?;
-                let trivial: bool = tvm_ffi::cached_global_func!("tirx.TileLayoutIsTrivial")
-                    .call_tuple((tile_layout.clone(),))?
-                    .try_into()?;
-                let mut span: Expr = if trivial {
+                let mut span: Expr = if tile_layout.is_trivial()? {
                     let mut span = Ex::from(int32(1));
                     for extent in buf_ty.shape.iter() {
                         span *= &extent;
                     }
                     span.expr()?
                 } else {
-                    let layout: Layout = tile_layout.into();
-                    tvm_ffi::cached_global_func!("tirx.LayoutGetSpan")
-                        .call_tuple((layout, String::from("m")))?
-                        .try_into()?
+                    Layout::from(tile_layout).span("m")?
                 };
                 let swizzle_len = compose.swizzle_len()?;
                 if swizzle_len != 0 {
@@ -377,35 +341,41 @@ impl LayoutApplier {
         if let Some(layout) = ty.layout.clone() {
             if let Ok(tile) = layout.clone().try_cast::<TileLayout>() {
                 for iter in tile.shard()?.iter() {
-                    if axis_is("tirx.AxisIsThreadAxis", &iter.axis)? {
-                        let message = "Cannot lower direct TensorLoad/TensorStore on a tensor \
-                                       with thread-axis layout: unable to verify that the \
-                                       coordinate matches the current thread. Use .view() + \
-                                       .local() to decompose thread and memory axes.";
-                        return Err(tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, message, ""));
+                    if iter.axis.is_thread_axis()? {
+                        tvm_ffi::bail!(
+                            INTERNAL_ERROR,
+                            "Cannot lower direct TensorLoad/TensorStore on a tensor with \
+                             thread-axis layout: unable to verify that the coordinate matches the \
+                             current thread. Use .view() + .local() to decompose thread and \
+                             memory axes."
+                        );
                     }
                 }
             }
-            let canonical: Layout = tvm_ffi::cached_global_func!("tirx.LayoutCanonicalize")
-                .call_tuple((layout,))?
-                .try_into()?;
-            let offsets: Map<String, Expr> =
-                tvm_ffi::cached_global_func!("tirx.LayoutApplyWithShape")
-                    .call_tuple((canonical, indices.clone(), ty.shape.clone()))?
-                    .try_into()?;
-            if offsets.len() != 1 {
-                let message = format!(
-                    "Check failed: res.size() == 1 ({} vs. 1) : Expected a single element offset",
-                    offsets.len()
-                );
-                return Err(tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, &message, ""));
-            }
+            let offsets = layout.canonicalize()?.apply_with_shape(indices, &ty.shape)?;
+            check_cmp!(
+                offsets.len(), ==, 1, INTERNAL_ERROR, "res.size() == 1",
+                "Expected a single element offset"
+            );
             let (_, offset) = offsets.iter().next().expect("one offset");
             return Ok(Array::new(vec![self.base.analyzer.simplify(&offset, 2)?]));
         }
         let flattened = elem_offset(&ty, indices, true)?;
         Ok(Array::new(vec![self.base.analyzer.simplify(&flattened.get(0)?, 2)?]))
     }
+}
+
+/// `Call(t.ty, decl_tensor, {data}, {}, {t.ty})`.
+fn declaration(tensor: &Var, data: Expr) -> Result<Call> {
+    let ty = tensor.ty.clone();
+    Call::new_full(
+        Some(ty.clone()),
+        DECL_TENSOR.get()?.into(),
+        Array::new(vec![data]),
+        None,
+        Array::new(vec![ty]),
+        unknown_loc()?,
+    )
 }
 
 /// C++ `LayoutApplier::Flatten(body, params, target)`: the flattened body and the parameters.
@@ -442,7 +412,7 @@ fn flatten(body: SeqStmt, params: &Array<Var>) -> Result<(Stmt, Array<Var>)> {
     }
     let mut stmt: Stmt = structural_mutate(body, &mut applier)?.try_into()?;
     for (buf, source) in aliased {
-        let declaration = applier.declaration(&buf, source.tensor_data()?)?;
+        let declaration = declaration(&buf, source.tensor_data()?)?;
         stmt = SeqStmt::new(vec![Bind::new(buf, declaration)?.into(), stmt])?.into();
     }
     Ok((stmt, Array::new(new_params)))
@@ -453,7 +423,7 @@ pub fn lower_tirx_cleanup() -> Result<Pass> {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         // `ResolveTarget`: the function's target, or the current one, which must exist.
         if get_attr(&func.attrs, "target")?.is_none() {
-            tvm_ffi::cached_global_func!("target.TargetCurrent").call_tuple((false,))?;
+            Target::current(false)?;
         }
         let (body, params) = flatten(body, &func.params)?;
         let body = SeqStmt::from_stmt(body)?;

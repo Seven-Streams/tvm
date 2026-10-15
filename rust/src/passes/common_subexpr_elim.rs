@@ -35,7 +35,7 @@ use tvm_ffi::{
 use super::util::{function_pass, prim_dtype, MutatorExt};
 use crate::ir::{
     AssertStmt, Bind, Break, Call, Continue, DictAttrs, Evaluate, Expr, FloatImmObj, For, If,
-    IntImmObj, Op, OpaqueExpr, OpaqueExprObj, PrimTypeObj, RegionStmt, Return, SeqStmt, Stmt,
+    IntImmObj, OpaqueExpr, OpaqueExprObj, PrimTypeObj, RegionStmt, Return, SeqStmt, Stmt,
     StringImmObj, TensorLoad, TensorLoadObj, TensorRegion, TensorStore, Tuple, TupleGetItem, Type,
     Var, VarObj, While,
 };
@@ -45,6 +45,8 @@ use crate::prim::{
     ModObj, MulObj, NotObj, OrObj, RShiftObj, Ramp, RampObj, SelectObj, Shuffle, SubObj, EQObj,
     GEObj, GTObj, LEObj, LTObj, NEObj,
 };
+use crate::ops::structural_hash;
+use crate::tirx::op::LAUNCH_THREAD;
 use crate::transform::Pass;
 
 const DL_BOOL: u8 = 6;
@@ -62,16 +64,7 @@ fn deep_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
     if tvm_ffi::AnyView::from(lhs).type_index() != tvm_ffi::AnyView::from(rhs).type_index() {
         return Ok(false);
     }
-    tvm_ffi::cached_global_func!("prim.expr_deep_equal")
-        .call_tuple((lhs.clone(), rhs.clone()))?
-        .try_into()
-}
-
-/// C++ `ffi::StructuralHash()(expr)`.
-fn structural_hash(expr: &Expr) -> Result<i64> {
-    tvm_ffi::cached_global_func!("ffi.StructuralHash")
-        .call_tuple((Any::from(expr.clone()), false, false))?
-        .try_into()
+    crate::ops::deep_equal(lhs, rhs)
 }
 
 /// A map keyed by expression under `ExprDeepEqual`, iterated in insertion order: C++
@@ -154,7 +147,6 @@ struct Planner {
     /// The statement most recently entered (C++ sets it on every statement visit).
     current_stmt: Option<Stmt>,
     let_depth: usize,
-    launch_thread: Op,
 }
 
 /// The operands of a node the planner records, in the order C++ visits them.
@@ -266,7 +258,6 @@ impl Planner {
             current_scope: 0,
             current_stmt: None,
             let_depth: 0,
-            launch_thread: Op::get("tirx.launch_thread")?,
         };
         structural_mutate(body.clone(), &mut planner)?;
         planner.compute_plan()
@@ -434,7 +425,7 @@ impl Planner {
         self.enter(op.clone());
         m.mutate(self, &op.args)?;
         m.mutate(self, &op.attrs)?;
-        if op.op.same_as(&self.launch_thread) {
+        if LAUNCH_THREAD.is(&op.op) {
             self.scoped(op.clone().into(), &op.body, m)?;
         }
         Ok(Unchanged)
@@ -659,7 +650,6 @@ struct Rewriter {
     materialized: HashSet<ObjectIdentity>,
     /// Inside the body of a region other than a launched thread, which the plan does not cover.
     opaque: bool,
-    launch_thread: Op,
 }
 
 impl Rewriter {
@@ -711,7 +701,7 @@ impl Rewriter {
         if self.opaque {
             return m.default_mutate(self, &op);
         }
-        let visited = if op.op.same_as(&self.launch_thread) {
+        let visited = if LAUNCH_THREAD.is(&op.op) {
             m.default_mutate(self, &op)?
         } else {
             let args: Array<Expr> = m.mutate_as(self, &op.args)?;
@@ -754,12 +744,7 @@ pub fn common_subexpr_elim() -> Result<Pass> {
         if plan.insert_before.is_empty() {
             return Ok(Some(func));
         }
-        let mut rewriter = Rewriter {
-            plan,
-            materialized: HashSet::new(),
-            opaque: false,
-            launch_thread: Op::get("tirx.launch_thread")?,
-        };
+        let mut rewriter = Rewriter { plan, materialized: HashSet::new(), opaque: false };
         let body: Stmt = structural_mutate(body, &mut rewriter)?.try_into()?;
         Ok(Some(func.with_body(Some(SeqStmt::from_stmt(body)?))))
     })

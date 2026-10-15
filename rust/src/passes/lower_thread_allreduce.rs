@@ -24,29 +24,29 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tvm_ffi::{
-    dispatch, structural_map, structural_mutate, Any, AnyView, Array, DLDataType, Error, Map,
+    bail, dispatch, structural_map, structural_mutate, Any, AnyView, Array, DLDataType, Map,
     Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String, UnchangedOr, WalkOrder,
-    TYPE_ERROR, VALUE_ERROR,
+    INTERNAL_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 
 use super::analyzer::is_const_int;
-use super::util::{MutatorExt, dict_with, function_pass, get_attr, int_imm, internal, prim_dtype};
+use super::util::{MutatorExt, dict_with, function_pass, get_attr, int_imm, prim_dtype};
 use crate::ir::{
-    Bind, Call, CallObj, DictAttrs, Evaluate, Expr, If, LambdaExpr, LambdaExprObj, Op, PrimType,
-    PrimTypeObj, RegionStmt, SeqStmt, Stmt, StringImm, StringImmObj, TensorLoad, TensorLoadObj,
-    TensorStore, TupleObj, Var, VarObj,
+    Bind, Call, CallObj, DictAttrs, Evaluate, Expr, If, LambdaExpr, LambdaExprObj, OpHandle,
+    PrimType, PrimTypeObj, RegionStmt, SeqStmt, Stmt, StringImm, StringImmObj, TensorLoad,
+    TensorLoadObj, TensorStore, TupleObj, Var, VarObj,
 };
 use crate::ops::{prim_type, PrimOps};
 use crate::prim::{CastObj, Select};
 use crate::runtime::MemoryScope;
 use crate::sym::Analyzer;
 use crate::target::Target;
+use crate::tirx::op::{
+    ALLOC_TENSOR, DECL_TENSOR, GPU_STORAGE_SYNC, GPU_THREAD_ALLREDUCE, GPU_WARP_ACTIVEMASK,
+    GPU_WARP_SHUFFLE, GPU_WARP_SHUFFLE_DOWN, LAUNCH_THREAD, TENSOR_DATA_PTR,
+};
 use crate::tirx::{TensorType, TensorTypeObj};
 use crate::transform::Pass;
-
-fn type_error(message: &str) -> Error {
-    Error::new(TYPE_ERROR, message, "")
-}
 
 /// `TensorStore(dest, indices, value)`, as a statement.
 fn tensor_store(dest: &Var, indices: Vec<Expr>, value: Expr) -> Result<Stmt> {
@@ -67,7 +67,7 @@ fn as_tensor_var(expr: &Expr) -> Result<Var> {
     let var = expr.as_node::<VarObj>().filter(|_| is_exact_var(expr));
     match var {
         Some(var) if var.ty.as_node::<TensorTypeObj>().is_some() => Ok(expr.clone().try_cast()?),
-        _ => Err(type_error("Cannot convert to `tirx.TensorVar`")),
+        _ => bail!(TYPE_ERROR, "Cannot convert to `tirx.TensorVar`"),
     }
 }
 
@@ -86,7 +86,7 @@ fn is_exact_var(expr: &Expr) -> bool {
 fn as_prim_expr(expr: &Expr) -> Result<Expr> {
     match expr.ty.as_node::<PrimTypeObj>() {
         Some(_) => Ok(expr.clone()),
-        None => Err(type_error("Cannot convert to `ir.PrimExpr`")),
+        None => bail!(TYPE_ERROR, "Cannot convert to `ir.PrimExpr`"),
     }
 }
 
@@ -99,7 +99,7 @@ fn prim_ty(expr: &Expr) -> Result<PrimType> {
 fn lanes(dtype: DLDataType) -> Result<i32> {
     match dtype.lanes as i16 {
         lanes if lanes < 0 => {
-            Err(internal("Can't fetch the lanes of a scalable vector at a compile time."))
+            bail!(INTERNAL_ERROR, "Can't fetch the lanes of a scalable vector at a compile time.")
         }
         lanes => Ok(lanes as i32),
     }
@@ -124,13 +124,13 @@ fn parse_thread_tag(tag: &str) -> Result<(i32, i32)> {
             return Ok((rank, dim(prefix)));
         }
     }
-    Err(internal(&format!("Unknown threadscope {tag}")))
+    bail!(INTERNAL_ERROR, "Unknown threadscope {tag}")
 }
 
 /// `LambdaExpr::Apply`: the body with the arguments substituted for the parameters.
 fn apply_lambda(lambda: &LambdaExprObj, arguments: Vec<Expr>) -> Result<Expr> {
     if arguments.len() != lambda.vars.len() {
-        return Err(Error::new(VALUE_ERROR, "LambdaExpr Apply arity mismatch", ""));
+        bail!(VALUE_ERROR, "LambdaExpr Apply arity mismatch");
     }
     let substitutions: HashMap<ObjectIdentity, Expr> =
         lambda.vars.iter().map(|var| ObjectIdentity::of(&var)).zip(arguments).collect();
@@ -153,43 +153,15 @@ fn apply_combiner(combiner: &LambdaExpr, lhs: &[Expr], rhs: &[Expr]) -> Result<V
 }
 
 /// `(GetBufferDataVar(data))`: the variable a tensor declaration's data refers to.
-fn buffer_data_var(data: &Expr, tensor_data_ptr: &Op) -> Option<Var> {
+fn buffer_data_var(data: &Expr) -> Option<Var> {
     if let Ok(var) = data.clone().try_cast::<Var>() {
         return Some(var);
     }
     let call = data.as_node::<CallObj>()?;
-    if call.op.same_as(tensor_data_ptr) && call.args.len() == 1 {
+    if TENSOR_DATA_PTR.is(&call.op) && call.args.len() == 1 {
         return call.args.get(0).ok()?.try_cast::<Var>().ok();
     }
     None
-}
-
-struct Ops {
-    allreduce: Op,
-    activemask: Op,
-    shuffle: Op,
-    shuffle_down: Op,
-    storage_sync: Op,
-    alloc_tensor: Op,
-    decl_tensor: Op,
-    tensor_data_ptr: Op,
-    launch_thread: Op,
-}
-
-impl Ops {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            allreduce: Op::get("tirx.gpu_thread_allreduce")?,
-            activemask: Op::get("tirx.gpu_warp_activemask")?,
-            shuffle: Op::get("tirx.gpu_warp_shuffle")?,
-            shuffle_down: Op::get("tirx.gpu_warp_shuffle_down")?,
-            storage_sync: Op::get("tirx.gpu_storage_sync")?,
-            alloc_tensor: Op::get("tirx.alloc_tensor")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
-            tensor_data_ptr: Op::get("tirx.tensor_data_ptr")?,
-            launch_thread: Op::get("tirx.launch_thread")?,
-        })
-    }
 }
 
 /// A thread axis of the enclosing launches.
@@ -234,16 +206,10 @@ impl Remaps {
 
     /// `RemapAllocTensor`: the allocation of `node` made for `replacement`, volatile in shared
     /// memory.
-    fn remap_alloc(
-        &self,
-        node: &Bind,
-        replacement: &Var,
-        ops: &Ops,
-        shared: &MemoryScope,
-    ) -> Result<Stmt> {
+    fn remap_alloc(&self, node: &Bind, replacement: &Var, shared: &MemoryScope) -> Result<Stmt> {
         let call = node.value.as_node::<CallObj>().expect("checked to be an alloc_tensor call");
         let Some(attrs) = &call.attrs else {
-            return Err(internal("alloc_tensor without attributes"));
+            bail!(INTERNAL_ERROR, "alloc_tensor without attributes");
         };
         let mut annotations: DictAttrs = attrs.clone().try_cast()?;
         if tensor_ty(replacement).scope.same_as(shared) {
@@ -252,7 +218,7 @@ impl Remaps {
         let ty = replacement.ty.clone();
         let value = Call::new_full(
             Some(ty.clone()),
-            ops.alloc_tensor.clone().into(),
+            ALLOC_TENSOR.get()?.into(),
             call.args.clone(),
             Some(annotations.into()),
             Array::new(vec![ty]),
@@ -263,7 +229,6 @@ impl Remaps {
 }
 
 struct ThreadAllreduceBuilder {
-    ops: Ops,
     shared: MemoryScope,
     local: MemoryScope,
     target_kind: std::string::String,
@@ -281,7 +246,7 @@ struct ThreadAllreduceBuilder {
 #[dispatch(mutate)]
 impl ThreadAllreduceBuilder {
     fn mutate_region(&mut self, op: RegionStmt, m: &mut Mutator) -> Result<Any> {
-        if !op.op.same_as(&self.ops.launch_thread) || thread_tag(&op)?.starts_with("vthread") {
+        if !LAUNCH_THREAD.is(&op.op) || thread_tag(&op)?.starts_with("vthread") {
             return m.default_mutate(self, &op);
         }
         self.thread_extents.push(op.clone());
@@ -293,7 +258,7 @@ impl ThreadAllreduceBuilder {
     fn mutate_evaluate(&mut self, op: Evaluate, m: &mut Mutator) -> Result<Any> {
         let stmt: Evaluate = m.default_mutate_as(self, &op)?;
         match stmt.value.as_node::<CallObj>() {
-            Some(call) if call.op.same_as(&self.ops.allreduce) => {
+            Some(call) if GPU_THREAD_ALLREDUCE.is(&call.op) => {
                 Ok(self.make_allreduce(call)?.into())
             }
             _ => Ok(stmt.into()),
@@ -302,10 +267,10 @@ impl ThreadAllreduceBuilder {
 
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            if call.op.same_as(&self.ops.alloc_tensor) {
+            if ALLOC_TENSOR.is(&call.op) {
                 return self.mutate_alloc_tensor(op, m);
             }
-            if call.op.same_as(&self.ops.decl_tensor) {
+            if DECL_TENSOR.is(&call.op) {
                 let data = call.args.get(0)?;
                 self.register_tensor_alias(&as_tensor_var(&op.var.clone().into())?, &data)?;
                 // Declarations are remapped by `DeferredRemapper`, once every allreduce is known.
@@ -335,9 +300,9 @@ impl ThreadAllreduceBuilder {
         let allocation = self.remaps.allocation_key(&as_tensor_var(&op.dest)?);
         let store: TensorStore = m.default_mutate_as(self, &op)?;
         if let Some(remapped) = self.load_remap.get(&allocation) {
-            let Some(replacement) = remapped.as_node::<TensorLoadObj>() else {
-                return Err(internal("Check failed: (replacement) is false: "));
-            };
+            let replacement = remapped.as_node::<TensorLoadObj>();
+            check!(replacement.is_some(), INTERNAL_ERROR, "replacement");
+            let replacement = replacement.expect("checked above");
             check_zero_indices(store.indices.iter())?;
             let (dest, indices) = (replacement.source.clone(), replacement.indices.clone());
             let value = store.value.clone();
@@ -360,15 +325,13 @@ fn thread_tag(region: &RegionStmt) -> Result<std::string::String> {
     let tag = region.args.get(0)?;
     match tag.as_node::<StringImmObj>() {
         Some(tag) => Ok(tag.value.as_str().to_string()),
-        None => Err(type_error("Cannot convert to `ir.StringImm`")),
+        None => bail!(TYPE_ERROR, "Cannot convert to `ir.StringImm`"),
     }
 }
 
 fn check_zero_indices(indices: impl Iterator<Item = Expr>) -> Result<()> {
     for index in indices {
-        if !is_const_int(&index, 0) {
-            return Err(internal("Check failed: (IsZero(index)) is false: "));
-        }
+        check!(is_const_int(&index, 0), INTERNAL_ERROR, "IsZero(index)");
     }
     Ok(())
 }
@@ -389,7 +352,6 @@ impl ThreadAllreduceBuilder {
             }
         }
         Ok(Self {
-            ops: Ops::new()?,
             shared: MemoryScope::get("shared")?,
             local: MemoryScope::get("local")?,
             target_kind: target.kind()?.name()?.as_str().to_string(),
@@ -408,10 +370,7 @@ impl ThreadAllreduceBuilder {
         self.remaps.aliases.insert(key.clone(), op.var.clone());
         let node: Bind = m.default_mutate_as(self, &op)?;
         if let Some(replacement) = self.remaps.alloc.get(&key) {
-            return Ok(self
-                .remaps
-                .remap_alloc(&node, replacement, &self.ops, &self.shared)?
-                .into());
+            return Ok(self.remaps.remap_alloc(&node, replacement, &self.shared)?.into());
         }
         self.remaps.pending.push(key);
         Ok(node.into())
@@ -420,17 +379,15 @@ impl ThreadAllreduceBuilder {
     /// `RegisterTensorAlias`: a declaration over another tensor's data shares its root.
     fn register_tensor_alias(&mut self, tensor: &Var, data: &Expr) -> Result<()> {
         let mut root = tensor.clone();
-        if let Some(source) = buffer_data_var(data, &self.ops.tensor_data_ptr) {
+        if let Some(source) = buffer_data_var(data) {
             if source.ty.as_node::<TensorTypeObj>().is_some() {
                 match self.remaps.aliases.get(&ObjectIdentity::of(&source)) {
                     Some(source_root) => root = source_root.clone(),
-                    None => {
-                        let message = format!(
-                            "Tensor alias source {} must be registered before its DeclTensor alias",
-                            source.name.as_str()
-                        );
-                        return Err(internal(&message));
-                    }
+                    None => bail!(
+                        INTERNAL_ERROR,
+                        "Tensor alias source {} must be registered before its DeclTensor alias",
+                        source.name.as_str()
+                    ),
                 }
             }
         }
@@ -441,15 +398,14 @@ impl ThreadAllreduceBuilder {
     /// `SyncThread(sync)`.
     fn sync_thread(&self, sync: &str) -> Result<Stmt> {
         let ty = prim_type(super::util::int32_dtype())?;
-        let call =
-            Call::new(ty, self.ops.storage_sync.clone(), vec![StringImm::new(sync)?.into()])?;
+        let call = Call::new(ty, GPU_STORAGE_SYNC.get()?, vec![StringImm::new(sync)?.into()])?;
         Ok(Evaluate::new(call)?.into())
     }
 
     /// `WarpShuffle(op, mask_tensor, val, delta_or_lane)`.
     fn warp_shuffle(
         &self,
-        op: &Op,
+        op: &OpHandle,
         mask_tensor: Option<&Var>,
         val: Expr,
         delta_or_lane: Expr,
@@ -460,7 +416,7 @@ impl ThreadAllreduceBuilder {
         };
         let width: Expr = crate::ops::int32(self.warp_size)?.into();
         let ty = val.ty.clone();
-        Ok(Call::new(ty, op.clone(), vec![mask, val, delta_or_lane, width.clone(), width])?.into())
+        Ok(Call::new(ty, op.get()?, vec![mask, val, delta_or_lane, width.clone(), width])?.into())
     }
 
     /// `FlattenThread`: the flattened index of `threads` and their total extent.
@@ -576,7 +532,7 @@ impl ThreadAllreduceBuilder {
                 arg = cast.value.clone();
             }
             let Some(load) = arg.as_node::<TensorLoadObj>() else {
-                return Err(type_error("Cannot convert to `ir.TensorLoad`"));
+                bail!(TYPE_ERROR, "Cannot convert to `ir.TensorLoad`");
             };
             tensors.push(as_tensor_var(&load.source)?);
         }
@@ -589,9 +545,10 @@ impl ThreadAllreduceBuilder {
                 }
                 None if is_const_int(axis, 0) => {}
                 None => {
-                    return Err(internal(
-                        "Reduction thread axis should be a VarNode or zero IntImmNode",
-                    ))
+                    bail!(
+                        INTERNAL_ERROR,
+                        "Reduction thread axis should be a VarNode or zero IntImmNode"
+                    )
                 }
             }
         }
@@ -600,30 +557,26 @@ impl ThreadAllreduceBuilder {
         let mut thread_axes_by_dim: BTreeMap<i32, (ThreadEntry, bool)> = BTreeMap::new();
         for launch in &self.thread_extents {
             let var = as_prim_var(&launch.body_params.get(0)?.into())
-                .ok_or_else(|| type_error("Cannot convert to `ir.PrimVar`"))?;
+                .ok_or_else(|| error!(TYPE_ERROR, "Cannot convert to `ir.PrimVar`"))?;
             let tag = thread_tag(launch)?;
             if tag.starts_with("vthread") {
-                return Err(internal("vthread do not work with cross thread reduction"));
+                bail!(INTERNAL_ERROR, "vthread do not work with cross thread reduction");
             }
             let (rank, dim_index) = parse_thread_tag(&tag)?;
-            if rank > 1 {
-                return Err(internal(&format!(
-                    "Check failed: e.scope.rank <= 1 ({rank} vs. 1) : "
-                )));
-            }
+            check_cmp!(rank, <=, 1, INTERNAL_ERROR, "e.scope.rank <= 1");
             if dim_index < 0 {
-                return Err(internal("vthread do not work with cross thread reduction"));
+                bail!(INTERNAL_ERROR, "vthread do not work with cross thread reduction");
             }
             if rank != 1 {
                 continue;
             }
             let extent = as_prim_expr(&launch.args.get(1)?)?;
             let Some(extent) = extent.as_node::<crate::ir::IntImmObj>() else {
-                let message = format!("Need constant extent for reduce set {}", var.name.as_str());
-                return Err(internal(&message));
+                bail!(INTERNAL_ERROR, "Need constant extent for reduce set {}", var.name.as_str());
             };
             let extent = extent.value.to_i64().and_then(|v| i32::try_from(v).ok());
-            let extent = extent.ok_or_else(|| internal("thread extent out of int range"))?;
+            let extent =
+                extent.ok_or_else(|| error!(INTERNAL_ERROR, "thread extent out of int range"))?;
             let entry = ThreadEntry { rank, dim_index, var: var.clone(), extent };
             let is_reduce = reduce_set.contains(&ObjectIdentity::of(&var));
             nmatch += is_reduce as usize;
@@ -633,9 +586,7 @@ impl ThreadAllreduceBuilder {
                 }
                 Some((existing, reduce)) => {
                     if existing.extent != entry.extent {
-                        return Err(internal(&format!(
-                            "Incompatible extents for nested bindings of {tag}"
-                        )));
+                        bail!(INTERNAL_ERROR, "Incompatible extents for nested bindings of {tag}");
                     }
                     // Fresh bindings of one hardware axis are aliases: the innermost one makes
                     // the indexes, and the axis is reduced when any of them is.
@@ -655,7 +606,7 @@ impl ThreadAllreduceBuilder {
             }
         }
         if nmatch != reduce_set.len() {
-            return Err(internal("Not all reduce index are presented in the context"));
+            bail!(INTERNAL_ERROR, "Not all reduce index are presented in the context");
         }
         let (reduce_index, reduce_extent) = Self::flatten_thread(&vred)?;
         let (group_index, group_extent) = Self::flatten_thread(&vpar)?;
@@ -682,7 +633,7 @@ impl ThreadAllreduceBuilder {
         let zero_index: Expr = int_imm(reduce_dtype, 0)?.into();
         if self.is_warp_reduction(&dtypes, group_extent, reduce_extent, contiguous_reduce_extent)? {
             let uint32 = prim_type(DLDataType { code: 1, bits: 32, lanes: 1 })?;
-            let mask: Expr = Call::new(uint32, self.ops.activemask.clone(), vec![])?.into();
+            let mask: Expr = Call::new(uint32, GPU_WARP_ACTIVEMASK.get()?, vec![])?.into();
             let mut reduce_results;
             if reduce_extent as i64 <= self.warp_size {
                 let local_bufs;
@@ -708,8 +659,8 @@ impl ThreadAllreduceBuilder {
                         (crate::ops::make_const(prim_dtype(&group_index)?, reduce_extent as i64)?
                             * &group_index)
                             .expr()?;
-                    let shuffle = self.ops.shuffle.clone();
-                    let splat = self.warp_shuffle(&shuffle, new_alloc_bufs.last(), val, lane)?;
+                    let splat =
+                        self.warp_shuffle(&GPU_WARP_SHUFFLE, new_alloc_bufs.last(), val, lane)?;
                     seq.push(tensor_store(&buf, vec![zero_index.clone()], splat)?);
                 }
             } else {
@@ -793,11 +744,11 @@ impl ThreadAllreduceBuilder {
             // The results replace the destinations' allocations and loads.
             for (i, result) in reduce_results.into_iter().enumerate() {
                 let key = self.remaps.allocation_key(&tensors[i]);
-                if self.load_remap.contains_key(&key) {
-                    return Err(internal(
-                        "Check failed: (!load_remap_.count(alloc_key)) is false: ",
-                    ));
-                }
+                check!(
+                    !self.load_remap.contains_key(&key),
+                    INTERNAL_ERROR,
+                    "!load_remap_.count(alloc_key)"
+                );
                 let buf = load_source(&result)?;
                 check_dtype(&result, dtypes[i])?;
                 self.load_remap.insert(key.clone(), result);
@@ -840,11 +791,11 @@ impl ThreadAllreduceBuilder {
             )?);
             for (idx, buf) in shared_bufs.iter().enumerate() {
                 let key = self.remaps.allocation_key(&tensors[idx]);
-                if self.load_remap.contains_key(&key) {
-                    return Err(internal(
-                        "Check failed: (!load_remap_.count(alloc_key)) is false: ",
-                    ));
-                }
+                check!(
+                    !self.load_remap.contains_key(&key),
+                    INTERNAL_ERROR,
+                    "!load_remap_.count(alloc_key)"
+                );
                 // C++ also makes an unused `MakeConst(Bool(lanes), true)`, which only fails for a
                 // scalable vector.
                 lanes(dtypes[idx])?;
@@ -866,7 +817,7 @@ impl ThreadAllreduceBuilder {
             let no_attrs = DictAttrs::new(Map::new());
             let value = Call::new_full(
                 Some(ty.clone()),
-                self.ops.alloc_tensor.clone().into(),
+                ALLOC_TENSOR.get()?.into(),
                 Array::new(vec![]),
                 Some(no_attrs.into()),
                 Array::new(vec![ty]),
@@ -939,9 +890,9 @@ impl ThreadAllreduceBuilder {
                 check_dtype(&val, dtypes[i])?;
                 a.push(val.clone());
                 // The shuffle goes to a local first: a shuffle in an if_then_else would diverge.
-                let down = self.ops.shuffle_down.clone();
                 let delta: Expr = crate::ops::int32(offset as i64)?.into();
-                let other = self.warp_shuffle(&down, mask_tensor.as_ref(), val, delta)?;
+                let other =
+                    self.warp_shuffle(&GPU_WARP_SHUFFLE_DOWN, mask_tensor.as_ref(), val, delta)?;
                 seq.push(tensor_store(&local_bufs[i], zero()?, other)?);
                 let load = tensor_load(&local_bufs[i], zero()?)?;
                 check_dtype(&load, dtypes[i])?;
@@ -983,10 +934,7 @@ impl ThreadAllreduceBuilder {
         while reduce_extent > reduce_align {
             reduce_align <<= 1;
         }
-        if reduce_align <= 1 {
-            let message = format!("Check failed: reduce_align > 1 ({reduce_align} vs. 1) : ");
-            return Err(internal(&message));
-        }
+        check_cmp!(reduce_align, >, 1, INTERNAL_ERROR, "reduce_align > 1");
         let mut seq: Vec<Stmt> = Vec::new();
         let buf_index = self.buf_index(reduce_index, group_index, reduce_extent)?;
         let fload = |offset: i32| -> Result<Vec<Expr>> {
@@ -1062,13 +1010,13 @@ impl ThreadAllreduceBuilder {
 fn load_source(load: &Expr) -> Result<Var> {
     match load.as_node::<TensorLoadObj>() {
         Some(load) => as_tensor_var(&load.source),
-        None => Err(type_error("Cannot convert to `ir.TensorLoad`")),
+        None => bail!(TYPE_ERROR, "Cannot convert to `ir.TensorLoad`"),
     }
 }
 
 fn check_dtype(expr: &Expr, dtype: DLDataType) -> Result<()> {
     if prim_dtype(expr)? != dtype {
-        return Err(internal("Check failed: the reduction keeps its value types"));
+        bail!(INTERNAL_ERROR, "Check failed: the reduction keeps its value types");
     }
     Ok(())
 }
@@ -1077,7 +1025,6 @@ fn check_dtype(expr: &Expr, dtype: DLDataType) -> Result<()> {
 /// allocations and the declarations over them are rewritten afterwards.
 struct DeferredRemapper<'a> {
     remaps: &'a Remaps,
-    ops: &'a Ops,
     shared: &'a MemoryScope,
     pending: HashSet<ObjectIdentity>,
 }
@@ -1086,20 +1033,17 @@ struct DeferredRemapper<'a> {
 impl DeferredRemapper<'_> {
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
         let Some(call) = op.value.as_node::<CallObj>() else { return m.default_mutate(self, &op) };
-        if call.op.same_as(&self.ops.alloc_tensor) {
+        if ALLOC_TENSOR.is(&call.op) {
             let key = ObjectIdentity::of(&op.var);
             let node: Bind = m.default_mutate_as(self, &op)?;
             if self.pending.contains(&key) {
                 if let Some(replacement) = self.remaps.alloc.get(&key) {
-                    return Ok(self
-                        .remaps
-                        .remap_alloc(&node, replacement, self.ops, self.shared)?
-                        .into());
+                    return Ok(self.remaps.remap_alloc(&node, replacement, self.shared)?.into());
                 }
             }
             return Ok(node.into());
         }
-        if call.op.same_as(&self.ops.decl_tensor) {
+        if DECL_TENSOR.is(&call.op) {
             let root = ObjectIdentity::of(&self.remaps.root(&op.var));
             if self.pending.contains(&root) && self.remaps.alloc.contains_key(&root) {
                 return Ok(Evaluate::new(0)?.into());
@@ -1114,7 +1058,7 @@ impl DeferredRemapper<'_> {
             let ty = tensor.ty.clone();
             let value = Call::new_full(
                 Some(ty.clone()),
-                self.ops.decl_tensor.clone().into(),
+                DECL_TENSOR.get()?.into(),
                 Array::new(vec![call.args.get(0)?]),
                 call.attrs.clone(),
                 Array::new(vec![ty]),
@@ -1128,25 +1072,22 @@ impl DeferredRemapper<'_> {
 
 pub fn lower_thread_allreduce() -> Result<Pass> {
     function_pass("tirx.LowerThreadAllreduce", 0, |func, _module, _context| {
-        let Some(target) = get_attr(&func.attrs, "target")? else {
-            return Err(internal(
-                "Check failed: (target.has_value()) is false: LowerThreadAllreduce: Require the \
-                 target attribute",
-            ));
-        };
-        let target: Target = target.try_into()?;
+        let target = get_attr(&func.attrs, "target")?;
+        check!(
+            target.is_some(),
+            INTERNAL_ERROR,
+            "target.has_value()",
+            "LowerThreadAllreduce: Require the target attribute"
+        );
+        let target: Target = target.expect("checked above").try_into()?;
         let mut builder = ThreadAllreduceBuilder::new(&target, &func.params)?;
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         let body: Stmt = structural_mutate(body, &mut builder)?.try_into()?;
         let mut body = SeqStmt::from_stmt(body)?;
         let pending: HashSet<ObjectIdentity> = builder.remaps.pending.iter().cloned().collect();
         if pending.iter().any(|key| builder.remaps.alloc.contains_key(key)) {
-            let mut remapper = DeferredRemapper {
-                remaps: &builder.remaps,
-                ops: &builder.ops,
-                shared: &builder.shared,
-                pending,
-            };
+            let mut remapper =
+                DeferredRemapper { remaps: &builder.remaps, shared: &builder.shared, pending };
             let remapped: Stmt = structural_mutate(body, &mut remapper)?.try_into()?;
             body = SeqStmt::from_stmt(remapped)?;
         }

@@ -29,106 +29,37 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    dispatch, structural_mutate, structural_walk, Any, AnyView, Array, BigInt, DefRegionKind,
-    Error, Mutator, ObjectCore, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String,
-    WalkOrder, WalkResult, INTERNAL_ERROR, TYPE_ERROR,
+    bail, dispatch, structural_mutate, structural_walk, Any, AnyView, Array, BigInt, DefRegionKind,
+    Mutator, ObjectCore, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String, WalkOrder,
+    WalkResult, INTERNAL_ERROR, TYPE_ERROR,
 };
 
 use super::side_effect::{side_effect, PURE};
 use super::substitute_dtype::{is_tensor_var, substitute_with_dtype_legalization};
 use super::util::{MutatorExt, function_pass, get_attr, int_imm, prim_dtype, prim_type};
 use crate::ir::{
-    Bind, Call, CallObj, Expr, For, IntImmObj, Op, PrimType, PrimTypeObj, PtrType, PtrTypeObj,
-    Range, RegionStmt, SeqStmt, Stmt, StringImmObj, TensorLoad, TensorStore, Var, VarObj,
+    Bind, Call, CallObj, Expr, For, IntImmObj, PrimType, PrimTypeObj, PtrType, PtrTypeObj, Range,
+    RegionStmt, SeqStmt, Stmt, StringImmObj, TensorLoad, TensorStore, Var, VarObj,
 };
-use crate::ops::PrimOps;
+use crate::ops::{repr, PrimOps};
 use crate::prim::{Ramp, RampObj};
 use crate::runtime::MemoryScope;
-use crate::sym::Analyzer;
+use crate::sym::{detect_linear_equation, Analyzer};
 use crate::target::Target;
+use crate::tirx::op::{
+    ALLOC_TENSOR, CUDA_MMA_FILL, CUDA_MMA_STORE, DECL_TENSOR, GPU_WARP_ACTIVEMASK,
+    GPU_WARP_SHUFFLE, LAUNCH_THREAD, PTX_LEGACY_LDMATRIX, PTX_LEGACY_MMA, TENSOR_DATA_PTR,
+};
 use crate::tirx::{TensorType, TensorTypeObj};
 use crate::transform::Pass;
 
-fn check(condition: bool, text: &str, message: impl FnOnce() -> std::string::String) -> Result<()> {
-    match condition {
-        true => Ok(()),
-        false => Err(Error::new(
-            INTERNAL_ERROR,
-            &format!("Check failed: ({text}) is false: {}", message()),
-            "",
-        )),
-    }
-}
-
-/// A failed `ICHECK_<op>(lhs, rhs)`: the condition, both values, and the message.
-fn check_cmp(
-    condition: bool,
-    text: &str,
-    (lhs, rhs): (i64, i64),
-    message: impl FnOnce() -> std::string::String,
-) -> Result<()> {
-    match condition {
-        true => Ok(()),
-        false => Err(Error::new(
-            INTERNAL_ERROR,
-            &format!("Check failed: {text} ({lhs} vs. {rhs}) : {}", message()),
-            "",
-        )),
-    }
-}
-
-fn repr<T>(value: &T) -> std::string::String
-where
-    for<'a> AnyView<'a>: From<&'a T>,
-{
-    tvm_ffi::cached_global_func!("ffi.ReprPrint")
-        .call_packed(&[AnyView::from(value)])
-        .and_then(String::try_from)
-        .map(|text| text.as_str().to_string())
-        .unwrap_or_default()
-}
-
-struct Ops {
-    launch_thread: Op,
-    alloc_tensor: Op,
-    decl_tensor: Op,
-    tensor_data_ptr: Op,
-    mma_store: Op,
-    mma_fill: Op,
-    ptx_mma_legacy: Op,
-    ptx_ldmatrix_legacy: Op,
-    warp_activemask: Op,
-    warp_shuffle: Op,
-    local: MemoryScope,
-    warp: MemoryScope,
-}
-
-impl Ops {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            launch_thread: Op::get("tirx.launch_thread")?,
-            alloc_tensor: Op::get("tirx.alloc_tensor")?,
-            decl_tensor: Op::get("tirx.decl_tensor")?,
-            tensor_data_ptr: Op::get("tirx.tensor_data_ptr")?,
-            mma_store: Op::get("tirx.cuda.mma_store")?,
-            mma_fill: Op::get("tirx.cuda.mma_fill")?,
-            ptx_mma_legacy: Op::get("tirx.ptx_legacy.mma")?,
-            ptx_ldmatrix_legacy: Op::get("tirx.ptx_legacy.ldmatrix")?,
-            warp_activemask: Op::get("tirx.gpu_warp_activemask")?,
-            warp_shuffle: Op::get("tirx.gpu_warp_shuffle")?,
-            local: MemoryScope::get("local")?,
-            warp: MemoryScope::get("warp")?,
-        })
-    }
-}
-
 /// `GetTensorVar(expr)`: the variable of a tensor, used directly or through `tensor_data_ptr`.
-fn tensor_var_of(expr: &Expr, ops: &Ops) -> Option<ObjectIdentity> {
+fn tensor_var_of(expr: &Expr) -> Option<ObjectIdentity> {
     if expr.as_node::<VarObj>().is_some() {
         return Some(ObjectIdentity::of(expr));
     }
     let call = expr.as_node::<CallObj>()?;
-    if !call.op.same_as(&ops.tensor_data_ptr) || call.args.len() != 1 {
+    if !TENSOR_DATA_PTR.is(&call.op) || call.args.len() != 1 {
         return None;
     }
     let arg = call.args.get(0).ok()?;
@@ -139,7 +70,7 @@ fn tensor_var_of(expr: &Expr, ops: &Ops) -> Option<ObjectIdentity> {
 fn as_tensor_var(expr: &Expr) -> Result<ObjectIdentity> {
     match is_tensor_var(expr) {
         true => Ok(ObjectIdentity::of(expr)),
-        false => Err(Error::new(TYPE_ERROR, "expected a TensorVar", "")),
+        false => bail!(TYPE_ERROR, "expected a TensorVar"),
     }
 }
 
@@ -149,7 +80,7 @@ fn as_prim_var(expr: &Expr) -> Result<Var> {
         && expr.ty.as_node::<PrimTypeObj>().is_some();
     match is_prim_var {
         true => Ok(expr.clone().try_cast()?),
-        false => Err(Error::new(TYPE_ERROR, "expected a PrimVar", "")),
+        false => bail!(TYPE_ERROR, "expected a PrimVar"),
     }
 }
 
@@ -157,11 +88,9 @@ fn as_prim_var(expr: &Expr) -> Result<Var> {
 fn lanes(expr: &Expr) -> Result<i64> {
     let lanes = prim_dtype(expr)?.lanes as i16;
     match lanes < 0 {
-        true => Err(Error::new(
-            INTERNAL_ERROR,
-            "Can't fetch the lanes of a scalable vector at a compile time.",
-            "",
-        )),
+        true => {
+            bail!(INTERNAL_ERROR, "Can't fetch the lanes of a scalable vector at a compile time.")
+        }
         false => Ok(lanes as i64),
     }
 }
@@ -220,7 +149,7 @@ fn launch_binding(op: &RegionStmt) -> Result<(Var, ThreadBinding)> {
     let tag = op.args.get(0)?;
     let tag = match tag.as_node::<StringImmObj>() {
         Some(tag) => tag.value.clone(),
-        None => return Err(Error::new(TYPE_ERROR, "expected a StringImm thread tag", "")),
+        None => bail!(TYPE_ERROR, "expected a StringImm thread tag"),
     };
     Ok((var, ThreadBinding { tag, extent: op.args.get(1)? }))
 }
@@ -230,16 +159,15 @@ fn launch_binding(op: &RegionStmt) -> Result<(Var, ThreadBinding)> {
 
 /// Collects each lexical launch definition and checks that every `threadIdx.x` has one width, a
 /// factor of the warp size.
-struct WarpIndexFinder<'a> {
-    ops: &'a Ops,
+struct WarpIndexFinder {
     warp_size: i64,
     width: i64,
     bindings: Bindings,
 }
 
-impl<'a> WarpIndexFinder<'a> {
-    fn new(ops: &'a Ops, warp_size: i64, bindings: Bindings) -> Result<Self> {
-        let mut finder = Self { ops, warp_size, width: 0, bindings };
+impl WarpIndexFinder {
+    fn new(warp_size: i64, bindings: Bindings) -> Result<Self> {
+        let mut finder = Self { warp_size, width: 0, bindings };
         let enclosing: Vec<ThreadBinding> = finder.bindings.values().cloned().collect();
         for binding in &enclosing {
             finder.check_width(binding)?;
@@ -249,9 +177,14 @@ impl<'a> WarpIndexFinder<'a> {
 
     fn find(mut self, stmt: &Stmt) -> Result<(Bindings, i64)> {
         structural_walk(stmt, &mut self, WalkOrder::PreOrder)?;
-        check_cmp(self.width > 0, "width_ > 0", (self.width, 0), || {
-            "Cannot find threadIdx.x within the scope of warp memory".into()
-        })?;
+        check_cmp!(
+            self.width,
+            >,
+            0,
+            INTERNAL_ERROR,
+            "width_ > 0",
+            "Cannot find threadIdx.x within the scope of warp memory"
+        );
         Ok((self.bindings, self.width))
     }
 
@@ -261,28 +194,31 @@ impl<'a> WarpIndexFinder<'a> {
         }
         let extent = binding.extent.as_node::<IntImmObj>().and_then(|imm| imm.value.to_i64());
         let valid = extent.is_some_and(|e| e > 0 && e <= self.warp_size && self.warp_size % e == 0);
-        let text = "extent && extent->value > 0 && extent->value <= warp_size_ && warp_size_ % \
-                    extent->value == 0";
-        check(valid, text, || {
-            format!(
-                "Expect threadIdx.x size to be a positive factor of warp size ({}), but got {}",
-                self.warp_size,
-                repr(&binding.extent)
-            )
-        })?;
+        check!(
+            valid,
+            INTERNAL_ERROR,
+            "extent && extent->value > 0 && extent->value <= warp_size_ && warp_size_ % \
+             extent->value == 0",
+            "Expect threadIdx.x size to be a positive factor of warp size ({}), but got {}",
+            self.warp_size,
+            repr(&binding.extent)
+        );
         let width = extent.expect("checked above");
-        check(self.width == 0 || self.width == width, "width_ == 0 || width_ == width", || {
-            "LowerWarpMemory requires compatible threadIdx.x extents across launch bindings".into()
-        })?;
+        check!(
+            self.width == 0 || self.width == width,
+            INTERNAL_ERROR,
+            "width_ == 0 || width_ == width",
+            "LowerWarpMemory requires compatible threadIdx.x extents across launch bindings"
+        );
         self.width = width;
         Ok(())
     }
 }
 
 #[dispatch(walk)]
-impl WarpIndexFinder<'_> {
+impl WarpIndexFinder {
     fn walk_region(&mut self, op: RegionStmt) -> Result<WalkResult> {
-        if op.op.same_as(&self.ops.launch_thread) {
+        if LAUNCH_THREAD.is(&op.op) {
             let (var, binding) = launch_binding(&op)?;
             self.check_width(&binding)?;
             self.bindings.insert(ObjectIdentity::of(&var), binding);
@@ -296,7 +232,6 @@ impl WarpIndexFinder<'_> {
 
 /// Finds the coefficient `m` of the warp index in the stores to the warp tensor.
 struct WarpStoreCoeffFinder<'a> {
-    ops: &'a Ops,
     tensor: ObjectIdentity,
     bindings: &'a Bindings,
     active: Bindings,
@@ -313,29 +248,26 @@ impl WarpStoreCoeffFinder<'_> {
     }
 
     fn warp_index(&self, what: &str) -> Result<Var> {
-        match &self.warp_index {
-            Some(index) => Ok(index.clone()),
-            None => Err(Error::new(
-                INTERNAL_ERROR,
-                &format!("Check failed: (warp_index_.defined()) is false: {what}"),
-                "",
-            )),
-        }
+        check!(self.warp_index.is_some(), INTERNAL_ERROR, "warp_index_.defined()", "{}", what);
+        Ok(self.warp_index.clone().expect("checked above"))
     }
 
     fn update_coefficient(&mut self, coefficient: i64) -> Result<()> {
         self.warp_index("Warp memory store must be inside a threadIdx.x launch")?;
-        check_cmp(coefficient > 0, "coefficient > 0", (coefficient, 0), Default::default)?;
+        check_cmp!(coefficient, >, 0, INTERNAL_ERROR, "coefficient > 0");
         if self.warp_coeff != 0 {
-            let values = (self.warp_coeff, coefficient);
-            check_cmp(self.warp_coeff == coefficient, "warp_coeff_ == coefficient", values, || {
+            check_cmp!(
+                self.warp_coeff,
+                ==,
+                coefficient,
+                INTERNAL_ERROR,
+                "warp_coeff_ == coefficient",
                 "LowerWarpMemory requires compatible store coefficients across launch bindings"
-                    .into()
-            })
+            );
         } else {
             self.warp_coeff = coefficient;
-            Ok(())
         }
+        Ok(())
     }
 
     fn update_pattern(&mut self, index: &Expr) -> Result<()> {
@@ -343,33 +275,33 @@ impl WarpStoreCoeffFinder<'_> {
             self.warp_index("Warp memory store must be inside a threadIdx.x launch")?;
         let normalized = normalize_warp_index(index, &self.active, &warp_index, self.aliases)?;
         let vars = Array::new(vec![as_prim_var(&warp_index.clone().into())?]);
-        let m: Array<Expr> = tvm_ffi::cached_global_func!("sym.DetectLinearEquation")
-            .call_tuple((normalized, vars))?
-            .try_into()?;
-        check_cmp(m.len() == 2, "m.size() == 2U", (m.len() as i64, 2), || {
-            format!(
-                "LowerWarpMemory failed. Could not simplify the store index `{}` into the form ax \
-                 + by + cz + ... Warp memory is approximated by storing values in thread local \
-                 registers and shuffling values between these registers. Currently only linear \
-                 equation indices are supported.",
-                repr(index)
-            )
-        })?;
+        let m = detect_linear_equation(&normalized, &vars)?;
+        check_cmp!(
+            m.len(),
+            ==,
+            2,
+            INTERNAL_ERROR,
+            "m.size() == 2U",
+            "LowerWarpMemory failed. Could not simplify the store index `{}` into the form ax + by \
+             + cz + ... Warp memory is approximated by storing values in thread local registers \
+             and shuffling values between these registers. Currently only linear equation indices \
+             are supported.",
+            repr(index)
+        );
         let coeff = self.analyzer.canonical_simplify(&m.get(0)?)?;
         let value =
             coeff.as_node::<IntImmObj>().and_then(|imm| imm.value.to_i64()).filter(|v| *v > 0);
-        let Some(value) = value else {
-            return check(false, "mcoeff_as_int && mcoeff_as_int->value > 0", || {
-                format!(
-                    "LowerWarpMemory failed due to store index={}, require positive constant \
-                     coefficient on warp index {} but get {}",
-                    repr(index),
-                    repr(&warp_index),
-                    repr(&coeff)
-                )
-            });
-        };
-        self.update_coefficient(value)
+        check!(
+            value.is_some(),
+            INTERNAL_ERROR,
+            "mcoeff_as_int && mcoeff_as_int->value > 0",
+            "LowerWarpMemory failed due to store index={}, require positive constant coefficient \
+             on warp index {} but get {}",
+            repr(index),
+            repr(&warp_index),
+            repr(&coeff)
+        );
+        self.update_coefficient(value.expect("checked above"))
     }
 }
 
@@ -380,12 +312,13 @@ impl WarpStoreCoeffFinder<'_> {
         structural_walk(&op.args, &mut *self, WalkOrder::PreOrder)?;
         structural_walk(&op.attrs, &mut *self, WalkOrder::PreOrder)?;
         let (previous_index, previous_bindings) = (self.warp_index.clone(), self.active.clone());
-        if op.op.same_as(&self.ops.launch_thread) {
+        if LAUNCH_THREAD.is(&op.op) {
             let (var, _) = launch_binding(&op)?;
-            let binding =
-                self.bindings.get(&ObjectIdentity::of(&var)).cloned().ok_or_else(|| {
-                    Error::new(INTERNAL_ERROR, "unordered_map::at: key not found", "")
-                })?;
+            let binding = self
+                .bindings
+                .get(&ObjectIdentity::of(&var))
+                .cloned()
+                .ok_or_else(|| error!(INTERNAL_ERROR, "unordered_map::at: key not found"))?;
             let is_tx = binding.tag.as_str() == "threadIdx.x";
             self.active.insert(ObjectIdentity::of(&var), binding);
             if is_tx {
@@ -400,20 +333,21 @@ impl WarpStoreCoeffFinder<'_> {
     }
 
     fn walk_call(&mut self, op: Call) -> Result<WalkResult> {
-        if op.op.same_as(&self.ops.mma_fill)
-            && tensor_var_of(&op.args.get(1)?, self.ops).as_ref() == Some(&self.tensor)
+        if CUDA_MMA_FILL.is(&op.op)
+            && tensor_var_of(&op.args.get(1)?).as_ref() == Some(&self.tensor)
         {
             let local_size = op.args.get(0)?;
-            let Some(local_size) = local_size.as_node::<IntImmObj>() else {
-                return check(false, "local_size", || {
-                    "Integer expected for the first argument of mma_fill".into()
-                })
-                .map(|_| WalkResult::Advance);
-            };
-            let value = local_size.value.to_i64().unwrap_or(0);
+            let local_size = local_size.as_node::<IntImmObj>();
+            check!(
+                local_size.is_some(),
+                INTERNAL_ERROR,
+                "local_size",
+                "Integer expected for the first argument of mma_fill"
+            );
+            let value = local_size.expect("checked above").value.to_i64().unwrap_or(0);
             self.update_coefficient(value)?;
-        } else if op.op.same_as(&self.ops.ptx_ldmatrix_legacy)
-            && tensor_var_of(&op.args.get(3)?, self.ops).as_ref() == Some(&self.tensor)
+        } else if PTX_LEGACY_LDMATRIX.is(&op.op)
+            && tensor_var_of(&op.args.get(3)?).as_ref() == Some(&self.tensor)
         {
             self.update_pattern(&op.args.get(4)?)?;
         }
@@ -424,25 +358,26 @@ impl WarpStoreCoeffFinder<'_> {
         if as_tensor_var(&op.dest)? != self.tensor {
             return Ok(WalkResult::Advance);
         }
-        check_cmp(
-            op.indices.len() == 1,
+        check_cmp!(
+            op.indices.len(),
+            ==,
+            1,
+            INTERNAL_ERROR,
             "op->indices.size() == 1",
-            (op.indices.len() as i64, 1),
-            || "Expected flat memory to use as warp memory.  Has FlattenTensor been run?".into(),
-        )?;
+            "Expected flat memory to use as warp memory.  Has FlattenTensor been run?"
+        );
         let mut index = op.indices.get(0)?;
         let value_lanes = lanes(&op.value)?;
         if value_lanes != 1 {
-            let Some(base) = unit_ramp_base(&index, value_lanes) else {
-                return check(false, "sym::ramp(base, 1, value_ty.lanes()).Match(index)", || {
-                    format!(
-                        "LowerWarpMemory failed due to store index={}, can only handle \
-                         continuous store",
-                        repr(&index)
-                    )
-                })
-                .map(|_| WalkResult::Skip);
-            };
+            let base = unit_ramp_base(&index, value_lanes);
+            check!(
+                base.is_some(),
+                INTERNAL_ERROR,
+                "sym::ramp(base, 1, value_ty.lanes()).Match(index)",
+                "LowerWarpMemory failed due to store index={}, can only handle continuous store",
+                repr(&index)
+            );
+            let base = base.expect("checked above");
             self.update_pattern(&base)?;
             index = base;
         }
@@ -456,7 +391,8 @@ impl WarpStoreCoeffFinder<'_> {
 
 /// Rewrites one warp allocation and its uses.
 struct WarpAccessRewriter<'a> {
-    ops: &'a Ops,
+    /// The scope of the local tensor.
+    local: MemoryScope,
     warp_size: i64,
     analyzer: &'a Analyzer,
     aliases: &'a Aliases,
@@ -472,7 +408,7 @@ struct WarpAccessRewriter<'a> {
 
 impl<'a> WarpAccessRewriter<'a> {
     fn new(
-        ops: &'a Ops,
+        local: MemoryScope,
         warp_size: i64,
         analyzer: &'a Analyzer,
         enclosing: Bindings,
@@ -480,7 +416,7 @@ impl<'a> WarpAccessRewriter<'a> {
         aliases: &'a Aliases,
     ) -> Self {
         Self {
-            ops,
+            local,
             warp_size,
             analyzer,
             aliases,
@@ -499,7 +435,7 @@ impl<'a> WarpAccessRewriter<'a> {
     fn rewrite(mut self, alloc: &Bind, call: &CallObj, body: Stmt) -> Result<Stmt> {
         let alloc_ty = call.ty_args.get(0)?;
         let Some(alloc_ty) = alloc_ty.as_node::<TensorTypeObj>() else {
-            return Err(Error::new(TYPE_ERROR, "expected a TensorType", ""));
+            bail!(TYPE_ERROR, "expected a TensorType");
         };
         let element_lanes = alloc_ty.dtype.dtype.lanes as i64;
         self.tensor = Some(ObjectIdentity::of(&alloc.var));
@@ -511,17 +447,21 @@ impl<'a> WarpAccessRewriter<'a> {
             };
         }
         let mut alloc_size = alloc_size as i64;
-        check_cmp(alloc_size > 0, "alloc_size > 0", (alloc_size, 0), || {
-            "warp memory only support constant alloc size".into()
-        })?;
+        check_cmp!(
+            alloc_size,
+            >,
+            0,
+            INTERNAL_ERROR,
+            "alloc_size > 0",
+            "warp memory only support constant alloc size"
+        );
         alloc_size *= element_lanes;
-        let finder = WarpIndexFinder::new(self.ops, self.warp_size, self.bindings.clone())?;
+        let finder = WarpIndexFinder::new(self.warp_size, self.bindings.clone())?;
         let (bindings, width) = finder.find(&body)?;
         self.bindings = bindings;
         self.width = width;
         let tensor = self.tensor.clone().expect("set above");
         self.warp_coeff = WarpStoreCoeffFinder {
-            ops: self.ops,
             tensor,
             bindings: &self.bindings,
             active: self.active.clone(),
@@ -534,7 +474,7 @@ impl<'a> WarpAccessRewriter<'a> {
 
         // Round the local size up to a multiple of `width * warp_coeff`.
         let factor = (self.width * self.warp_coeff) as i32 as i64;
-        check_cmp(factor != 0, "factor != 0", (factor, 0), || "Divide by zero".into())?;
+        check_cmp!(factor, !=, 0, INTERNAL_ERROR, "factor != 0", "Divide by zero");
         self.warp_group = (alloc_size + (factor - 1)) / factor;
         alloc_size = self.warp_group * factor;
 
@@ -544,7 +484,7 @@ impl<'a> WarpAccessRewriter<'a> {
         let local_ty = TensorType::from_complete_fields(
             var_ty.loc.clone(),
             var_ty.dtype.clone(),
-            self.ops.local.clone(),
+            self.local.clone(),
             Array::new(vec![super::util::int32(alloc_size / self.width)?.into()]),
             Array::new(vec![]),
             elem_offset,
@@ -563,7 +503,7 @@ impl<'a> WarpAccessRewriter<'a> {
         let new_ty = new_tensor.ty.clone();
         let new_call = Call::new_full(
             Some(new_ty.clone()),
-            self.ops.alloc_tensor.clone().into(),
+            ALLOC_TENSOR.get()?.into(),
             Array::new(args),
             call.attrs.clone(),
             Array::new(vec![new_ty]),
@@ -575,11 +515,10 @@ impl<'a> WarpAccessRewriter<'a> {
 
     fn warp_index(&self) -> Result<Var> {
         self.warp_index.clone().ok_or_else(|| {
-            Error::new(
+            error!(
                 INTERNAL_ERROR,
                 "Check failed: (warp_index_.defined()) is false: Warp memory access must be inside \
-                 a threadIdx.x launch",
-                "",
+                 a threadIdx.x launch"
             )
         })
     }
@@ -599,13 +538,13 @@ impl<'a> WarpAccessRewriter<'a> {
         let index_dtype = prim_dtype(&index)?;
         let index_lanes = lanes(&index)?;
         if index_lanes != 1 {
-            let Some(base) = unit_ramp_base(&index, index_lanes) else {
-                return Err(Error::new(
-                    INTERNAL_ERROR,
-                    "Check failed: (sym::ramp(base, 1, index_ty.lanes()).Match(index)) is false: ",
-                    "",
-                ));
-            };
+            let base = unit_ramp_base(&index, index_lanes);
+            check!(
+                base.is_some(),
+                INTERNAL_ERROR,
+                "sym::ramp(base, 1, index_ty.lanes()).Match(index)"
+            );
+            let base = base.expect("checked above");
             let (local_index, group) = self.split_index_by_group(&base)?;
             let one = int_imm(prim_dtype(&local_index)?, 1)?;
             let local_index = Ramp::new(local_index, one, index_lanes as i32)?.into();
@@ -632,7 +571,7 @@ impl<'a> WarpAccessRewriter<'a> {
     fn rewrite_indices_at(&self, op: &Call, positions: &[usize]) -> Result<Any> {
         let mut args: Vec<Expr> = op.args.iter().collect();
         for &i in positions {
-            if tensor_var_of(&op.args.get(i)?, self.ops).is_some_and(|id| self.is_tensor(&id)) {
+            if tensor_var_of(&op.args.get(i)?).is_some_and(|id| self.is_tensor(&id)) {
                 let (local_index, _) = self.split_index_by_group(&op.args.get(i + 1)?)?;
                 args[i] = self.new_tensor().tensor_data()?;
                 args[i + 1] = local_index;
@@ -653,16 +592,17 @@ impl<'a> WarpAccessRewriter<'a> {
 #[dispatch(mutate)]
 impl WarpAccessRewriter<'_> {
     fn mutate_region(&mut self, op: RegionStmt, m: &mut Mutator) -> Result<Any> {
-        if !op.op.same_as(&self.ops.launch_thread) {
+        if !LAUNCH_THREAD.is(&op.op) {
             return m.default_mutate(self, &op);
         }
         let extent: Expr = m.mutate_as(self, &op.args.get(1)?)?;
         let (var, _) = launch_binding(&op)?;
         let (previous_index, previous_bindings) = (self.warp_index.clone(), self.active.clone());
-        let binding =
-            self.bindings.get(&ObjectIdentity::of(&var)).cloned().ok_or_else(|| {
-                Error::new(INTERNAL_ERROR, "unordered_map::at: key not found", "")
-            })?;
+        let binding = self
+            .bindings
+            .get(&ObjectIdentity::of(&var))
+            .cloned()
+            .ok_or_else(|| error!(INTERNAL_ERROR, "unordered_map::at: key not found"))?;
         let is_tx = binding.tag.as_str() == "threadIdx.x";
         self.active.insert(ObjectIdentity::of(&var), binding);
         if is_tx {
@@ -686,17 +626,17 @@ impl WarpAccessRewriter<'_> {
     }
 
     fn mutate_call(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
-        if op.op.same_as(&self.ops.mma_store) {
+        if CUDA_MMA_STORE.is(&op.op) {
             return self.rewrite_indices_at(&op, &[3]);
         }
-        if op.op.same_as(&self.ops.mma_fill) {
+        if CUDA_MMA_FILL.is(&op.op) {
             return self.rewrite_indices_at(&op, &[1]);
         }
         // Legacy variants: (pointer, offset) pairs at their apache positions.
-        if op.op.same_as(&self.ops.ptx_mma_legacy) {
+        if PTX_LEGACY_MMA.is(&op.op) {
             return self.rewrite_indices_at(&op, &[6, 8, 10]);
         }
-        if op.op.same_as(&self.ops.ptx_ldmatrix_legacy) {
+        if PTX_LEGACY_LDMATRIX.is(&op.op) {
             return self.rewrite_indices_at(&op, &[3]);
         }
         m.default_mutate(self, &op)
@@ -704,14 +644,13 @@ impl WarpAccessRewriter<'_> {
 
     /// The warp tensor may only be accessed through loads, stores and the rewritten calls.
     fn mutate_var(&mut self, var: Var, m: &mut Mutator) -> Result<Any> {
-        if m.def_region_kind() == DefRegionKind::None && self.is_tensor(&ObjectIdentity::of(&var)) {
-            return Err(Error::new(
-                INTERNAL_ERROR,
-                "Check failed: (op != tensor_) is false: Cannot access address of warp memory \
-                 directly",
-                "",
-            ));
-        }
+        let is_use = m.def_region_kind() == DefRegionKind::None;
+        check!(
+            !(is_use && self.is_tensor(&ObjectIdentity::of(&var))),
+            INTERNAL_ERROR,
+            "op != tensor_",
+            "Cannot access address of warp memory directly"
+        );
         m.default_mutate(self, &var)
     }
 
@@ -725,10 +664,14 @@ impl WarpAccessRewriter<'_> {
                 TensorStore::from_complete_fields(op.loc.clone(), op.dest.clone(), indices, value);
         }
         if as_tensor_var(&store.dest).is_ok_and(|id| self.is_tensor(&id)) {
-            let values = (store.indices.len() as i64, 1);
-            check_cmp(store.indices.len() == 1, "store->indices.size() == 1", values, || {
-                "Expected flat memory to use as warp memory.  Has FlattenTensor been run?".into()
-            })?;
+            check_cmp!(
+                store.indices.len(),
+                ==,
+                1,
+                INTERNAL_ERROR,
+                "store->indices.size() == 1",
+                "Expected flat memory to use as warp memory.  Has FlattenTensor been run?"
+            );
             let (local_index, _) = self.split_index_by_group(&store.indices.get(0)?)?;
             store = TensorStore::from_complete_fields(
                 store.loc.clone(),
@@ -757,33 +700,34 @@ impl WarpAccessRewriter<'_> {
         if !self.is_tensor(&as_tensor_var(&load.source)?) {
             return Ok(load.into());
         }
-        check_cmp(
-            op.indices.len() == 1,
+        check_cmp!(
+            op.indices.len(),
+            ==,
+            1,
+            INTERNAL_ERROR,
             "op->indices.size() == 1",
-            (op.indices.len() as i64, 1),
-            || "Expected flat memory to use as warp memory.  Has FlattenTensor been run?".into(),
-        )?;
+            "Expected flat memory to use as warp memory.  Has FlattenTensor been run?"
+        );
         let (local_index, group) = self.split_index_by_group(&op.indices.get(0)?)?;
         // The local index must not depend on the warp index.
         let warp_index = self.warp_index()?;
         let mut finder = VarFinder { target: ObjectIdentity::of(&warp_index) };
         let uses_warp_index = structural_walk(&local_index, &mut finder, WalkOrder::PreOrder)?;
-        let text =
-            "!ffi::StructuralWalk<ffi::WalkOrder::kPreOrder>(local_index, walkfn).has_value()";
-        check(uses_warp_index.is_none(), text, || {
-            format!(
-                "LowerWarpMemory failed to rewrite load to shuffle for index {} local_index={}",
-                repr(&op.indices.get(0).expect("checked")),
-                repr(&local_index)
-            )
-        })?;
+        check!(
+            uses_warp_index.is_none(),
+            INTERNAL_ERROR,
+            "!ffi::StructuralWalk<ffi::WalkOrder::kPreOrder>(local_index, walkfn).has_value()",
+            "LowerWarpMemory failed to rewrite load to shuffle for index {} local_index={}",
+            repr(&op.indices.get(0).expect("checked")),
+            repr(&local_index)
+        );
         let local: Expr =
             TensorLoad::new_full(self.new_tensor(), vec![local_index], load.loc.clone())?.into();
         if self.analyzer.can_prove_equal(&group, &warp_index.clone().into())? {
             return Ok(local.into());
         }
         let uint32 = prim_type(tvm_ffi::DLDataType { code: 1, bits: 32, lanes: 1 })?;
-        let mask: Expr = Call::new(uint32, self.ops.warp_activemask.clone(), vec![])?.into();
+        let mask: Expr = Call::new(uint32, GPU_WARP_ACTIVEMASK.get()?, vec![])?.into();
         let args = vec![
             mask,
             local.clone(),
@@ -791,7 +735,7 @@ impl WarpAccessRewriter<'_> {
             super::util::int32(self.width)?.into(),
             super::util::int32(self.warp_size)?.into(),
         ];
-        Ok(Call::new(local.ty.clone(), self.ops.warp_shuffle.clone(), args)?.into())
+        Ok(Call::new(local.ty.clone(), GPU_WARP_SHUFFLE.get()?, args)?.into())
     }
 }
 
@@ -815,7 +759,6 @@ impl VarFinder {
 /// Binds loop and thread ranges in the analyzer, and records pure integer bindings as aliases of
 /// their (expanded) values. Only statements are visited.
 struct BindVarBoundInfo<'a> {
-    ops: &'a Ops,
     analyzer: &'a Analyzer,
     aliases: &'a mut Aliases,
 }
@@ -842,7 +785,7 @@ impl BindVarBoundInfo<'_> {
     }
 
     fn walk_region(&mut self, op: RegionStmt) -> Result<WalkResult> {
-        if op.op.same_as(&self.ops.launch_thread) {
+        if LAUNCH_THREAD.is(&op.op) {
             let var = as_prim_var(&op.body_params.get(0)?.into())?;
             let extent = op.args.get(1)?;
             let zero = int_imm(prim_dtype(&extent)?, 0)?;
@@ -860,8 +803,9 @@ impl BindVarBoundInfo<'_> {
 // WarpMemoryRewriter
 
 /// Finds each warp allocation in a sequence and rewrites it with the statements after it.
-struct WarpMemoryRewriter<'a> {
-    ops: &'a Ops,
+struct WarpMemoryRewriter {
+    local: MemoryScope,
+    warp: MemoryScope,
     warp_size: i64,
     analyzer: Analyzer,
     active: Bindings,
@@ -871,25 +815,21 @@ struct WarpMemoryRewriter<'a> {
     new_storage_scopes: Vec<(Var, MemoryScope)>,
 }
 
-impl WarpMemoryRewriter<'_> {
+impl WarpMemoryRewriter {
     fn rewrite(&mut self, stmt: Stmt) -> Result<Stmt> {
         if self.warp_size == 1 {
             return Ok(stmt);
         }
-        let mut binder = BindVarBoundInfo {
-            ops: self.ops,
-            analyzer: &self.analyzer,
-            aliases: &mut self.aliases,
-        };
+        let mut binder = BindVarBoundInfo { analyzer: &self.analyzer, aliases: &mut self.aliases };
         structural_walk(&stmt, &mut binder, WalkOrder::PreOrder)?;
         structural_mutate(stmt, self)?.try_into()
     }
 }
 
 #[dispatch(mutate)]
-impl WarpMemoryRewriter<'_> {
+impl WarpMemoryRewriter {
     fn mutate_region(&mut self, op: RegionStmt, m: &mut Mutator) -> Result<Any> {
-        if !op.op.same_as(&self.ops.launch_thread) {
+        if !LAUNCH_THREAD.is(&op.op) {
             return m.default_mutate(self, &op);
         }
         let (var, binding) = launch_binding(&op)?;
@@ -923,18 +863,18 @@ impl WarpMemoryRewriter<'_> {
             let warp_alloc = stmt.as_node::<crate::ir::BindObj>().and_then(|alloc| {
                 let call = alloc.value.as_node::<CallObj>()?;
                 let ty = call.ty_args.get(0).ok()?;
-                let is_warp = call.op.same_as(&self.ops.alloc_tensor)
-                    && ty.as_node::<TensorTypeObj>()?.scope.same_as(&self.ops.warp);
+                let is_warp = ALLOC_TENSOR.is(&call.op)
+                    && ty.as_node::<TensorTypeObj>()?.scope.same_as(&self.warp);
                 is_warp.then_some(())
             });
             if warp_alloc.is_some() {
                 let alloc: Bind = stmt.clone().try_cast()?;
                 let call: Call = alloc.value.clone().try_cast()?;
-                self.new_storage_scopes.push((alloc.var.clone(), self.ops.local.clone()));
+                self.new_storage_scopes.push((alloc.var.clone(), self.local.clone()));
                 let remaining: Vec<Stmt> = stmts[i + 1..].to_vec();
                 let body: Stmt = SeqStmt::new(remaining)?.into();
                 let rewriter = WarpAccessRewriter::new(
-                    self.ops,
+                    self.local.clone(),
                     self.warp_size,
                     &self.analyzer,
                     self.active.clone(),
@@ -967,14 +907,13 @@ impl WarpMemoryRewriter<'_> {
 // UpdatePointerStorageScope
 
 /// Retypes the rewritten warp variables to local memory wherever they remain.
-struct UpdatePointerStorageScope<'a> {
-    ops: &'a Ops,
+struct UpdatePointerStorageScope {
     remap: HashMap<ObjectIdentity, Var>,
     tensor_scopes: HashMap<ObjectIdentity, MemoryScope>,
 }
 
-impl<'a> UpdatePointerStorageScope<'a> {
-    fn new(ops: &'a Ops, new_storage_scopes: &[(Var, MemoryScope)]) -> Result<Self> {
+impl UpdatePointerStorageScope {
+    fn new(new_storage_scopes: &[(Var, MemoryScope)]) -> Result<Self> {
         let mut remap = HashMap::new();
         for (var, scope) in new_storage_scopes {
             let replacement: Var = if let Some(ty) = var.ty.as_node::<TensorTypeObj>() {
@@ -991,44 +930,43 @@ impl<'a> UpdatePointerStorageScope<'a> {
                 );
                 Var::new_full(var.name.clone(), ty, var.loc.clone())?
             } else {
-                let Some(ptr) = var.ty.as_node::<PtrTypeObj>() else {
-                    return Err(Error::new(
-                        INTERNAL_ERROR,
-                        "Check failed: (ptr_type) is false: The provided variable is not of \
-                         pointer type",
-                        "",
-                    ));
-                };
+                let ptr = var.ty.as_node::<PtrTypeObj>();
+                check!(
+                    ptr.is_some(),
+                    INTERNAL_ERROR,
+                    "ptr_type",
+                    "The provided variable is not of pointer type"
+                );
+                let ptr = ptr.expect("checked above");
                 let ty = PtrType::new(ptr.element_type.clone(), scope.clone())?;
                 Var::new_full(var.name.clone(), ty, var.loc.clone())?
             };
             remap.insert(ObjectIdentity::of(var), replacement);
         }
-        Ok(Self { ops, remap, tensor_scopes: HashMap::new() })
+        Ok(Self { remap, tensor_scopes: HashMap::new() })
     }
 }
 
 /// `ReinferMutatedCallType`: the call, retyped by `Call::ReinferType` when the type changes.
 fn reinfer_call_type(call: Expr) -> Result<Expr> {
-    let ty: crate::ir::Type =
-        tvm_ffi::cached_global_func!("ir.reinfer_type").call_tuple((call.clone(),))?.try_into()?;
-    let node = call.as_node::<CallObj>().expect("a call");
-    if node.ty.same_as(&ty) {
-        return Ok(call);
+    let call: Call = call.try_cast()?;
+    let ty = call.reinfer_type()?;
+    if call.ty.same_as(&ty) {
+        return Ok(call.into());
     }
     let rebuilt = Call::from_complete_fields(
-        node.loc.clone(),
+        call.loc.clone(),
         ty,
-        node.op.clone(),
-        node.args.clone(),
-        node.attrs.clone(),
-        node.ty_args.clone(),
+        call.op.clone(),
+        call.args.clone(),
+        call.attrs.clone(),
+        call.ty_args.clone(),
     );
     Ok(rebuilt.into())
 }
 
 #[dispatch(mutate)]
-impl UpdatePointerStorageScope<'_> {
+impl UpdatePointerStorageScope {
     fn mutate_var(&mut self, var: Var, m: &mut Mutator) -> Result<Any> {
         match self.remap.get(&ObjectIdentity::of(&var)) {
             Some(replacement) => Ok(replacement.clone().into()),
@@ -1038,14 +976,13 @@ impl UpdatePointerStorageScope<'_> {
 
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
         if let Some(call) = op.value.as_node::<CallObj>() {
-            let is_tensor_call =
-                call.op.same_as(&self.ops.alloc_tensor) || call.op.same_as(&self.ops.decl_tensor);
+            let is_tensor_call = ALLOC_TENSOR.is(&call.op) || DECL_TENSOR.is(&call.op);
             if let Some(mapped) =
                 self.remap.get(&ObjectIdentity::of(&op.var)).filter(|_| is_tensor_call)
             {
                 let scope = match mapped.ty.as_node::<TensorTypeObj>() {
                     Some(ty) => ty.scope.clone(),
-                    None => return Err(Error::new(TYPE_ERROR, "expected a TensorVar", "")),
+                    None => bail!(TYPE_ERROR, "expected a TensorVar"),
                 };
                 let key = ObjectIdentity::of(&op.value);
                 self.tensor_scopes.insert(key.clone(), scope);
@@ -1064,7 +1001,7 @@ impl UpdatePointerStorageScope<'_> {
             let call = result.as_node::<CallObj>().expect("a call mutates to a call");
             let ty = call.ty_args.get(0)?;
             let Some(tensor_ty) = ty.as_node::<TensorTypeObj>() else {
-                return Err(Error::new(TYPE_ERROR, "expected a TensorType", ""));
+                bail!(TYPE_ERROR, "expected a TensorType");
             };
             if !tensor_ty.scope.same_as(&scope) {
                 let updated = TensorType::from_complete_fields(
@@ -1092,7 +1029,7 @@ impl UpdatePointerStorageScope<'_> {
             }
             return Ok(result.into());
         }
-        if !op.op.same_as(&self.ops.tensor_data_ptr) {
+        if !TENSOR_DATA_PTR.is(&op.op) {
             return Ok(result.into());
         }
         Ok(reinfer_call_type(result)?.into())
@@ -1110,18 +1047,17 @@ fn thread_warp_size(target: &Target) -> Result<i64> {
 pub fn lower_warp_memory() -> Result<Pass> {
     function_pass("tirx.LowerWarpMemory", 0, |func, _module, _context| {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
-        let Some(target) = get_attr(&func.attrs, "target")? else {
-            return Err(Error::new(
-                INTERNAL_ERROR,
-                "Check failed: (target.has_value()) is false: LowerWarpMemory: Require the target \
-                 attribute",
-                "",
-            ));
-        };
-        let target: Target = target.try_into()?;
-        let ops = Ops::new()?;
+        let target = get_attr(&func.attrs, "target")?;
+        check!(
+            target.is_some(),
+            INTERNAL_ERROR,
+            "target.has_value()",
+            "LowerWarpMemory: Require the target attribute"
+        );
+        let target: Target = target.expect("checked above").try_into()?;
         let mut rewriter = WarpMemoryRewriter {
-            ops: &ops,
+            local: MemoryScope::get("local")?,
+            warp: MemoryScope::get("warp")?,
             warp_size: thread_warp_size(&target)?,
             analyzer: Analyzer::new()?,
             active: HashMap::new(),
@@ -1130,7 +1066,7 @@ pub fn lower_warp_memory() -> Result<Pass> {
             new_storage_scopes: Vec::new(),
         };
         let stmt = rewriter.rewrite(body.into())?;
-        let mut updater = UpdatePointerStorageScope::new(&ops, &rewriter.new_storage_scopes)?;
+        let mut updater = UpdatePointerStorageScope::new(&rewriter.new_storage_scopes)?;
         let stmt: Stmt = structural_mutate(stmt, &mut updater)?.try_into()?;
         Ok(Some(func.with_body(Some(SeqStmt::from_stmt(stmt)?))))
     })

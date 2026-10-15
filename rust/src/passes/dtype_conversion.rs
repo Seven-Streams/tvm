@@ -20,7 +20,7 @@
 //! `src/tirx/transform/dtype_conversion.{h,cc}`: convert a value between floating-point types
 //! bit by bit, for targets without a native conversion.
 
-use tvm_ffi::{DLDataType, DLDataTypeCode, Error, Result, INTERNAL_ERROR};
+use tvm_ffi::{DLDataType, DLDataTypeCode, Result, INTERNAL_ERROR};
 
 use crate::ir::{Expr, PrimType};
 use crate::ops::{if_then_else, make_const, prim_dtype, prim_type, Ex, PrimOps};
@@ -80,19 +80,19 @@ pub(crate) fn storage_uint(dtype: DLDataType) -> DLDataType {
 /// C++ `DTypeConversion(src_value, tgt_dtype)` with `RoundingMode::kHalfToEven`.
 pub(crate) fn dtype_conversion(src_value: Expr, tgt: &PrimType) -> Result<Expr> {
     let (src_dtype, tgt_dtype) = (prim_dtype(&src_value)?, tgt.dtype);
-    if src_dtype.lanes != tgt_dtype.lanes {
-        let message = format!(
-            "Check failed: src_dtype->dtype.lanes == tgt_dtype->dtype.lanes ({} vs. {}) : The lanes \
-             for data type for source value must matches the target datatype.",
-            src_dtype.lanes, tgt_dtype.lanes
-        );
-        return Err(Error::new(INTERNAL_ERROR, &message, ""));
-    }
-    if !is_floating_point(src_dtype) || !is_floating_point(tgt_dtype) {
-        let message =
-            "Check failed: (is_floating_point(src_dtype) && is_floating_point(tgt_dtype)) is false: ";
-        return Err(Error::new(INTERNAL_ERROR, message, ""));
-    }
+    check_cmp!(
+        src_dtype.lanes,
+        ==,
+        tgt_dtype.lanes,
+        INTERNAL_ERROR,
+        "src_dtype->dtype.lanes == tgt_dtype->dtype.lanes",
+        "The lanes for data type for source value must matches the target datatype."
+    );
+    check!(
+        is_floating_point(src_dtype) && is_floating_point(tgt_dtype),
+        INTERNAL_ERROR,
+        "is_floating_point(src_dtype) && is_floating_point(tgt_dtype)"
+    );
     let (src_fp, tgt_fp) = (FloatConfig::of(src_dtype), FloatConfig::of(tgt_dtype));
     let exponent_delta = tgt_fp.exponent - src_fp.exponent;
     let bias_delta = tgt_fp.bias - src_fp.bias;
