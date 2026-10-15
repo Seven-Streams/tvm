@@ -30,9 +30,11 @@ use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use tvm_ffi::tvm_ffi_sys::{TVMFFIAny, TVMFFITypeIndex};
-use tvm_ffi::{Any, AnyView, Array, Error, ObjectArc, Result, String, TYPE_ERROR, VALUE_ERROR};
+use tvm_ffi::{
+    Any, AnyView, Array, Error, ObjectArc, ObjectRefCore, Result, String, TYPE_ERROR, VALUE_ERROR,
+};
 
-use super::{CallObj, Expr, Op, OpObj, SeqCell, Type};
+use super::{Attrs, CallObj, Expr, Op, OpObj, SeqCell, Type};
 use sig::{ArgType, Checks};
 
 /// C++ `OpDef`: register an operator from Rust, or attach more to a registered one.
@@ -75,10 +77,10 @@ impl OpDef {
         self.0
     }
 
-    /// C++ `OpDef::signature`: replace the argument descriptions, and the validator generated
-    /// from their types, which checks a Call's argument counts and argument types. A custom
-    /// validator keeps precedence. It clears the attrs type, so set [`OpDef::attrs_type_key`]
-    /// after it.
+    /// C++ `OpDef::signature`: replace the argument descriptions and the attrs type, and the
+    /// validator generated from them, which checks a Call's argument counts, argument types and
+    /// attrs. A custom validator keeps precedence. Without [`Signature::call_attrs`] the
+    /// operator has no attrs type, and `Call.attrs` is unconstrained.
     pub fn signature<L: Checks>(self, signature: Signature<L>) -> Self {
         let Signature {
             arg_names, arg_docs, ty_arg_names, ty_arg_docs, var_args, var_ty_args, ..
@@ -86,12 +88,16 @@ impl OpDef {
         let lists =
             [arg_names, arg_docs, ty_arg_names, ty_arg_docs, var_args, var_ty_args].map(Array::new);
         let args: Vec<AnyView> = lists.iter().map(AnyView::from).collect();
-        self.invoke("_set_signature", &args).then(|op| {
+        let def = self.invoke("_set_signature", &args).then(|op| {
             if !op.validator_is_custom() {
                 write_validator(op, validate_signature::<L>, false);
             }
             Ok(())
-        })
+        });
+        match L::ATTRS_TYPE_KEY {
+            Some(key) => def.attrs_type_key(key),
+            None => def,
+        }
     }
 
     /// Append a value argument's description, without changing what the validator checks.
@@ -247,6 +253,15 @@ impl<L> Signature<L> {
         doc: &str,
     ) -> Signature<(sig::VarTyArgs<T>, L)> {
         self.var_ty_args = vec![String::from(name), String::from(doc)];
+        self.retype()
+    }
+
+    /// `Call.attrs` holds a `T`, which is also the operator's attrs type (C++
+    /// `sig::call_attrs<T>`).
+    pub fn call_attrs<T>(self) -> Signature<(sig::CallAttrs<T>, L)>
+    where
+        T: ObjectRefCore + Into<Attrs> + 'static,
+    {
         self.retype()
     }
 
@@ -487,6 +502,8 @@ pub mod sig {
     pub struct TyArg<T>(PhantomData<T>);
     /// The variadic type-argument tail, of type `T`.
     pub struct VarTyArgs<T>(PhantomData<T>);
+    /// `Call.attrs`, of type `T`.
+    pub struct CallAttrs<T>(PhantomData<T>);
 
     /// The checks of a signature, as a list of descriptors with the newest first.
     #[doc(hidden)]
@@ -495,6 +512,9 @@ pub mod sig {
         const TY_ARGS: usize;
         const VAR_ARGS: usize;
         const VAR_TY_ARGS: usize;
+        const CALL_ATTRS: usize;
+        /// The type key of the attrs type, if the signature names one.
+        const ATTRS_TYPE_KEY: Option<&'static str>;
 
         /// Check the arguments of `call` these descriptors describe, in declaration order.
         /// `args` and `ty_args` count the signature's fixed arguments, where its tails start.
@@ -506,6 +526,8 @@ pub mod sig {
         const TY_ARGS: usize = 0;
         const VAR_ARGS: usize = 0;
         const VAR_TY_ARGS: usize = 0;
+        const CALL_ATTRS: usize = 0;
+        const ATTRS_TYPE_KEY: Option<&'static str> = None;
 
         fn check(_call: &CallObj, _op: &OpObj, _args: usize, _ty_args: usize) -> Result<()> {
             Ok(())
@@ -517,6 +539,8 @@ pub mod sig {
         const TY_ARGS: usize = L::TY_ARGS;
         const VAR_ARGS: usize = L::VAR_ARGS;
         const VAR_TY_ARGS: usize = L::VAR_TY_ARGS;
+        const CALL_ATTRS: usize = L::CALL_ATTRS;
+        const ATTRS_TYPE_KEY: Option<&'static str> = L::ATTRS_TYPE_KEY;
 
         fn check(call: &CallObj, op: &OpObj, args: usize, ty_args: usize) -> Result<()> {
             L::check(call, op, args, ty_args)?;
@@ -529,6 +553,8 @@ pub mod sig {
         const TY_ARGS: usize = L::TY_ARGS;
         const VAR_ARGS: usize = L::VAR_ARGS + 1;
         const VAR_TY_ARGS: usize = L::VAR_TY_ARGS;
+        const CALL_ATTRS: usize = L::CALL_ATTRS;
+        const ATTRS_TYPE_KEY: Option<&'static str> = L::ATTRS_TYPE_KEY;
 
         fn check(call: &CallObj, op: &OpObj, args: usize, ty_args: usize) -> Result<()> {
             L::check(call, op, args, ty_args)?;
@@ -542,6 +568,8 @@ pub mod sig {
         const TY_ARGS: usize = L::TY_ARGS + 1;
         const VAR_ARGS: usize = L::VAR_ARGS;
         const VAR_TY_ARGS: usize = L::VAR_TY_ARGS;
+        const CALL_ATTRS: usize = L::CALL_ATTRS;
+        const ATTRS_TYPE_KEY: Option<&'static str> = L::ATTRS_TYPE_KEY;
 
         fn check(call: &CallObj, op: &OpObj, args: usize, ty_args: usize) -> Result<()> {
             L::check(call, op, args, ty_args)?;
@@ -554,6 +582,8 @@ pub mod sig {
         const TY_ARGS: usize = L::TY_ARGS;
         const VAR_ARGS: usize = L::VAR_ARGS;
         const VAR_TY_ARGS: usize = L::VAR_TY_ARGS + 1;
+        const CALL_ATTRS: usize = L::CALL_ATTRS;
+        const ATTRS_TYPE_KEY: Option<&'static str> = L::ATTRS_TYPE_KEY;
 
         fn check(call: &CallObj, op: &OpObj, args: usize, ty_args: usize) -> Result<()> {
             L::check(call, op, args, ty_args)?;
@@ -562,12 +592,37 @@ pub mod sig {
         }
     }
 
-    /// C++ `ValidateSignature<Specs...>`: the argument counts, then each argument's type.
+    impl<T: ObjectRefCore + 'static, L: Checks> Checks for (CallAttrs<T>, L) {
+        const ARGS: usize = L::ARGS;
+        const TY_ARGS: usize = L::TY_ARGS;
+        const VAR_ARGS: usize = L::VAR_ARGS;
+        const VAR_TY_ARGS: usize = L::VAR_TY_ARGS;
+        const CALL_ATTRS: usize = L::CALL_ATTRS + 1;
+        const ATTRS_TYPE_KEY: Option<&'static str> = Some(T::ContainerType::TYPE_KEY);
+
+        fn check(call: &CallObj, op: &OpObj, args: usize, ty_args: usize) -> Result<()> {
+            L::check(call, op, args, ty_args)?;
+            let actual = match &call.attrs {
+                Some(attrs) if attrs.as_node::<T::ContainerType>().is_some() => return Ok(()),
+                Some(attrs) => format!("`{}`", type_key(AnyView::from(attrs).type_index())),
+                None => "None".into(),
+            };
+            let message = format!(
+                "Op `{}`: Call.attrs expected `{}`, got {actual}",
+                op.name.as_str(),
+                T::ContainerType::TYPE_KEY,
+            );
+            Err(Error::new(TYPE_ERROR, &message, ""))
+        }
+    }
+
+    /// C++ `ValidateSignature<Specs...>`: the argument counts, then each argument's type and the
+    /// attrs, in declaration order.
     pub(super) fn validate<L: Checks>(call: &CallObj) -> Result<()> {
         const {
             assert!(
-                L::VAR_ARGS <= 1 && L::VAR_TY_ARGS <= 1,
-                "a signature has at most one variadic tail of each kind"
+                L::VAR_ARGS <= 1 && L::VAR_TY_ARGS <= 1 && L::CALL_ATTRS <= 1,
+                "a signature has at most one variadic tail of each kind and one call_attrs"
             )
         };
         let Some(op) = call.op.as_node::<OpObj>() else {

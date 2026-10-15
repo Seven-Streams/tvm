@@ -27,12 +27,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tvm::ir::sig::{IntExpr, PrimExpr, PrimVar, TensorVar};
 use tvm::ir::{
-    Call, CallObj, Expr, FuncType, Op, OpDef, PrimType, Signature, StringImm, Type, Var, VarObj,
+    Attrs, Call, CallObj, DictAttrs, Expr, FuncType, Op, OpDef, PrimType, Signature, StringImm,
+    Type, Var, VarObj,
 };
+use tvm::tirx::CallFFIKernelAttr;
 use tvm::ops::{int32, int32_dtype, prim_type, unknown_loc};
 use tvm::tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex;
 use tvm::tvm_ffi::{
-    AnyView, Array, DLDataType, DLDataTypeExt, Error, ErrorKind, ObjectRefCore, Result,
+    AnyView, Array, DLDataType, DLDataTypeExt, Error, ErrorKind, Map, ObjectRefCore, Result,
     String as FfiString, ATTRIBUTE_ERROR, INTERNAL_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 
@@ -80,21 +82,23 @@ fn validate(call: &Call) -> Result<()> {
     global("ir.CallValidate").call_tuple((call.clone(),)).map(|_| ())
 }
 
-/// The message `Call::Validate` raises for `op(args)` with `ty_args`, with the name of `op`
-/// replaced by `<op>`.
-fn rejection(op: &Op, args: &[Expr], ty_args: &[Type]) -> std::string::String {
+/// `Call(op, args)` with `ty_args`, `attrs` and a result type, so the constructor infers none.
+fn call_with(op: &Op, args: Vec<Expr>, ty_args: Vec<Type>, attrs: Option<Attrs>) -> Call {
     let ty = prim_type(int32_dtype()).unwrap();
-    let args = Array::new(args.to_vec());
-    let ty_args = Array::new(ty_args.to_vec());
-    let call = Call::new_full(
-        Some(ty.into()),
-        op.clone().into(),
-        args,
-        None,
-        ty_args,
-        unknown_loc().unwrap(),
-    )
-    .unwrap();
+    let (args, ty_args) = (Array::new(args), Array::new(ty_args));
+    Call::new_full(Some(ty.into()), op.clone().into(), args, attrs, ty_args, unknown_loc().unwrap())
+        .unwrap()
+}
+
+/// The message `Call::Validate` raises for `op(args)` with `ty_args` and `attrs`, with the name
+/// of `op` replaced by `<op>`.
+fn rejection(
+    op: &Op,
+    args: &[Expr],
+    ty_args: &[Type],
+    attrs: Option<Attrs>,
+) -> std::string::String {
+    let call = call_with(op, args.to_vec(), ty_args.to_vec(), attrs);
     let error = validate(&call).unwrap_err();
     assert_eq!(error.kind(), TYPE_ERROR, "{}", error.message());
     error.message().replace(&format!("`{}`", op.name.as_str()), "`<op>`")
@@ -108,6 +112,9 @@ fn assert_error(result: Result<impl Sized>, kind: ErrorKind, message: &str) {
 
 /// A Call's `args` and `ty_args`.
 type Arguments = (Vec<Expr>, Vec<Type>);
+
+/// A Call's `args` and `attrs`.
+type AttrsCall = (Vec<Expr>, Option<Attrs>);
 
 static INFERRED: AtomicUsize = AtomicUsize::new(0);
 
@@ -235,14 +242,18 @@ fn ops_registered_from_rust_are_used_natively() {
     for (native, rust, calls) in cases {
         let (native, rust) = (Op::get(native).unwrap(), rust.op().unwrap());
         for (args, ty_args) in calls {
-            assert_eq!(rejection(&rust, &args, &ty_args), rejection(&native, &args, &ty_args));
+            let (rust, native) = (
+                rejection(&rust, &args, &ty_args, None),
+                rejection(&native, &args, &ty_args, None),
+            );
+            assert_eq!(rust, native);
         }
     }
 
     // A tensor variable with any number of trailing values passes both.
     for name in ["tirx.masked_load", "rust_test.masked_load"] {
         let args = vec![tensor.clone().into(), i.clone().into(), j.clone().into()];
-        validate(&call_with(&Op::get(name).unwrap(), args, vec![])).unwrap();
+        validate(&call_with(&Op::get(name).unwrap(), args, vec![], None)).unwrap();
     }
 
     // Variadic tails and type arguments.
@@ -262,24 +273,79 @@ fn ops_registered_from_rust_are_used_natively() {
         &tails,
         vec![i.clone().into(), one.clone()],
         vec![int32_ty.clone(), func_ty.clone()],
+        None,
     ))
     .unwrap();
     assert_eq!(
-        rejection(&tails, &[], std::slice::from_ref(&int32_ty)),
+        rejection(&tails, &[], std::slice::from_ref(&int32_ty), None),
         "Op `<op>`: Call.args expected at least 1 argument, got 0"
     );
     assert_eq!(
-        rejection(&tails, &[i.clone().into()], &[]),
+        rejection(&tails, &[i.clone().into()], &[], None),
         "Op `<op>`: Call.ty_args expected at least 1 type argument, got 0"
     );
     assert_eq!(
-        rejection(&tails, &[i.clone().into(), one.clone(), text.clone()], std::slice::from_ref(&int32_ty)),
+        rejection(
+            &tails,
+            &[i.clone().into(), one.clone(), text.clone()],
+            std::slice::from_ref(&int32_ty),
+            None,
+        ),
         "Op `<op>`: `Call.args[2]` (`rest`) expected `ir.PrimExpr`, got `ir.StringImm[ty=ir.StringType]`."
     );
     assert_eq!(
-        rejection(&tails, &[i.clone().into()], std::slice::from_ref(&func_ty)),
+        rejection(&tails, &[i.clone().into()], std::slice::from_ref(&func_ty), None),
         "Op `<op>`: `Call.ty_args[0]` (`T`) expected `ir.PrimType`, got `ir.FuncType`."
     );
+
+    // `call_attrs`: the operator's attrs type, and the check that `Call.attrs` holds one.
+    let dict: Attrs = DictAttrs::new(Map::new()).into();
+    let attrs_cases: Vec<(&str, OpDef, Vec<AttrsCall>)> = vec![
+        (
+            "tirx.device_entry",
+            OpDef::new("rust_test.device_entry", "").signature(
+                Signature::new().var_args::<Expr>("launch_values", "").call_attrs::<DictAttrs>(),
+            ),
+            vec![(vec![], None), (vec![i.clone().into()], None)],
+        ),
+        (
+            "tirx.call_ffi_kernel",
+            OpDef::new("rust_test.call_ffi_kernel", "").signature(
+                Signature::new()
+                    .arg::<Expr>("kernel", "")
+                    .var_args::<Expr>("args", "")
+                    .call_attrs::<CallFFIKernelAttr>(),
+            ),
+            vec![
+                (vec![], Some(dict.clone())),
+                (vec![x.clone().into()], Some(dict.clone())),
+                (vec![x.clone().into(), i.clone().into()], None),
+            ],
+        ),
+    ];
+    for (native, rust, calls) in attrs_cases {
+        let (native, rust) = (Op::get(native).unwrap(), rust.op().unwrap());
+        assert_eq!(rust.attrs_type_key.as_str(), native.attrs_type_key.as_str());
+        assert_eq!(rust.attrs_type_index(), native.attrs_type_index());
+        for (args, attrs) in calls {
+            let (rust, native) = (
+                rejection(&rust, &args, &[], attrs.clone()),
+                rejection(&native, &args, &[], attrs),
+            );
+            assert_eq!(rust, native);
+        }
+    }
+    for name in ["tirx.device_entry", "rust_test.device_entry"] {
+        let entry =
+            call_with(&Op::get(name).unwrap(), vec![i.clone().into()], vec![], Some(dict.clone()));
+        validate(&entry).unwrap();
+    }
+    // A signature without `call_attrs` leaves the operator without an attrs type.
+    let plain = OpDef::extend("rust_test.device_entry")
+        .signature(Signature::new().var_args::<Expr>("launch_values", ""))
+        .op()
+        .unwrap();
+    assert_eq!(plain.attrs_type_key.as_str(), "");
 
     // A custom validator replaces the generated one, and a later signature keeps it.
     let checked = OpDef::new("rust_test.checked", "Take variables only.")
@@ -344,11 +410,4 @@ fn ops_registered_from_rust_are_used_natively() {
         .unwrap();
     let note = Op::attr_map::<FfiString>("rust_test.Note").unwrap().unwrap();
     assert_eq!(note.get(&likely).unwrap().unwrap().as_str(), "hint");
-}
-
-fn call_with(op: &Op, args: Vec<Expr>, ty_args: Vec<Type>) -> Call {
-    let ty = prim_type(int32_dtype()).unwrap();
-    let (args, ty_args) = (Array::new(args), Array::new(ty_args));
-    Call::new_full(Some(ty.into()), op.clone().into(), args, None, ty_args, unknown_loc().unwrap())
-        .unwrap()
 }
