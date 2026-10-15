@@ -151,7 +151,7 @@ impl ConvertSsa {
         let first = self.defined.insert(ObjectIdentity::of(var));
         let defined = match (first, ty.same_as(&var.ty)) {
             (true, true) => var.clone(),
-            _ => Var::new(var.loc.clone(), ty, var.name.clone()),
+            _ => Var::from_complete_fields(var.loc.clone(), ty, var.name.clone()),
         };
         self.rename(var, defined.clone());
         defined
@@ -189,7 +189,7 @@ impl ConvertSsa {
                 let mut mapped = this.renamed(&var).unwrap_or_else(|| var.clone());
                 let ty: Type = structural_mutate(var.ty.clone(), &mut *this)?.try_into()?;
                 if !ty.same_as(&mapped.ty) {
-                    mapped = Var::new(mapped.loc.clone(), ty, mapped.name.clone());
+                    mapped = Var::from_complete_fields(mapped.loc.clone(), ty, mapped.name.clone());
                     this.rename(&var, mapped.clone());
                 }
                 params.push(mapped);

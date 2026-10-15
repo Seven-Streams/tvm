@@ -317,33 +317,6 @@ fn prim_var(name: &str, dtype: DLDataType) -> Result<Var> {
     Var::prim(name, dtype)
 }
 
-/// `Shuffle::ExtractElement(vector, index)`.
-fn extract_element(vector: Expr, index: i64) -> Result<Expr> {
-    shuffle(vec![vector], vec![int32(index)?.into()])
-}
-
-/// `Shuffle::Concat(vectors)`.
-fn concat(vectors: Vec<Expr>) -> Result<Expr> {
-    if vectors.len() == 1 {
-        return Ok(vectors.into_iter().next().expect("one vector"));
-    }
-    let mut indices = Vec::new();
-    let mut index = 0;
-    for vector in &vectors {
-        for _ in 0..lanes(prim_dtype(vector)?)? {
-            indices.push(int32(index)?.into());
-            index += 1;
-        }
-    }
-    shuffle(vectors, indices)
-}
-
-fn shuffle(vectors: Vec<Expr>, indices: Vec<Expr>) -> Result<Expr> {
-    global("prim.Shuffle")?
-        .call_tuple((Array::new(vectors), Array::new(indices), unknown_loc()?))?
-        .try_into()
-}
-
 // ---------------------------------------------------------------------------------------------
 // TryPredicateTensorAccesses
 
@@ -698,8 +671,7 @@ impl Vectorizer {
         if a.same_as(&op.a) {
             return Ok(op.into());
         }
-        let not: Expr = global("prim.BitwiseNot")?.call_tuple((a, op.loc.clone()))?.try_into()?;
-        Ok(not.into())
+        Ok(crate::prim::BitwiseNot::new_full(a, op.loc.clone())?.into())
     }
 
     fn mutate_not(&mut self, op: crate::prim::Not, m: &mut Mutator) -> Result<Any> {
@@ -751,11 +723,12 @@ impl Vectorizer {
         let base = broadcast_to(base, lanes, false)?;
         let stride = broadcast_to(stride, lanes, false)?;
         let mut elems = Vec::with_capacity(lanes as usize);
-        for i in 0..lanes as i64 {
-            let (b, s) = (extract_element(base.clone(), i)?, extract_element(stride.clone(), i)?);
+        for i in 0..lanes {
+            let b = Shuffle::extract_element(base.clone(), i)?;
+            let s = Shuffle::extract_element(stride.clone(), i)?;
             elems.push(Ramp::new(b, s, op.lanes.clone())?.into());
         }
-        Ok(concat(elems)?.into())
+        Ok(Shuffle::concat(elems)?.into())
     }
 
     /// A broadcast of a value that became a vector cannot be widened; C++ rebuilds a changed one
@@ -909,7 +882,7 @@ impl Vectorizer {
             }
         }
         if lanes_or_factor(prim_dtype(&value)?)? != lanes_or_factor(prim_dtype(&op.value)?)? {
-            let new_var = new_var(op.var.name.as_str(), value.ty.clone())?;
+            let new_var = Var::new(op.var.name.clone(), value.ty.clone())?;
             self.remap.insert(key, new_var.clone().into());
             let body: Expr = m.mutate_as(self, &op.body)?;
             return Ok(Let::new(new_var, value, body)?.into());
@@ -1021,10 +994,7 @@ fn no_default<T>(node: &T) -> Error
 where
     for<'a> AnyView<'a>: From<&'a T>,
 {
-    let index = AnyView::from(node).type_index();
-    // SAFETY: every value's type index is registered.
-    let key =
-        unsafe { (*tvm_ffi::tvm_ffi_sys::TVMFFIGetTypeInfo(index)).type_key.as_str().to_string() };
+    let key = crate::ops::type_key(AnyView::from(node).type_index());
     internal(&format!("Do not have a default for {key}"))
 }
 
@@ -1046,11 +1016,6 @@ fn is_prim_vector(expr: &Expr) -> bool {
 /// `ExprDeepEqual()(lhs, rhs)`.
 fn deep_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
     global("prim.expr_deep_equal")?.call_tuple((lhs.clone(), rhs.clone()))?.try_into()
-}
-
-/// `Var(name, ty)`.
-fn new_var(name: &str, ty: crate::ir::Type) -> Result<Var> {
-    global("ir.Var")?.call_tuple((String::from(name), ty, unknown_loc()?))?.try_into()
 }
 
 /// The index patterns C++ accepts for a vectorized `Shuffle`: `Ramp(0, 1, lanes)`, or
@@ -1467,7 +1432,7 @@ impl Vectorizer {
             ));
         }
         if lanes_or_factor(prim_dtype(&value)?)? != lanes_or_factor(prim_dtype(&op.value)?)? {
-            let new_var = new_var(op.var.name.as_str(), value.ty.clone())?;
+            let new_var = Var::new(op.var.name.clone(), value.ty.clone())?;
             self.remap.insert(key, new_var.clone().into());
             return Ok(Bind::new(new_var, value)?.into());
         }
@@ -1527,7 +1492,9 @@ impl Vectorizer {
         let last_index_lanes = total_lanes / other_index_lanes;
         indices[last] = broadcast_to(indices[last].clone(), last_index_lanes, last_scalable)?;
         let value = broadcast_to(value, total_lanes, last_scalable)?;
-        let store = TensorStore::new(op.loc.clone(), op.dest.clone(), Array::new(indices), value);
+        let indices = Array::new(indices);
+        let store =
+            TensorStore::from_complete_fields(op.loc.clone(), op.dest.clone(), indices, value);
         Ok(store.into())
     }
 }

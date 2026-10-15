@@ -33,8 +33,7 @@ use tvm_ffi::{
 
 use super::analyzer::{is_const_int, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::flattened_tensor::{
-    as_tensor_var, elem_offset, flattened_tensor, structural_equal, tensor_data, tensor_type,
-    tensor_var,
+    as_tensor_var, elem_offset, flattened_tensor, structural_equal, tensor_type,
 };
 use super::stmt_simplify::mark_global_non_neg_value;
 use super::util::{function_pass, int_imm, prim_dtype, MutatorExt};
@@ -115,7 +114,9 @@ impl TensorFlattener {
         let indices: Array<Expr> = m.mutate_as(self, &op.indices)?;
         let original: Var = op.dest.clone().try_cast()?;
         let (flattened, indices) = self.access(&original, &indices)?;
-        Ok(TensorStore::new(op.loc.clone(), flattened.into(), indices, value).into())
+        let store =
+            TensorStore::from_complete_fields(op.loc.clone(), flattened.into(), indices, value);
+        Ok(store.into())
     }
 
     fn mutate_load(&mut self, op: TensorLoad, m: &mut Mutator) -> Result<Any> {
@@ -158,7 +159,7 @@ impl TensorFlattener {
                 if tensor_type(&original).is_ok() {
                     self.tensors_used.insert(ObjectIdentity::of(&original));
                     let flattened = self.lookup(&original)?.flattened.clone();
-                    return Ok(tensor_data(&flattened)?.into());
+                    return Ok(flattened.tensor_data()?.into());
                 }
             }
         }
@@ -207,13 +208,10 @@ impl TensorFlattener {
             let (shard, shard_changed) = self.remap_iters(site, &tile.shard()?)?;
             let (replica, replica_changed) = self.remap_iters(site, &tile.replica()?)?;
             if shard_changed || replica_changed {
-                let rebuilt: TileLayout = tvm_ffi::cached_global_func!("tirx.TileLayout")
-                    .call_tuple((shard, replica, tile.offset()?))?
-                    .try_into()?;
-                layout = Some(rebuilt.into());
+                layout = Some(TileLayout::new(&shard, &replica, tile.offset()?)?.into());
             }
         }
-        let fold_view = TensorType::new(
+        let fold_view = TensorType::from_complete_fields(
             ty.loc.clone(),
             ty.dtype.clone(),
             ty.scope.clone(),
@@ -224,7 +222,7 @@ impl TensorFlattener {
             ty.offset_factor,
             layout,
         );
-        let fold_var = tensor_var(&buf.name, fold_view.clone(), &buf.loc)?;
+        let fold_var = Var::new_full(buf.name.clone(), fold_view.clone(), buf.loc.clone())?;
 
         // The husk: the linearized indices carry layout and elem_offset, so it keeps neither.
         let (_, flat_ty) = flattened_tensor(&fold_var, &fold_view)?;
@@ -236,7 +234,7 @@ impl TensorFlattener {
             true => flat_ty.elem_offset.clone(),
             false => int_imm(prim_dtype(&flat_ty.elem_offset)?, 0)?.into(),
         };
-        let husk = TensorType::new(
+        let husk = TensorType::from_complete_fields(
             flat_ty.loc.clone(),
             flat_ty.dtype.clone(),
             flat_ty.scope.clone(),
@@ -251,7 +249,7 @@ impl TensorFlattener {
         // always rebuilds, as the epilogue aliases the husk onto the argument.
         let flattened = match !self.extern_tensors.contains(&key) && structural_equal(&husk, &ty)? {
             true => buf.clone(),
-            false => tensor_var(&buf.name, husk, &buf.loc)?,
+            false => Var::new_full(buf.name.clone(), husk, buf.loc.clone())?,
         };
         self.remap.insert(key.clone(), flattened.clone());
         self.flat.insert(key, FlatInfo { fold_view, flattened });
@@ -278,10 +276,7 @@ impl TensorFlattener {
                 continue;
             }
             changed = true;
-            let rebuilt: Iter = tvm_ffi::cached_global_func!("tirx.Iter")
-                .call_tuple((extent, stride, iter.axis.clone()))?
-                .try_into()?;
-            out.push(rebuilt);
+            out.push(Iter::new(extent, stride, iter.axis.clone()));
         }
         Ok((Array::new(out), changed))
     }
@@ -403,7 +398,7 @@ fn flatten(func: Function) -> Result<Function> {
         let alias = Call::new_full(
             Some(ty.clone()),
             pass.decl_tensor.clone().into(),
-            Array::new(vec![tensor_data(param)?]),
+            Array::new(vec![param.tensor_data()?]),
             None,
             Array::new(vec![ty]),
             crate::ops::unknown_loc()?,

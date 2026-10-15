@@ -88,19 +88,10 @@ fn int_imm(o: &Operands, value: i64) -> Expr {
     imm.into()
 }
 
-/// The lossless allocation: `from_complete_fields` for a node with a `custom-new` constructor.
-macro_rules! lossless {
-    ($node:ident) => {
-        $node::new
-    };
-    ($node:ident, $ctor:ident) => {
-        $node::$ctor
-    };
-}
-
-/// A native binary node reads back its operands, and the Rust-allocated node equals it.
+/// A native binary node reads back its operands, and the Rust-allocated node equals it, as does
+/// the one the Rust constructor builds.
 macro_rules! check_binary {
-    ($o:expr; $($node:ident$(::$ctor:ident)?($lhs:expr, $rhs:expr)),* $(,)?) => {$({
+    ($o:expr; $($node:ident($lhs:expr, $rhs:expr)),* $(,)?) => {$({
         let name = concat!("prim.", stringify!($node));
         let native: $node = global(name)
             .call_tuple(($lhs.clone(), $rhs.clone(), $o.loc.clone()))
@@ -109,10 +100,12 @@ macro_rules! check_binary {
             .unwrap();
         assert!(structural_equal(&native.a, &$lhs), "{name}: a");
         assert!(structural_equal(&native.b, &$rhs), "{name}: b");
-        let rust = lossless!($node $(, $ctor)?)($o.loc.clone(), native.ty.clone(), $lhs.clone(), $rhs.clone());
+        let rust = $node::from_complete_fields($o.loc.clone(), native.ty.clone(), $lhs.clone(), $rhs.clone());
         assert!(structural_equal(&rust, &native), "{name}: Rust-allocated node differs");
-        let swapped = lossless!($node $(, $ctor)?)($o.loc.clone(), native.ty.clone(), $rhs.clone(), $lhs.clone());
+        let swapped = $node::from_complete_fields($o.loc.clone(), native.ty.clone(), $rhs.clone(), $lhs.clone());
         assert!(!structural_equal(&swapped, &native), "{name}: operands are not distinguished");
+        let built = $node::new_full($lhs.clone(), $rhs.clone(), $o.loc.clone()).unwrap();
+        assert!(structural_equal(&built, &native), "{name}: Rust constructor differs");
     })*};
 }
 
@@ -121,8 +114,7 @@ fn binary_nodes_round_trip() {
     load_tvm_compiler();
     let o = operands();
     check_binary!(o;
-        Add::from_complete_fields(o.x, o.y), Sub::from_complete_fields(o.x, o.y),
-        Mul::from_complete_fields(o.x, o.y), Div(o.x, o.y), Mod(o.x, o.y),
+        Add(o.x, o.y), Sub(o.x, o.y), Mul(o.x, o.y), Div(o.x, o.y), Mod(o.x, o.y),
         FloorDiv(o.x, o.y), FloorMod(o.x, o.y), Min(o.x, o.y), Max(o.x, o.y),
         EQ(o.x, o.y), NE(o.x, o.y), LT(o.x, o.y), LE(o.x, o.y), GT(o.x, o.y), GE(o.x, o.y),
         BitwiseAnd(o.x, o.y), BitwiseOr(o.x, o.y), BitwiseXor(o.x, o.y),
@@ -146,7 +138,7 @@ fn other_nodes_round_trip() {
 
     let bitwise_not: BitwiseNot =
         global("prim.BitwiseNot").call_tuple((o.x.clone(), loc())).unwrap().try_into().unwrap();
-    let rust = BitwiseNot::new(loc(), bitwise_not.ty.clone(), o.x.clone());
+    let rust = BitwiseNot::from_complete_fields(loc(), bitwise_not.ty.clone(), o.x.clone());
     assert!(structural_equal(&rust, &bitwise_not));
 
     // `Cast` keeps its target type in the inherited `ty`.
@@ -235,7 +227,7 @@ fn other_nodes_round_trip() {
         .unwrap();
     assert_eq!(shuffle.vectors.len(), 2);
     assert_eq!(shuffle.indices.len(), 2);
-    let rust = Shuffle::new(loc(), shuffle.ty.clone(), vectors, indices);
+    let rust = Shuffle::from_complete_fields(loc(), shuffle.ty.clone(), vectors, indices);
     assert!(structural_equal(&rust, &shuffle));
 }
 

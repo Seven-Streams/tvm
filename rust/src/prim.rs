@@ -23,16 +23,37 @@
 // Every object registered under `prim` gets its block in this file; `skip` leaves one out.
 // tvm-ffi-stubgen(prefix): prim
 // The raw constructors (C++ `Add(a, b)` etc.: type checks, no folding) that passes build
-// directly: `new` is hand-written in `ops/build.rs` and calls the native constructor; the
-// generated lossless allocation is `from_complete_fields`. The folding operators are in `ops`.
+// directly: `new` is hand-written in `ops/build.rs`, with the C++ checks; the generated lossless
+// allocation is `from_complete_fields`. The folding operators are in `ops`.
 // tvm-ffi-stubgen(custom-new): prim.Add
+// tvm-ffi-stubgen(custom-new): prim.And
+// tvm-ffi-stubgen(custom-new): prim.BitwiseAnd
+// tvm-ffi-stubgen(custom-new): prim.BitwiseNot
+// tvm-ffi-stubgen(custom-new): prim.BitwiseOr
+// tvm-ffi-stubgen(custom-new): prim.BitwiseXor
 // tvm-ffi-stubgen(custom-new): prim.Broadcast
 // tvm-ffi-stubgen(custom-new): prim.Cast
+// tvm-ffi-stubgen(custom-new): prim.Div
+// tvm-ffi-stubgen(custom-new): prim.EQ
+// tvm-ffi-stubgen(custom-new): prim.FloorDiv
+// tvm-ffi-stubgen(custom-new): prim.FloorMod
+// tvm-ffi-stubgen(custom-new): prim.GE
+// tvm-ffi-stubgen(custom-new): prim.GT
+// tvm-ffi-stubgen(custom-new): prim.LE
+// tvm-ffi-stubgen(custom-new): prim.LShift
+// tvm-ffi-stubgen(custom-new): prim.LT
 // tvm-ffi-stubgen(custom-new): prim.Let
+// tvm-ffi-stubgen(custom-new): prim.Max
+// tvm-ffi-stubgen(custom-new): prim.Min
+// tvm-ffi-stubgen(custom-new): prim.Mod
 // tvm-ffi-stubgen(custom-new): prim.Mul
+// tvm-ffi-stubgen(custom-new): prim.NE
 // tvm-ffi-stubgen(custom-new): prim.Not
+// tvm-ffi-stubgen(custom-new): prim.Or
+// tvm-ffi-stubgen(custom-new): prim.RShift
 // tvm-ffi-stubgen(custom-new): prim.Ramp
 // tvm-ffi-stubgen(custom-new): prim.Select
+// tvm-ffi-stubgen(custom-new): prim.Shuffle
 // tvm-ffi-stubgen(custom-new): prim.Sub
 
 // tvm-ffi-stubgen(begin): import-section
@@ -147,7 +168,7 @@ impl AndObj {
 
 impl And {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = AndObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -202,7 +223,7 @@ impl BitwiseAndObj {
 
 impl BitwiseAnd {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = BitwiseAndObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -256,7 +277,7 @@ impl BitwiseNotObj {
 
 impl BitwiseNot {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr) -> Self {
         let obj = BitwiseNotObj::new(loc, ty, a);
         Self { base: ObjectArc::new(obj) }
     }
@@ -311,7 +332,7 @@ impl BitwiseOrObj {
 
 impl BitwiseOr {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = BitwiseOrObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -366,7 +387,7 @@ impl BitwiseXorObj {
 
 impl BitwiseXor {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = BitwiseXorObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -530,7 +551,7 @@ impl DivObj {
 
 impl Div {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = DivObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -585,7 +606,7 @@ impl EQObj {
 
 impl EQ {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = EQObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -640,7 +661,7 @@ impl FloorDivObj {
 
 impl FloorDiv {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = FloorDivObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -695,7 +716,7 @@ impl FloorModObj {
 
 impl FloorMod {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = FloorModObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -750,7 +771,7 @@ impl GEObj {
 
 impl GE {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = GEObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -805,7 +826,7 @@ impl GTObj {
 
 impl GT {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = GTObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -860,7 +881,7 @@ impl LEObj {
 
 impl LE {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = LEObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -915,7 +936,7 @@ impl LShiftObj {
 
 impl LShift {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = LShiftObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -970,7 +991,7 @@ impl LTObj {
 
 impl LT {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = LTObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1087,7 +1108,7 @@ impl MaxObj {
 
 impl Max {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = MaxObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1142,7 +1163,7 @@ impl MinObj {
 
 impl Min {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = MinObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1197,7 +1218,7 @@ impl ModObj {
 
 impl Mod {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = ModObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1307,7 +1328,7 @@ impl NEObj {
 
 impl NE {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = NEObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1416,7 +1437,7 @@ impl OrObj {
 
 impl Or {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = OrObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1471,7 +1492,7 @@ impl RShiftObj {
 
 impl RShift {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, a: Expr, b: Expr) -> Self {
         let obj = RShiftObj::new(loc, ty, a, b);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1656,7 +1677,12 @@ impl ShuffleObj {
 
 impl Shuffle {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, vectors: Array<Expr>, indices: Array<Expr>) -> Self {
+    pub fn from_complete_fields(
+        loc: Location,
+        ty: Type,
+        vectors: Array<Expr>,
+        indices: Array<Expr>,
+    ) -> Self {
         let obj = ShuffleObj::new(loc, ty, vectors, indices);
         Self { base: ObjectArc::new(obj) }
     }

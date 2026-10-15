@@ -35,6 +35,7 @@ use tvm_ffi::{
 };
 
 use super::{Attrs, CallObj, Expr, Op, OpObj, SeqCell, Type};
+use crate::ops::type_key;
 use sig::{ArgType, Checks};
 
 /// C++ `OpDef`: register an operator from Rust, or attach more to a registered one.
@@ -354,15 +355,6 @@ fn cells<T: tvm_ffi::type_traits::ContainerElement + Clone>(array: &Array<T>) ->
             return &[];
         }
         std::slice::from_raw_parts(cell.data, cell.size as usize)
-    }
-}
-
-/// The registered type key of a type index (C++ `TypeIndexToTypeKey`).
-fn type_key(type_index: i32) -> std::string::String {
-    // SAFETY: every value's type index is registered.
-    unsafe {
-        let info = tvm_ffi::tvm_ffi_sys::TVMFFIGetTypeInfo(type_index);
-        (*info).type_key.as_str().to_string()
     }
 }
 

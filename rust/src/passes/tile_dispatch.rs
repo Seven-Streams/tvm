@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    dispatch, structural_mutate, structural_walk, Any, AnyView, Array, Error, FieldGetter,
+    dispatch, structural_mutate, structural_walk, Any, Array, Error, FieldGetter,
     Function as FfiFunction, Map, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
     String, Unchanged, WalkOrder, WalkResult,
 };
@@ -41,7 +41,8 @@ use crate::ir::{
     Bind, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, Op, OpObj, OpAttrMap, Range,
     RegionStmt, SeqStmt, Stmt, Var,
 };
-use crate::ops::{int32_dtype, prim_dtype, unknown_loc};
+use crate::ops::{int32_dtype, prim_dtype};
+use crate::prim::Max;
 use crate::sym::Analyzer;
 use crate::target::Target;
 use crate::tirx::{DispatchContext, ExecScope, Function, TensorTypeObj};
@@ -172,10 +173,7 @@ fn resolve_storage_roots(
                 if let Some(var) = tensor_var(&call.args.get(0)?) {
                     if let Some(root) = self.roots.get(&ObjectIdentity::of(&var)) {
                         if !root.same_as(&var) {
-                            let data: Expr = tvm_ffi::cached_global_func!("tirx.TensorData")
-                                .call_tuple((root.clone(),))?
-                                .try_into()?;
-                            return Ok(data.into());
+                            return Ok(root.tensor_data()?.into());
                         }
                     }
                 }
@@ -376,9 +374,7 @@ impl TileDispatcher {
         let attrs_type = Any::from(attrs.clone()).type_index();
         let scope_name: String = FieldGetter::new(attrs_type, "scope")?.get(&*attrs)?;
         let kind = self.target.kind()?.name()?;
-        let scope: ExecScope = tvm_ffi::cached_global_func!("tirx.ExecScope")
-            .call_tuple((kind, scope_name))?
-            .try_into()?;
+        let scope = ExecScope::new(kind, scope_name)?;
         let (inter, intra) = match &self.analysis {
             Some(analysis) => analysis.split(&scope)?,
             None => (Map::new(), Map::new()),
@@ -391,22 +387,18 @@ impl TileDispatcher {
             })
             .collect();
         let var_range_map: Map<Var, Range> = self.var_ranges.iter().cloned().collect();
-        let callbacks: Map<String, tvm_ffi::object::ObjectRef> = Map::new();
-        let args = [
-            Any::from(self.target.clone()),
-            Any::from(scope.clone()),
-            Any::from(launch_params),
-            Any::from(var_range_map),
-            Any::from(false),
-            Any::from(callbacks),
-            Any::from(self.shared_state.clone()),
-            Any::from(inter),
-            Any::from(intra),
-            Any::from(scope.name.clone()),
-        ];
-        let args: Vec<AnyView> = args.iter().map(AnyView::from).collect();
-        let context: DispatchContext =
-            tvm_ffi::cached_global_func!("tirx.DispatchContext").call_packed(&args)?.try_into()?;
+        let context = DispatchContext::new_full(
+            self.target.clone(),
+            scope.clone(),
+            launch_params,
+            var_range_map,
+            false,
+            Map::new(),
+            self.shared_state.clone(),
+            inter,
+            intra,
+            scope.name.clone(),
+        )?;
         let implementation = dispatcher.call_tuple((call, context.clone()))?;
         if implementation.type_index() == tvm_ffi::TypeIndex::kTVMFFINone as i32 {
             return Err(internal(
@@ -716,10 +708,8 @@ impl TileDispatcher {
                 if field.as_str() == preferred_field {
                     prim_dtype(&arg)?;
                     self.variable_cluster |= !self.analyzer.can_prove_equal(&extent, &arg)?;
-                    let max: Expr = tvm_ffi::cached_global_func!("prim.Max")
-                        .call_tuple((extent.clone(), arg.clone(), unknown_loc()?))?
-                        .try_into()?;
-                    extent = self.analyzer.simplify(&max, 2)?;
+                    let max = Max::new(extent.clone(), arg)?;
+                    extent = self.analyzer.simplify(&max.into(), 2)?;
                 }
             }
             self.cluster_bounds.push((tag, extent));

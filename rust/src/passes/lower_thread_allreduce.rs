@@ -30,66 +30,27 @@ use tvm_ffi::{
 };
 
 use super::analyzer::is_const_int;
-use super::util::{
-    MutatorExt, dict_with, function_pass, get_attr, int_imm, internal, memory_scope, prim_dtype,
-};
+use super::util::{MutatorExt, dict_with, function_pass, get_attr, int_imm, internal, prim_dtype};
 use crate::ir::{
     Bind, Call, CallObj, DictAttrs, Evaluate, Expr, If, LambdaExpr, LambdaExprObj, Op, PrimType,
     PrimTypeObj, RegionStmt, SeqStmt, Stmt, StringImm, StringImmObj, TensorLoad, TensorLoadObj,
-    TensorStore, TupleObj, Type, Var, VarObj,
+    TensorStore, TupleObj, Var, VarObj,
 };
 use crate::ops::{prim_type, PrimOps};
 use crate::prim::{CastObj, Select};
 use crate::runtime::MemoryScope;
 use crate::sym::Analyzer;
 use crate::target::Target;
-use crate::tirx::TensorTypeObj;
+use crate::tirx::{TensorType, TensorTypeObj};
 use crate::transform::Pass;
 
 fn type_error(message: &str) -> Error {
     Error::new(TYPE_ERROR, message, "")
 }
 
-/// `TensorType(shape, dtype, scope)`: the other fields take their C++ defaults.
-fn tensor_type(shape: Vec<Expr>, dtype: PrimType, scope: &MemoryScope) -> Result<Type> {
-    let shape = Array::new(shape);
-    let strides = Array::<Expr>::new(vec![]);
-    tvm_ffi::cached_global_func!("tirx.TensorType")
-        .call_packed(&[
-            AnyView::from(&shape),
-            AnyView::from(&dtype),
-            AnyView::from(scope),
-            AnyView::from(&strides),
-            AnyView::new(),
-            AnyView::from(&0i32),
-            AnyView::from(&0i32),
-            AnyView::new(),
-            AnyView::from(&crate::ops::unknown_loc()?),
-        ])?
-        .try_into()
-}
-
-/// `TensorVar(name, ty)`.
-fn new_tensor_var(name: &str, ty: Type) -> Result<Var> {
-    tvm_ffi::cached_global_func!("tirx.TensorVar")
-        .call_tuple((String::from(name), ty, crate::ops::unknown_loc()?))?
-        .try_into()
-}
-
-/// `Var(name, ty)`.
-fn new_var(name: &str, ty: Type) -> Result<Var> {
-    tvm_ffi::cached_global_func!("ir.Var")
-        .call_tuple((String::from(name), ty, crate::ops::unknown_loc()?))?
-        .try_into()
-}
-
-/// `TensorStore(dest, indices, value)` through the native constructor, which validates it.
+/// `TensorStore(dest, indices, value)`, as a statement.
 fn tensor_store(dest: &Var, indices: Vec<Expr>, value: Expr) -> Result<Stmt> {
-    let indices = Array::new(indices);
-    let store: TensorStore = tvm_ffi::cached_global_func!("ir.TensorStore")
-        .call_tuple((dest.clone(), indices, value, crate::ops::unknown_loc()?))?
-        .try_into()?;
-    Ok(store.into())
+    Ok(TensorStore::new(dest.clone(), indices, value)?.into())
 }
 
 fn tensor_load(source: &Var, indices: Vec<Expr>) -> Result<Expr> {
@@ -379,14 +340,16 @@ impl ThreadAllreduceBuilder {
             };
             check_zero_indices(store.indices.iter())?;
             let (dest, indices) = (replacement.source.clone(), replacement.indices.clone());
+            let value = store.value.clone();
             return Ok(
-                TensorStore::new(store.loc.clone(), dest, indices, store.value.clone()).into()
+                TensorStore::from_complete_fields(store.loc.clone(), dest, indices, value).into()
             );
         }
         match self.remaps.remapped_tensor(&as_tensor_var(&store.dest)?) {
             Some(tensor) => {
-                let (indices, value) = (store.indices.clone(), store.value.clone());
-                Ok(TensorStore::new(store.loc.clone(), tensor.into(), indices, value).into())
+                let (loc, indices, value) =
+                    (store.loc.clone(), store.indices.clone(), store.value.clone());
+                Ok(TensorStore::from_complete_fields(loc, tensor.into(), indices, value).into())
             }
             None => Ok(store.into()),
         }
@@ -427,8 +390,8 @@ impl ThreadAllreduceBuilder {
         }
         Ok(Self {
             ops: Ops::new()?,
-            shared: memory_scope("shared")?,
-            local: memory_scope("local")?,
+            shared: MemoryScope::get("shared")?,
+            local: MemoryScope::get("local")?,
             target_kind: target.kind()?.name()?.as_str().to_string(),
             warp_size: attr("thread_warp_size", 1)?,
             max_num_threads: attr("max_num_threads", -1)?,
@@ -756,8 +719,8 @@ impl ThreadAllreduceBuilder {
                 for tensor in &tensors {
                     let shape =
                         vec![int_imm(reduce_dtype, (n_warps * group_extent) as i128)?.into()];
-                    let ty = tensor_type(shape, tensor_ty(tensor).dtype.clone(), &self.shared)?;
-                    let buf = new_tensor_var("red_buf_staging", ty)?;
+                    let ty = TensorType::new(shape, &tensor_ty(tensor).dtype, self.shared.clone())?;
+                    let buf = Var::new("red_buf_staging", ty)?;
                     new_alloc_bufs.push(buf.clone());
                     staging.push(buf);
                 }
@@ -814,8 +777,8 @@ impl ThreadAllreduceBuilder {
                     new_alloc_bufs.push(load_source(result)?);
                     let shape = vec![int_imm(reduce_dtype, group_extent as i128)?.into()];
                     let ty =
-                        tensor_type(shape, tensor_ty(&tensors[i]).dtype.clone(), &self.shared)?;
-                    let broadcast = new_tensor_var("red_result", ty)?;
+                        TensorType::new(shape, &tensor_ty(&tensors[i]).dtype, self.shared.clone())?;
+                    let broadcast = Var::new("red_result", ty)?;
                     write_result.push(tensor_store(
                         &broadcast,
                         vec![group_index.clone()],
@@ -858,8 +821,8 @@ impl ThreadAllreduceBuilder {
             for (idx, value) in values.into_iter().enumerate() {
                 let shape =
                     vec![int_imm(group_dtype, (group_extent * reduce_extent) as i128)?.into()];
-                let ty = tensor_type(shape, prim_type(dtypes[idx])?, &self.shared)?;
-                let buf = new_tensor_var(&format!("red_buf{idx}"), ty)?;
+                let ty = TensorType::new(shape, dtypes[idx], self.shared.clone())?;
+                let buf = Var::new(format!("red_buf{idx}"), ty)?;
                 let index = self.buf_index(&reduce_index, &group_index, reduce_extent)?;
                 seq.push(tensor_store(&buf, vec![index], value)?);
                 shared_bufs.push(buf);
@@ -937,16 +900,16 @@ impl ThreadAllreduceBuilder {
         let mut load_values = Vec::with_capacity(values.len());
         for (idx, value) in values.into_iter().enumerate() {
             let dtype = prim_type(dtypes[idx])?;
-            let red_buf = new_tensor_var(
-                &format!("red_buf{idx}"),
-                tensor_type(shape()?, dtype.clone(), &self.local)?,
+            let red_buf = Var::new(
+                format!("red_buf{idx}"),
+                TensorType::new(shape()?, &dtype, self.local.clone())?,
             )?;
             load_values.push(tensor_store(&red_buf, zero()?, value)?);
             red_bufs.push(red_buf);
             // The shuffled value, in a local tensor of its own.
-            local_bufs.push(new_tensor_var(
-                &format!("t{idx}"),
-                tensor_type(shape()?, dtype, &self.local)?,
+            local_bufs.push(Var::new(
+                format!("t{idx}"),
+                TensorType::new(shape()?, dtype, self.local.clone())?,
             )?);
         }
         match predicate {
@@ -958,8 +921,8 @@ impl ThreadAllreduceBuilder {
         // The active lanes, cached as the reduction may sit in divergent control flow.
         let mut mask_tensor = None;
         if self.need_warp_shuffle_mask {
-            let ty = tensor_type(shape()?, prim_ty(mask)?, &self.local)?;
-            let tensor = new_tensor_var("mask", ty)?;
+            let ty = TensorType::new(shape()?, prim_ty(mask)?, self.local.clone())?;
+            let tensor = Var::new("mask", ty)?;
             seq.push(tensor_store(&tensor, zero()?, mask.clone())?);
             local_bufs.push(tensor.clone());
             mask_tensor = Some(tensor);
@@ -1077,7 +1040,7 @@ impl ThreadAllreduceBuilder {
                 let loads = fload(reduce_align)?;
                 let mut vars = Vec::with_capacity(loads.len());
                 for (k, load) in loads.iter().enumerate() {
-                    vars.push(new_var(&format!("w_{reduce_align}_{k}"), load.ty.clone())?);
+                    vars.push(Var::new(format!("w_{reduce_align}_{k}"), load.ty.clone())?);
                 }
                 let mut body: Vec<Stmt> = Vec::with_capacity(loads.len() + 3);
                 for (var, load) in vars.iter().zip(loads) {

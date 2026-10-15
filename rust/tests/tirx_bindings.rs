@@ -120,7 +120,7 @@ fn strings(items: &[&str]) -> Array<FfiString> {
 fn rust_allocated_data_objects_are_read_by_native_getters() {
     load_tvm_compiler();
 
-    let scope = tirx::ExecScope::new(s("cuda"), s("kernel"));
+    let scope = tirx::ExecScope::from_complete_fields(s("cuda"), s("kernel"));
     assert_fields!(scope; backend = s("cuda"), name = s("kernel"));
 
     let kernel_attrs: Map<FfiString, i64> = [(s("k"), 7i64)].into_iter().collect();
@@ -324,7 +324,7 @@ fn native_ir_objects_agree_with_getters_and_rust_allocation() {
         dtype = ir.int32, scope, shape = shape, strides = strides, elem_offset,
         data_alignment = 64i64, offset_factor = 1i64, layout = None::<tirx::Layout>,
     );
-    let rust = tirx::TensorType::new(
+    let rust = tirx::TensorType::from_complete_fields(
         tensor.loc.clone(),
         tensor.dtype.clone(),
         tensor.scope.clone(),

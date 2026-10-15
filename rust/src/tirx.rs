@@ -26,9 +26,12 @@ pub mod transform;
 
 // Every object registered under `tirx` gets its block in this file; `skip` leaves one out.
 // tvm-ffi-stubgen(prefix): tirx
-// `Function`'s native constructor derives `ty` from the signature, so `new` is hand-written in
-// `ops/build.rs`; the generated lossless allocation is `from_complete_fields`.
+// Constructors with C++ semantics (`Function` derives `ty` from the signature, `TensorType`
+// fills in defaults, `ExecScope` checks a registry) are hand-written in `ops/build.rs`; the
+// generated lossless allocation is `from_complete_fields`.
+// tvm-ffi-stubgen(custom-new): tirx.ExecScope
 // tvm-ffi-stubgen(custom-new): tirx.Function
+// tvm-ffi-stubgen(custom-new): tirx.TensorType
 
 // tvm-ffi-stubgen(begin): import-section
 use std::ops::Deref;
@@ -267,7 +270,7 @@ impl ExecScopeObj {
 
 impl ExecScope {
     /// Lossless complete-field allocation.
-    pub fn new(backend: String, name: String) -> Self {
+    pub fn from_complete_fields(backend: String, name: String) -> Self {
         let obj = ExecScopeObj::new(backend, name);
         Self { base: ObjectArc::new(obj) }
     }
@@ -718,7 +721,7 @@ impl TensorTypeObj {
 
 impl TensorType {
     /// Lossless complete-field allocation.
-    pub fn new(
+    pub fn from_complete_fields(
         loc: Location,
         dtype: PrimType,
         scope: MemoryScope,

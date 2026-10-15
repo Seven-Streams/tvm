@@ -37,8 +37,8 @@ use crate::ir::{Bind, Call, CallObj, Expr, IntImmObj, Op, OpObj, SeqStmt, Stmt, 
 use crate::ops::{int32, int32_dtype, int_imm, prim_dtype, prim_type, unknown_loc, Ex, PrimOps};
 use crate::passes::analyzer::is_const_int;
 use crate::prim::{
-    AndObj, BitwiseAndObj, BitwiseNotObj, BitwiseOrObj, BitwiseXorObj, CastObj, EQObj, FloorModObj,
-    GEObj, GTObj, LEObj, LShiftObj, LTObj, ModObj, RShiftObj,
+    AndObj, BitwiseAndObj, BitwiseNot, BitwiseNotObj, BitwiseOrObj, BitwiseXorObj, CastObj, EQObj,
+    FloorModObj, GEObj, GTObj, LEObj, LShiftObj, LTObj, ModObj, RShiftObj,
 };
 use crate::sym::Analyzer;
 use crate::tirx::ExecScope;
@@ -1387,9 +1387,7 @@ impl ExecAnalysis {
             if a.same_as(&node.a) {
                 return Ok(pred.clone());
             }
-            return tvm_ffi::cached_global_func!("prim.BitwiseNot")
-                .call_tuple((a, node.loc.clone()))?
-                .try_into();
+            return Ok(BitwiseNot::new_full(a, node.loc.clone())?.into());
         }
         if let Some(call) = pred.as_node::<CallObj>() {
             if call.op.same_as(&self.ops.thread_filter) {

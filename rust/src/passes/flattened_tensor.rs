@@ -21,12 +21,12 @@
 //! simplification (`src/tirx/ir/tensor.cc`), `FlattenedTensor`
 //! (`src/tirx/transform/flattened_tensor.h`), and small `TensorVar` helpers.
 
-use tvm_ffi::{AnyView, Array, ObjectCore, ObjectRefCast, ObjectRefCore, Result, String};
+use tvm_ffi::{AnyView, Array, ObjectCore, ObjectRefCast, ObjectRefCore, Result};
 
 use super::analyzer::is_const_int;
-use crate::ir::{Expr, Location, Var, VarObj};
+use crate::ir::{Expr, Var, VarObj};
 use crate::ops::{int32, unknown_loc, Ex, PrimOps};
-use crate::prim::{AddObj, FloorDivObj, FloorModObj, MulObj};
+use crate::prim::{AddObj, FloorDivObj, FloorModObj, Max, MulObj};
 use crate::sym::Analyzer;
 use crate::tirx::TensorType;
 
@@ -44,18 +44,6 @@ pub(crate) fn as_tensor_var(expr: &Expr) -> Option<(Var, TensorType)> {
 /// The `TensorType` of a variable known to be a tensor.
 pub(crate) fn tensor_type(var: &Var) -> Result<TensorType> {
     var.ty.clone().try_cast()
-}
-
-/// C++ `TensorVar(name, type, loc)`.
-pub(crate) fn tensor_var(name: &String, ty: TensorType, loc: &Location) -> Result<Var> {
-    tvm_ffi::cached_global_func!("tirx.TensorVar")
-        .call_tuple((name.clone(), ty, loc.clone()))?
-        .try_into()
-}
-
-/// C++ `TensorVar::data()`: `tensor_data_ptr(tensor)`, typed as the tensor's data pointer.
-pub(crate) fn tensor_data(tensor: &Var) -> Result<Expr> {
-    tvm_ffi::cached_global_func!("tirx.TensorData").call_tuple((tensor.clone(),))?.try_into()
 }
 
 /// C++ `ffi::StructuralEqual()(lhs, rhs)`.
@@ -80,11 +68,6 @@ fn deep_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
         .try_into()
 }
 
-/// The raw `Max(a, b)` node (C++ `prim::Max`).
-fn raw_max(a: Expr, b: Expr) -> Result<Expr> {
-    tvm_ffi::cached_global_func!("prim.Max").call_tuple((a, b, unknown_loc()?))?.try_into()
-}
-
 /// The text of a failed C++ `TVM_FFI_ICHECK_EQ`.
 fn check_eq_failed(condition: &str, lhs: usize, rhs: usize, message: &str) -> tvm_ffi::Error {
     let message = format!("Check failed: {condition} ({lhs} vs. {rhs}) : {message}");
@@ -106,7 +89,7 @@ pub(crate) fn flattened_tensor(tensor: &Var, ty: &TensorType) -> Result<(Var, Te
             span += (Ex::from(&extent) - 1) * &stride;
         }
         let outer = (Ex::from(&strides.get(0)?) * &shape.get(0)?).expr()?;
-        Ex::from(raw_max(outer, span.expr()?))
+        Ex::from(Max::new(outer, span)?)
     } else {
         let mut extent = Ex::from(int32(1));
         for dim in shape.iter() {
@@ -117,20 +100,19 @@ pub(crate) fn flattened_tensor(tensor: &Var, ty: &TensorType) -> Result<(Var, Te
     if shape.len() == 1 && strides.is_empty() {
         return Ok((tensor.clone(), ty.clone()));
     }
-    let flat_ty: TensorType = tvm_ffi::cached_global_func!("tirx.TensorType")
-        .call_packed(&[
-            AnyView::from(&Array::new(vec![extent.expr()?])),
-            AnyView::from(&ty.dtype),
-            AnyView::from(&ty.scope),
-            AnyView::from(&Array::<Expr>::new(vec![])),
-            AnyView::from(&ty.elem_offset),
-            AnyView::from(&ty.data_alignment),
-            AnyView::from(&ty.offset_factor),
-            AnyView::new(),
-            AnyView::from(&unknown_loc()?),
-        ])?
-        .try_into()?;
-    Ok((tensor_var(&tensor.name, flat_ty.clone(), &tensor.loc)?, flat_ty))
+    // The original layout describes the old rank; reset it for the flattened shape.
+    let flat_ty = TensorType::new_full(
+        [extent.expr()?],
+        &ty.dtype,
+        ty.scope.clone(),
+        [],
+        Some(ty.elem_offset.clone()),
+        ty.data_alignment,
+        ty.offset_factor,
+        None,
+        unknown_loc()?,
+    )?;
+    Ok((Var::new_full(tensor.name.clone(), flat_ty.clone(), tensor.loc.clone())?, flat_ty))
 }
 
 /// C++ `TensorTypeNode::ElemOffset(indices, inner)`: the offset of an element in elements,

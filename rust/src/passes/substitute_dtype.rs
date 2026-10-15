@@ -33,7 +33,7 @@ use tvm_ffi::{
     WalkResult, INTERNAL_ERROR,
 };
 
-use super::util::{prim_dtype, prim_type, unknown_loc, MutatorExt};
+use super::util::{prim_dtype, prim_type, MutatorExt};
 use crate::ir::{Call, Expr, Op, PrimTypeObj, TensorLoad, TensorLoadObj, Var, VarObj};
 use crate::ops::{ex, Ex, PrimOps};
 use crate::prim::{
@@ -231,8 +231,7 @@ impl Legalizer {
         if a.same_as(&op.a) {
             return Ok(op.into());
         }
-        let loc = op.loc.clone();
-        tvm_ffi::cached_global_func!("prim.BitwiseNot").call_tuple((a, loc))
+        Ok(BitwiseNot::new_full(a, op.loc.clone())?.into())
     }
 
     /// Both values are cast to the wider of their types.
@@ -308,7 +307,7 @@ impl Legalizer {
         if vectors.same_as(&op.vectors) && indices.same_as(&op.indices) {
             return Ok(op.into());
         }
-        tvm_ffi::cached_global_func!("prim.Shuffle").call_tuple((vectors, indices, unknown_loc()?))
+        Ok(Shuffle::new(&vectors, &indices)?.into())
     }
 
     /// A value of another type retypes the variable, or is cast to a variable already replaced.
@@ -321,13 +320,8 @@ impl Legalizer {
         let mut var = var;
         if Some(prim_dtype(&value)?) != var_dtype {
             if var.same_as(&op.var) {
-                let retyped: Var = tvm_ffi::cached_global_func!("ir.Var")
-                    .call_tuple((
-                        op.var.name.clone(),
-                        prim_type(prim_dtype(&value)?)?,
-                        op.var.loc.clone(),
-                    ))?
-                    .try_into()?;
+                let ty = prim_type(prim_dtype(&value)?)?;
+                let retyped = Var::new_full(op.var.name.clone(), ty, op.var.loc.clone())?;
                 self.remap.insert(ObjectIdentity::of(&op.var), retyped.clone().into());
                 var = retyped;
             } else {

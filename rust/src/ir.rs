@@ -30,21 +30,30 @@ pub use op_def::{sig, OpDef, Signature};
 // tvm-ffi-stubgen(skip): ir.Op
 // tvm-ffi-stubgen(ty-map): ir.Op -> Op
 // Nodes passes construct: `new` is hand-written in `ops/build.rs` in the shape of the C++
-// constructor (defaults, implicit conversions) and calls the native one; the generated lossless
-// allocation is `from_complete_fields`.
+// constructor (defaults, implicit conversions), either written in Rust after it or calling the
+// native one; the generated lossless allocation is `from_complete_fields`.
 // tvm-ffi-stubgen(custom-new): ir.AssertStmt
 // tvm-ffi-stubgen(custom-new): ir.Bind
 // tvm-ffi-stubgen(custom-new): ir.Call
 // tvm-ffi-stubgen(custom-new): ir.Evaluate
 // tvm-ffi-stubgen(custom-new): ir.For
 // tvm-ffi-stubgen(custom-new): ir.FuncType
+// tvm-ffi-stubgen(custom-new): ir.GlobalVar
 // tvm-ffi-stubgen(custom-new): ir.If
+// tvm-ffi-stubgen(custom-new): ir.LambdaExpr
+// tvm-ffi-stubgen(custom-new): ir.MissingType
+// tvm-ffi-stubgen(custom-new): ir.PtrType
 // tvm-ffi-stubgen(custom-new): ir.Range
 // tvm-ffi-stubgen(custom-new): ir.RegionStmt
+// tvm-ffi-stubgen(custom-new): ir.Return
 // tvm-ffi-stubgen(custom-new): ir.SeqStmt
 // tvm-ffi-stubgen(custom-new): ir.StringImm
 // tvm-ffi-stubgen(custom-new): ir.TensorLoad
+// tvm-ffi-stubgen(custom-new): ir.TensorStore
+// tvm-ffi-stubgen(custom-new): ir.Tuple
+// tvm-ffi-stubgen(custom-new): ir.TupleType
 // tvm-ffi-stubgen(custom-new): ir.UnknownLoc
+// tvm-ffi-stubgen(custom-new): ir.Var
 // Names the hand-written `Op` binding uses: the import section keeps them even when no
 // generated block does.
 // tvm-ffi-stubgen(import-object): std::ops::Deref
@@ -731,7 +740,7 @@ impl GlobalVarObj {
 
 impl GlobalVar {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, name_hint: String) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, name_hint: String) -> Self {
         let obj = GlobalVarObj::new(loc, ty, name_hint);
         Self { base: ObjectArc::new(obj) }
     }
@@ -1590,7 +1599,7 @@ impl LambdaExprObj {
 
 impl LambdaExpr {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, vars: Array<Var>, body: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, vars: Array<Var>, body: Expr) -> Self {
         let obj = LambdaExprObj::new(loc, ty, vars, body);
         Self { base: ObjectArc::new(obj) }
     }
@@ -2188,7 +2197,7 @@ impl ReturnObj {
 
 impl Return {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, value: Expr) -> Self {
+    pub fn from_complete_fields(loc: Location, value: Expr) -> Self {
         let obj = ReturnObj::new(loc, value);
         Self { base: ObjectArc::new(obj) }
     }
@@ -2467,7 +2476,12 @@ impl TensorStoreObj {
 
 impl TensorStore {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, dest: Expr, indices: Array<Expr>, value: Expr) -> Self {
+    pub fn from_complete_fields(
+        loc: Location,
+        dest: Expr,
+        indices: Array<Expr>,
+        value: Expr,
+    ) -> Self {
         let obj = TensorStoreObj::new(loc, dest, indices, value);
         Self { base: ObjectArc::new(obj) }
     }
@@ -2521,7 +2535,7 @@ impl TupleObj {
 
 impl Tuple {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, fields: Array<Expr>) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, fields: Array<Expr>) -> Self {
         let obj = TupleObj::new(loc, ty, fields);
         Self { base: ObjectArc::new(obj) }
     }
@@ -2781,7 +2795,7 @@ impl MissingTypeObj {
 
 impl MissingType {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location) -> Self {
+    pub fn from_complete_fields(loc: Location) -> Self {
         let obj = MissingTypeObj::new(loc);
         Self { base: ObjectArc::new(obj) }
     }
@@ -2943,7 +2957,7 @@ impl PtrTypeObj {
 
 impl PtrType {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, element_type: Type, scope: MemoryScope) -> Self {
+    pub fn from_complete_fields(loc: Location, element_type: Type, scope: MemoryScope) -> Self {
         let obj = PtrTypeObj::new(loc, element_type, scope);
         Self { base: ObjectArc::new(obj) }
     }
@@ -3103,7 +3117,7 @@ impl TupleTypeObj {
 
 impl TupleType {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, fields: Array<Type>) -> Self {
+    pub fn from_complete_fields(loc: Location, fields: Array<Type>) -> Self {
         let obj = TupleTypeObj::new(loc, fields);
         Self { base: ObjectArc::new(obj) }
     }
@@ -3233,7 +3247,7 @@ impl VarObj {
 
 impl Var {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, name: String) -> Self {
+    pub fn from_complete_fields(loc: Location, ty: Type, name: String) -> Self {
         let obj = VarObj::new(loc, ty, name);
         Self { base: ObjectArc::new(obj) }
     }

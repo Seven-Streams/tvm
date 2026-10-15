@@ -33,10 +33,10 @@ use tvm_ffi::{
 use super::dtype_conversion::{dtype_conversion, storage_uint};
 use super::util::{MutatorExt, function_pass, get_attr, internal};
 use crate::ir::{
-    Bind, Call, CallObj, Expr, FloatImm, Op, PrimType, PrimTypeObj, PtrTypeObj, Stmt, TensorLoad,
-    TensorStore, TupleObj, Type, Var, LambdaExprObj, SeqStmt,
+    Bind, Call, CallObj, Expr, FloatImm, LambdaExpr, LambdaExprObj, Op, PrimType, PrimTypeObj,
+    PtrType, PtrTypeObj, SeqStmt, Stmt, TensorLoad, TensorStore, Tuple, TupleObj, Type, Var,
 };
-use crate::ops::{float_imm, prim_dtype, prim_type, unknown_loc, Ex, PrimOps};
+use crate::ops::{float_imm, prim_dtype, prim_type, Ex, PrimOps};
 use crate::prim::{
     Add, Broadcast, Cast, CastObj, Div, Let, Max, Min, Mul, Select, Shuffle, Sub, EQ, GE, GT, LE,
     LT, NE,
@@ -130,12 +130,12 @@ fn with_lanes(dtype: DLDataType, other: DLDataType) -> DLDataType {
 
 /// `var.CopyWithType(ty)`.
 fn copy_with_type(var: &Var, ty: Type) -> Var {
-    Var::new(var.loc.clone(), ty, var.name.clone())
+    Var::from_complete_fields(var.loc.clone(), ty, var.name.clone())
 }
 
 /// `make_object<TensorTypeNode>(*ty)` with `dtype` replaced.
 fn with_tensor_dtype(ty: &TensorType, dtype: PrimType) -> TensorType {
-    TensorType::new(
+    TensorType::from_complete_fields(
         ty.loc.clone(),
         dtype,
         ty.scope.clone(),
@@ -190,14 +190,6 @@ fn call_like(original: &Call, ty: Type, args: Vec<Expr>, ty_args: Array<Type>) -
 fn void_type() -> Result<Type> {
     Ok(prim_type(DLDataType { code: DLDataTypeCode::kDLOpaqueHandle as u8, bits: 0, lanes: 0 })?
         .into())
-}
-
-/// `TensorStore(dest, indices, value)`.
-fn tensor_store(dest: Expr, indices: Array<Expr>, value: Expr) -> Result<Stmt> {
-    let store: TensorStore = tvm_ffi::cached_global_func!("ir.TensorStore")
-        .call_tuple((dest, indices, value, unknown_loc()?))?
-        .try_into()?;
-    Ok(store.into())
 }
 
 fn same_elements(new: &[Expr], old: &Array<Expr>) -> bool {
@@ -330,10 +322,7 @@ impl ComputeLegalizer<'_> {
         if same_elements(&vectors, &op.vectors) && !self.family.matches(&op.ty) {
             return Ok(op.into());
         }
-        let shuffle: Shuffle = tvm_ffi::cached_global_func!("prim.Shuffle")
-            .call_tuple((Array::new(vectors), op.indices.clone(), unknown_loc()?))?
-            .try_into()?;
-        Ok(shuffle.into())
+        Ok(Shuffle::new(vectors, &op.indices)?.into())
     }
 
     fn mutate_call(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
@@ -474,7 +463,7 @@ impl ComputeLegalizer<'_> {
         }
         let indices_vec: Vec<Expr> = indices.iter().collect();
         value = self.store_value(&tensor, &indices_vec, value)?;
-        Ok(tensor_store(tensor, indices, value)?.into())
+        Ok(TensorStore::new(tensor, &indices, value)?.into())
     }
 
     fn mutate_load(&mut self, op: TensorLoad, m: &mut Mutator) -> Result<Any> {
@@ -648,9 +637,7 @@ impl ComputeLegalizer<'_> {
             let value: Expr = m.mutate_as(this, value)?;
             this.promote(value)
         })?;
-        let legalized_combine: Expr = tvm_ffi::cached_global_func!("ir.LambdaExpr")
-            .call_tuple((Array::new(vars), body))?
-            .try_into()?;
+        let legalized_combine = LambdaExpr::new(vars, body)?.into();
         let predicate: Expr = m.mutate_as(self, &op.args.get(3)?)?;
         let destinations =
             self.map_operand(&op.args.get(4)?, &mut |this, value| m.mutate_as(this, value))?;
@@ -671,9 +658,7 @@ impl ComputeLegalizer<'_> {
         for field in tuple.fields.iter() {
             fields.push(transform(self, &field)?);
         }
-        tvm_ffi::cached_global_func!("ir.Tuple")
-            .call_tuple((Array::new(fields), operand.loc.clone()))?
-            .try_into()
+        Ok(Tuple::new_full(fields, operand.loc.clone())?.into())
     }
 }
 
@@ -731,7 +716,7 @@ impl StorageLegalizer<'_> {
         if self.family.matches(&op.value.ty) {
             self.check_uint_tensor(&tensor)?;
         }
-        Ok(tensor_store(tensor, indices, value)?.into())
+        Ok(TensorStore::new(tensor, &indices, value)?.into())
     }
 
     fn mutate_load(&mut self, op: TensorLoad, m: &mut Mutator) -> Result<Any> {
@@ -766,9 +751,9 @@ impl StorageLegalizer<'_> {
                 return Ok(result.into());
             };
             let call: Call = result.try_cast()?;
-            let ty = ptr_type(prim_type(storage_uint(element))?.into(), &pointer.scope)?;
+            let ty = PtrType::new(prim_type(storage_uint(element))?, pointer.scope.clone())?;
             let rebuilt = Call::new_full(
-                Some(ty),
+                Some(ty.into()),
                 call.op.clone(),
                 call.args.clone(),
                 call.attrs.clone(),
@@ -857,10 +842,8 @@ impl StorageLegalizer<'_> {
         if !self.family.matches_dtype(element.dtype) {
             return Ok(var.clone());
         }
-        let ty = ptr_type(prim_type(storage_uint(element.dtype))?.into(), &pointer.scope)?;
-        let remapped: Var = tvm_ffi::cached_global_func!("ir.Var")
-            .call_tuple((var.name.clone(), ty, unknown_loc()?))?
-            .try_into()?;
+        let ty = PtrType::new(prim_type(storage_uint(element.dtype))?, pointer.scope.clone())?;
+        let remapped = Var::new(var.name.clone(), ty)?;
         self.remap.insert(ObjectIdentity::of(var), remapped.clone());
         Ok(remapped)
     }
@@ -910,11 +893,6 @@ impl StorageLegalizer<'_> {
         };
         call_like(op, ty, args, op.ty_args.clone())
     }
-}
-
-/// `PtrType(element_type, scope)`.
-fn ptr_type(element: Type, scope: &crate::runtime::MemoryScope) -> Result<Type> {
-    tvm_ffi::cached_global_func!("ir.PtrType").call_tuple((element, scope.clone()))?.try_into()
 }
 
 fn repr(expr: &Expr) -> std::string::String {

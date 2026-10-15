@@ -34,7 +34,7 @@ use super::util::{MutatorExt, function_pass, get_attr, has_nonzero_attr, interna
 use crate::ir::{
     Bind, BindObj, Call, CallObj, DictAttrs, Evaluate, Expr, For, ForObj, If, IfObj, IntImmObj, Op,
     PrimType, PrimTypeObj, PtrType, PtrTypeObj, RegionStmt, RegionStmtObj, SeqStmt, Stmt,
-    StringImm, StringImmObj, TensorLoad, TensorStore, Type, Var,
+    StringImm, StringImmObj, TensorLoad, TensorStore, Var,
 };
 use crate::ops::{int32, int_imm, unknown_loc, Ex, PrimOps};
 use crate::prim::Cast;
@@ -120,46 +120,11 @@ fn storage_bytes(d: DLDataType) -> Result<i64> {
     Ok((d.bits as i64 * lanes + 7) / 8)
 }
 
-/// `PtrType(element, scope)` through the native constructor.
-fn ptr_type(element: Type, scope: &MemoryScope) -> Result<PtrType> {
-    tvm_ffi::cached_global_func!("ir.PtrType").call_tuple((element, scope.clone()))?.try_into()
-}
-
-/// `PtrType::VoidPtrType()`: a pointer to the void sentinel in the global scope.
-fn void_ptr_type() -> Result<PtrType> {
-    let void: Type = prim_type(dtype(HANDLE, 0, 0))?.into();
-    tvm_ffi::cached_global_func!("ir.PtrType")
-        .call_tuple((void, String::from("global")))?
-        .try_into()
-}
-
-/// `Var(name, ty)`.
-fn new_var(name: &str, ty: Type) -> Result<Var> {
-    tvm_ffi::cached_global_func!("ir.Var")
-        .call_tuple((String::from(name), ty, unknown_loc()?))?
-        .try_into()
-}
-
 /// `TensorVar(name, TensorType({extent}, Int(64)))`.
 fn int64_tensor_var(name: &str, extent: i64) -> Result<Var> {
-    let shape: Array<Expr> = Array::new(vec![int_imm(dtype(INT, 64, 1), extent as i128)?.into()]);
-    let no_strides: Array<Expr> = Array::new(vec![]);
-    let tensor: TensorType = tvm_ffi::cached_global_func!("tirx.TensorType")
-        .call_packed(&[
-            (&shape).into(),
-            (&ty(INT, 64)?).into(),
-            (&String::from("global")).into(),
-            (&no_strides).into(),
-            tvm_ffi::AnyView::new(),
-            (&0i32).into(),
-            (&0i32).into(),
-            tvm_ffi::AnyView::new(),
-            (&unknown_loc()?).into(),
-        ])?
-        .try_into()?;
-    tvm_ffi::cached_global_func!("tirx.TensorVar")
-        .call_tuple((String::from(name), tensor, unknown_loc()?))?
-        .try_into()
+    let int64 = dtype(INT, 64, 1);
+    let shape = [int_imm(int64, extent as i128)?.into()];
+    Var::new(name, TensorType::new(shape, int64, MemoryScope::global()?)?)
 }
 
 /// The `TensorType` of a `TensorVar`.
@@ -168,11 +133,6 @@ fn tensor_type_of(var: &Var) -> Result<TensorType> {
         .clone()
         .try_cast::<TensorType>()
         .map_err(|_| Error::new(TYPE_ERROR, "expected a TensorVar, a variable of a TensorType", ""))
-}
-
-/// `TensorTypeNode::DataPtrType()`.
-fn data_ptr_type(tensor: &TensorTypeObj) -> Result<PtrType> {
-    ptr_type(tensor.dtype.clone().into(), &tensor.scope)
 }
 
 /// `TensorTypeNode::ConstantAllocationSize()`.
@@ -301,8 +261,8 @@ impl AllocaScope {
     fn new() -> Result<Self> {
         Ok(Self {
             stack_shape: None,
-            stack_array: new_var("stack_array", void_ptr_type()?.into())?,
-            stack_ffi_any: new_var("stack_ffi_any", void_ptr_type()?.into())?,
+            stack_array: Var::new("stack_array", PtrType::void()?)?,
+            stack_ffi_any: Var::new("stack_ffi_any", PtrType::void()?)?,
             max: StackSizes::default(),
             run: StackSizes::default(),
         })
@@ -438,7 +398,7 @@ impl BuiltinLower {
             let stack_shape = int64_tensor_var("stack_shape", scope.max.shape)?;
             let tensor = tensor_type_of(&stack_shape)?;
             let data = Call::new(
-                data_ptr_type(&tensor)?,
+                tensor.data_ptr_type()?,
                 self.ops.stack_alloca.clone(),
                 vec![StringImm::new("shape")?.into(), int32(scope.max.shape)?.into()],
             )?;
@@ -560,7 +520,7 @@ impl BuiltinLower {
             Some(imm) if imm.value == BigInt::from(DL_CPU)
         );
         let var_type = tensor_type_of(&bind.var)?;
-        if on_cpu && alloc_type.scope.same_as(&global_scope()?) {
+        if on_cpu && alloc_type.scope.same_as(&MemoryScope::global()?) {
             if let Some(size) = constant_allocation_size(&var_type) {
                 if size > 0 && (size as u64).wrapping_mul(nbytes as u64) < MAX_STACK_ALLOCA {
                     return Ok(stmt);
@@ -578,7 +538,7 @@ impl BuiltinLower {
             Evaluate::new(Call::new(int32_ty.clone(), self.ops.throw_last_error.clone(), vec![])?)?
                 .into();
         let data: Expr = Call::new(
-            data_ptr_type(&var_type)?,
+            var_type.data_ptr_type()?,
             self.ops.tensor_data_ptr.clone(),
             vec![bind.var.clone().into()],
         )?
@@ -598,7 +558,7 @@ impl BuiltinLower {
         self.pending_frees.last_mut().expect("a scope is active").push(free_stmt);
 
         let alloc = Call::new(
-            data_ptr_type(&var_type)?,
+            var_type.data_ptr_type()?,
             Op::get("tirx.alloc_workspace")?,
             vec![
                 device_type,
@@ -829,19 +789,12 @@ impl BuiltinLower {
         for (i, arg) in call.args.iter().enumerate() {
             let index: Expr = int32(begin + i as i64)?.into();
             let value = arg.cast(int64.clone()).expr()?;
-            let store: TensorStore = tvm_ffi::cached_global_func!("ir.TensorStore")
-                .call_tuple((
-                    Expr::from(stack_shape.clone()),
-                    Array::new(vec![index]),
-                    value,
-                    unknown_loc()?,
-                ))?
-                .try_into()?;
+            let store = TensorStore::new(stack_shape.clone(), [index], value)?;
             self.prep().push(store.into());
         }
         let load = TensorLoad::new(stack_shape.clone(), vec![int32(begin)?.into()])?;
         let tensor = tensor_type_of(&stack_shape)?;
-        Ok(Call::new(data_ptr_type(&tensor)?, self.ops.address_of.clone(), vec![load.into()])?
+        Ok(Call::new(tensor.data_ptr_type()?, self.ops.address_of.clone(), vec![load.into()])?
             .into())
     }
 
@@ -872,7 +825,7 @@ impl BuiltinLower {
         if is_prim_expr(&strides) && is_zero(&strides) {
             // `ConstHandle(0)`.
             let zero: Expr = int_imm(dtype(UINT, 64, 1), 0)?.into();
-            strides = zero.reinterpret(void_ptr_type()?).expr()?;
+            strides = zero.reinterpret(PtrType::void()?).expr()?;
         }
         prep.push(self.set_field(&stack, index, DLTENSOR_STRIDES, strides)?);
         let ndim = arg(3)?;
@@ -919,7 +872,7 @@ impl BuiltinLower {
         prep.push(self.set_field(&stack, index, DLTENSOR_DEVICE_TYPE, device_type)?);
         self.prep().extend(prep);
         let args = vec![stack.into(), int32(index)?.into(), int32(DLTENSOR_ADDR as i64)?.into()];
-        Ok(Call::new(void_ptr_type()?, self.ops.abi_field_get.clone(), args)?.into())
+        Ok(Call::new(PtrType::void()?, self.ops.abi_field_get.clone(), args)?.into())
     }
 
     /// `IsArrayHandle`: the address of a `DLTensor` made by `stack_make_dltensor`.
@@ -935,7 +888,7 @@ impl BuiltinLower {
     fn set_packed_arg(&mut self, arg: Expr, stack: &Var, offset: i64) -> Result<()> {
         let mut arg = arg;
         let type_index = if arg.as_node::<StringImmObj>().is_some() {
-            arg = arg.reinterpret(void_ptr_type()?).expr()?;
+            arg = arg.reinterpret(PtrType::void()?).expr()?;
             FFI_RAW_STR
         } else if arg.ty.as_node::<PtrTypeObj>().is_some() {
             if self.is_array_handle(&arg) {
@@ -1100,11 +1053,6 @@ fn int_attr(value: Any) -> Result<BigInt> {
     }
     let imm: crate::ir::IntImm = value.try_into()?;
     Ok(imm.value.clone())
-}
-
-/// `runtime::MemoryScope::Global()`.
-fn global_scope() -> Result<MemoryScope> {
-    Ok(void_ptr_type()?.scope.clone())
 }
 
 /// How C++ prints a node in an error message.

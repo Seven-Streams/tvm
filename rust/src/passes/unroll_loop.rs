@@ -28,7 +28,7 @@ use tvm_ffi::{
 };
 
 use super::convert_ssa::convert_ssa_stmt;
-use super::util::{MutatorExt, function_pass, int_imm, memory_scope};
+use super::util::{MutatorExt, function_pass, int_imm};
 use crate::ir::{
     Evaluate, Expr, For, IntImm, IntImmObj, PrimTypeObj, SeqStmt, Stmt, TensorLoad, TensorStore,
     Var,
@@ -309,8 +309,8 @@ pub fn unroll_loop() -> Result<Pass> {
             unroll_local_access,
             indexes_local: HashSet::new(),
             analyzer: Analyzer::new()?,
-            local: memory_scope("local")?,
-            warp: memory_scope("warp")?,
+            local: MemoryScope::get("local")?,
+            warp: MemoryScope::get("warp")?,
         };
         let result: Stmt = structural_mutate(body.clone(), &mut unroller)?.try_into()?;
         let body = if result.same_as(&body) {

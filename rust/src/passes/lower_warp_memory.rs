@@ -36,7 +36,7 @@ use tvm_ffi::{
 
 use super::side_effect::{side_effect, PURE};
 use super::substitute_dtype::{is_tensor_var, substitute_with_dtype_legalization};
-use super::util::{MutatorExt, function_pass, get_attr, int_imm, memory_scope, prim_dtype, prim_type};
+use super::util::{MutatorExt, function_pass, get_attr, int_imm, prim_dtype, prim_type};
 use crate::ir::{
     Bind, Call, CallObj, Expr, For, IntImmObj, Op, PrimType, PrimTypeObj, PtrType, PtrTypeObj,
     Range, RegionStmt, SeqStmt, Stmt, StringImmObj, TensorLoad, TensorStore, Var, VarObj,
@@ -116,8 +116,8 @@ impl Ops {
             ptx_ldmatrix_legacy: Op::get("tirx.ptx_legacy.ldmatrix")?,
             warp_activemask: Op::get("tirx.gpu_warp_activemask")?,
             warp_shuffle: Op::get("tirx.gpu_warp_shuffle")?,
-            local: memory_scope("local")?,
-            warp: memory_scope("warp")?,
+            local: MemoryScope::get("local")?,
+            warp: MemoryScope::get("warp")?,
         })
     }
 }
@@ -541,7 +541,7 @@ impl<'a> WarpAccessRewriter<'a> {
         let var = &alloc.var;
         let var_ty = var.ty.as_node::<TensorTypeObj>().expect("a tensor variable");
         let elem_offset: crate::ir::Expr = int_imm(prim_dtype(&var_ty.elem_offset)?, 0)?.into();
-        let local_ty = TensorType::new(
+        let local_ty = TensorType::from_complete_fields(
             var_ty.loc.clone(),
             var_ty.dtype.clone(),
             self.ops.local.clone(),
@@ -552,9 +552,7 @@ impl<'a> WarpAccessRewriter<'a> {
             var_ty.offset_factor,
             var_ty.layout.clone(),
         );
-        let new_tensor: Var = tvm_ffi::cached_global_func!("tirx.TensorVar")
-            .call_tuple((var.name.clone(), local_ty, var.loc.clone()))?
-            .try_into()?;
+        let new_tensor = Var::new_full(var.name.clone(), local_ty, var.loc.clone())?;
         self.new_tensor = Some(new_tensor.clone());
 
         let rewritten_body: Stmt = structural_mutate(body, &mut self)?.try_into()?;
@@ -636,9 +634,7 @@ impl<'a> WarpAccessRewriter<'a> {
         for &i in positions {
             if tensor_var_of(&op.args.get(i)?, self.ops).is_some_and(|id| self.is_tensor(&id)) {
                 let (local_index, _) = self.split_index_by_group(&op.args.get(i + 1)?)?;
-                args[i] = tvm_ffi::cached_global_func!("tirx.TensorData")
-                    .call_tuple((self.new_tensor(),))?
-                    .try_into()?;
+                args[i] = self.new_tensor().tensor_data()?;
                 args[i + 1] = local_index;
             }
         }
@@ -725,7 +721,8 @@ impl WarpAccessRewriter<'_> {
         let indices: Array<Expr> = m.mutate_as(self, &op.indices)?;
         let mut store = op.clone();
         if !value.same_as(&op.value) || !indices.same_as(&op.indices) {
-            store = TensorStore::new(op.loc.clone(), op.dest.clone(), indices, value);
+            store =
+                TensorStore::from_complete_fields(op.loc.clone(), op.dest.clone(), indices, value);
         }
         if as_tensor_var(&store.dest).is_ok_and(|id| self.is_tensor(&id)) {
             let values = (store.indices.len() as i64, 1);
@@ -733,7 +730,7 @@ impl WarpAccessRewriter<'_> {
                 "Expected flat memory to use as warp memory.  Has FlattenTensor been run?".into()
             })?;
             let (local_index, _) = self.split_index_by_group(&store.indices.get(0)?)?;
-            store = TensorStore::new(
+            store = TensorStore::from_complete_fields(
                 store.loc.clone(),
                 self.new_tensor().into(),
                 Array::new(vec![local_index]),
@@ -981,7 +978,7 @@ impl<'a> UpdatePointerStorageScope<'a> {
         let mut remap = HashMap::new();
         for (var, scope) in new_storage_scopes {
             let replacement: Var = if let Some(ty) = var.ty.as_node::<TensorTypeObj>() {
-                let ty = TensorType::new(
+                let ty = TensorType::from_complete_fields(
                     ty.loc.clone(),
                     ty.dtype.clone(),
                     scope.clone(),
@@ -992,9 +989,7 @@ impl<'a> UpdatePointerStorageScope<'a> {
                     ty.offset_factor,
                     ty.layout.clone(),
                 );
-                tvm_ffi::cached_global_func!("tirx.TensorVar")
-                    .call_tuple((var.name.clone(), ty, var.loc.clone()))?
-                    .try_into()?
+                Var::new_full(var.name.clone(), ty, var.loc.clone())?
             } else {
                 let Some(ptr) = var.ty.as_node::<PtrTypeObj>() else {
                     return Err(Error::new(
@@ -1004,12 +999,8 @@ impl<'a> UpdatePointerStorageScope<'a> {
                         "",
                     ));
                 };
-                let ty: PtrType = tvm_ffi::cached_global_func!("ir.PtrType")
-                    .call_tuple((ptr.element_type.clone(), scope.clone()))?
-                    .try_into()?;
-                tvm_ffi::cached_global_func!("ir.Var")
-                    .call_tuple((var.name.clone(), crate::ir::Type::from(ty), var.loc.clone()))?
-                    .try_into()?
+                let ty = PtrType::new(ptr.element_type.clone(), scope.clone())?;
+                Var::new_full(var.name.clone(), ty, var.loc.clone())?
             };
             remap.insert(ObjectIdentity::of(var), replacement);
         }
@@ -1076,7 +1067,7 @@ impl UpdatePointerStorageScope<'_> {
                 return Err(Error::new(TYPE_ERROR, "expected a TensorType", ""));
             };
             if !tensor_ty.scope.same_as(&scope) {
-                let updated = TensorType::new(
+                let updated = TensorType::from_complete_fields(
                     tensor_ty.loc.clone(),
                     tensor_ty.dtype.clone(),
                     scope,

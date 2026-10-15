@@ -250,7 +250,7 @@ impl SplitPatternRenormalizer {
     fn mutate_lt(&mut self, op: LT, m: &mut Mutator) -> Result<Any> {
         let a: Expr = m.mutate_as(self, &op.a)?;
         let b: Expr = m.mutate_as(self, &op.b)?;
-        let ret = raw_lt(a.clone(), b.clone())?;
+        let ret = LT::new(a.clone(), b.clone())?;
         if let Some(c2) = int_const(&b) {
             if c2.value > BigInt::from(0i64) && a.as_node::<VarObj>().is_none() {
                 let rewritten = a.floordiv(&b).less(1).expr()?;
@@ -291,13 +291,6 @@ impl SplitPatternRenormalizer {
         let _upper = analyzer.assume(&op.loop_var.less(&op.min + &op.extent).expr()?)?;
         m.default_mutate(self, &op)
     }
-}
-
-/// The raw `LT(a, b)` (C++ `prim::LT`).
-fn raw_lt(a: Expr, b: Expr) -> Result<LT> {
-    tvm_ffi::cached_global_func!("prim.LT")
-        .call_tuple((a, b, super::util::unknown_loc()?))?
-        .try_into()
 }
 
 pub fn renormalize_split_pattern() -> Result<Pass> {

@@ -41,7 +41,7 @@ use tvm_ffi::{
     ObjectRefCast, ObjectRefCore, Result, UnchangedOr,
 };
 
-use super::util::{unknown_loc, ContextExt};
+use super::util::ContextExt;
 use crate::ir::{
     Bind, Call, Expr, For, If, Op, PrimType, PrimTypeObj, RegionStmt, SeqStmt, TensorLoad,
     TensorStore, Type, Var,
@@ -221,7 +221,7 @@ pub fn with_bits(ty: &PrimType, bits: u8) -> Result<PrimType> {
 
 /// `var.CopyWithType(ty)`: the same variable, name and location with another type.
 pub fn copy_with_type(var: &Var, ty: impl Into<Type>) -> Var {
-    Var::new(var.loc.clone(), ty.into(), var.name.clone())
+    Var::from_complete_fields(var.loc.clone(), ty.into(), var.name.clone())
 }
 
 /// `tensor.dtype()` of a tensor variable.
@@ -378,10 +378,7 @@ fn legalize_shuffle<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Shuffle) 
     if vectors.same_as(&op.vectors) && indices.same_as(&op.indices) {
         return unchanged();
     }
-    let shuffle: Expr = tvm_ffi::cached_global_func!("prim.Shuffle")
-        .call_tuple((vectors, indices, unknown_loc()?))?
-        .try_into()?;
-    changed(shuffle)
+    changed(Shuffle::new(&vectors, &indices)?)
 }
 
 /// A shift by the C++ operator; with `clamp_shift_amounts`, a shift amount of a narrowed signed
@@ -415,10 +412,7 @@ fn legalize_bitwise_not<S: DataTypeRewriterState>(
     if a.same_as(&op.a) {
         return unchanged();
     }
-    let not: Expr = tvm_ffi::cached_global_func!("prim.BitwiseNot")
-        .call_tuple((a, op.loc.clone()))?
-        .try_into()?;
-    changed(not)
+    changed(BitwiseNot::new_full(a, op.loc.clone())?)
 }
 
 /// A binary operation rebuilt by its C++ operator, which matches the operand types.
@@ -526,7 +520,7 @@ fn index_store<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: TensorStore) -
     if dest.same_as(&op.dest) && value_unchanged && indices.same_as(&op.indices) {
         return changed(op);
     }
-    changed(TensorStore::new(op.loc.clone(), dest, indices, value))
+    changed(TensorStore::from_complete_fields(op.loc.clone(), dest, indices, value))
 }
 
 fn index_load<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: TensorLoad) -> Rewritten {

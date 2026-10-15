@@ -44,12 +44,12 @@ use crate::ir::{
 };
 use crate::prim::{Broadcast, BroadcastObj, Cast, Mul, Ramp, RampObj, Select};
 
-const INT: u8 = DLDataTypeCode::kDLInt as u8;
-const UINT: u8 = DLDataTypeCode::kDLUInt as u8;
+pub(super) const INT: u8 = DLDataTypeCode::kDLInt as u8;
+pub(super) const UINT: u8 = DLDataTypeCode::kDLUInt as u8;
 const FLOAT: u8 = DLDataTypeCode::kDLFloat as u8;
-const HANDLE: u8 = DLDataTypeCode::kDLOpaqueHandle as u8;
+pub(super) const HANDLE: u8 = DLDataTypeCode::kDLOpaqueHandle as u8;
 const BFLOAT: u8 = DLDataTypeCode::kDLBfloat as u8;
-const BOOL: u8 = DLDataTypeCode::kDLBool as u8;
+pub(super) const BOOL: u8 = DLDataTypeCode::kDLBool as u8;
 const FLOAT8: std::ops::RangeInclusive<u8> =
     DLDataTypeCode::kDLFloat8_e3m4 as u8..=DLDataTypeCode::kDLFloat8_e8m0fnu as u8;
 const FLOAT6: std::ops::RangeInclusive<u8> =
@@ -86,7 +86,7 @@ fn vscale_factor(dtype: DLDataType) -> i32 {
 }
 
 /// C++ `PrimType::lanes()`, which a scalable vector has none of at compile time.
-fn lanes(dtype: DLDataType) -> Result<i32> {
+pub(super) fn lanes(dtype: DLDataType) -> Result<i32> {
     match encoded_lanes(dtype) {
         lanes if lanes < 0 => {
             Err(internal("Can't fetch the lanes of a scalable vector at a compile time."))
@@ -96,7 +96,7 @@ fn lanes(dtype: DLDataType) -> Result<i32> {
 }
 
 /// The scalar element type, `WithLanes(1)`.
-fn element(dtype: DLDataType) -> DLDataType {
+pub(super) fn element(dtype: DLDataType) -> DLDataType {
     DLDataType { lanes: 1, ..dtype }
 }
 
@@ -111,12 +111,12 @@ fn storage_bytes(dtype: DLDataType) -> u64 {
 // ---------------------------------------------------------------------------------------------
 // Shared pieces
 
-fn internal(message: &str) -> Error {
+pub(super) fn internal(message: &str) -> Error {
     Error::new(INTERNAL_ERROR, message, "")
 }
 
 /// The error of a failed C++ `TVM_FFI_CHECK` or `TVM_FFI_ICHECK`.
-fn check_failed(kind: ErrorKind, condition: &str, message: &str) -> Error {
+pub(super) fn check_failed(kind: ErrorKind, condition: &str, message: &str) -> Error {
     Error::new(kind, &format!("Check failed: ({condition}) is false: {message}"), "")
 }
 
@@ -137,7 +137,7 @@ thread_local! {
 }
 
 /// `Op::Get(name)`, fetched once per thread as the C++ functions keep theirs in `static`s.
-fn op(name: &'static str) -> Result<Op> {
+pub(super) fn op(name: &'static str) -> Result<Op> {
     if let Some(op) = OPS.with(|ops| ops.borrow().get(name).cloned()) {
         return Ok(op);
     }

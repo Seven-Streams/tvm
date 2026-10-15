@@ -20,38 +20,72 @@
 //! Constructors shaped like the C++ ones, and the constants they build on (see the module doc).
 
 use std::cell::OnceCell;
+use std::fmt::Display;
+use std::sync::OnceLock;
+use std::thread::LocalKey;
 
+use tvm_ffi::object::ObjectRef;
 use tvm_ffi::{
-    Any, Array, BigInt, DLDataType, DLDataTypeCode, Map, ObjectRefCast, ObjectRefCore, Result,
-    String,
+    Any, AnyView, Array, BigInt, DLDataType, DLDataTypeCode, DLDataTypeExt,
+    Function as FfiFunction, Map, ObjectCore, ObjectRefCast, ObjectRefCore, Result, String,
+    TypeAttrColumn, INTERNAL_ERROR, TYPE_ERROR,
 };
 
 use super::arith::Ex;
+use super::math::{check_failed, element, lanes, op, BOOL, HANDLE, INT, UINT};
 use crate::ir::{
-    AssertStmt, Attrs, Bind, Call, DictAttrs, Evaluate, Expr, FloatImm, For, FuncType, If, IntImm,
-    Location, Op, PrimType, PrimTypeObj, Range, RegionStmt, SeqStmt, SeqStmtObj, Stmt, StringImm,
-    TensorLoad, Type, UnknownLoc, Var,
+    AssertStmt, Attrs, Bind, Call, DictAttrs, Evaluate, Expr, FloatImm, For, FuncType, GlobalVar,
+    If, IntImm, LambdaExpr, Location, MissingType, MissingTypeObj, Op, PrimType, PrimTypeObj,
+    PtrType, Range, RegionStmt, Return, SeqStmt, SeqStmtObj, Stmt, StringImm, TensorLoad,
+    TensorStore, Tuple, TupleType, Type, UniqueNameSupply, UnknownLoc, Var,
 };
-use crate::prim::{Add, Broadcast, Cast, Let, Mul, Not, Ramp, Select, Sub};
-use crate::tirx::Function;
+use crate::prim::{
+    Add, And, BitwiseAnd, BitwiseNot, BitwiseOr, BitwiseXor, Broadcast, Cast, Div, FloorDiv,
+    FloorMod, LShift, Let, Max, Min, Mod, Mul, Not, Or, RShift, Ramp, Select, Shuffle, Sub, EQ, GE,
+    GT, LE, LT, NE,
+};
+use crate::runtime::{MemoryScope, MemoryScopeObj};
+use crate::target::Target;
+use crate::tirx::{
+    Axis, DispatchContext, ExecScope, Function, Iter, Layout, TensorType, TensorTypeObj, TileLayout,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Constants and types
 
 thread_local! {
     static UNKNOWN_LOC: OnceCell<Location> = const { OnceCell::new() };
+    static MISSING_TYPE: OnceCell<MissingType> = const { OnceCell::new() };
+    static GLOBAL_SCOPE: OnceCell<MemoryScope> = const { OnceCell::new() };
+}
+
+/// A process-wide singleton, fetched once per thread.
+fn singleton<T: Clone>(
+    cell: &'static LocalKey<OnceCell<T>>,
+    fetch: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    cell.with(|cell| {
+        if let Some(value) = cell.get() {
+            return Ok(value.clone());
+        }
+        let value = fetch()?;
+        let _ = cell.set(value.clone());
+        Ok(value)
+    })
 }
 
 /// The process-wide `UnknownLoc()` singleton, as a `Location`, fetched once per thread.
 pub fn unknown_loc() -> Result<Location> {
-    UNKNOWN_LOC.with(|cell| {
-        if let Some(loc) = cell.get() {
-            return Ok(loc.clone());
-        }
-        let loc: Location = UnknownLoc::new()?.into();
-        let _ = cell.set(loc.clone());
-        Ok(loc)
-    })
+    singleton(&UNKNOWN_LOC, || Ok(UnknownLoc::new()?.into()))
+}
+
+/// The registered type key of a type index (C++ `TypeIndexToTypeKey`).
+pub(crate) fn type_key(type_index: i32) -> std::string::String {
+    // SAFETY: every value's type index is registered.
+    unsafe {
+        let info = tvm_ffi::tvm_ffi_sys::TVMFFIGetTypeInfo(type_index);
+        (*info).type_key.as_str().to_string()
+    }
 }
 
 pub fn int32_dtype() -> DLDataType {
@@ -192,15 +226,6 @@ impl StringImm {
     }
 }
 
-impl Var {
-    /// C++ `PrimVar(name, dtype)`.
-    pub fn prim(name: &str, dtype: DLDataType) -> Result<Self> {
-        tvm_ffi::cached_global_func!("ir.Var")
-            .call_tuple((String::from(name), prim_type(dtype)?, unknown_loc()?))?
-            .try_into()
-    }
-}
-
 /// C++ `max_value(dtype)`: the largest value of a scalar type.
 pub fn max_value(dtype: DLDataType) -> Result<Expr> {
     tvm_ffi::cached_global_func!("prim.max_value")
@@ -243,6 +268,153 @@ impl Range {
         tvm_ffi::cached_global_func!("ir.Range_from_min_extent")
             .call_tuple((min, extent, unknown_loc()?))?
             .try_into()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Types and variables
+
+impl MissingType {
+    /// C++ `MissingType()`: the process-wide singleton, the type of an expression whose type is
+    /// not known yet.
+    pub fn new() -> Result<Self> {
+        singleton(&MISSING_TYPE, || {
+            tvm_ffi::cached_global_func!("ir.MissingType").call_packed(&[])?.try_into()
+        })
+    }
+}
+
+impl MemoryScope {
+    /// C++ `MemoryScope::Get(name)`: the registered scope of that name; an error for an
+    /// unregistered one. The enum's registry lives in C++; its JSON decoder is this lookup.
+    pub fn get(name: &str) -> Result<Self> {
+        let decode = tvm_ffi::get_type_attr(MemoryScopeObj::type_index(), "__data_from_json__")
+            .ok_or_else(|| super::math::internal("runtime.MemoryScope has no JSON decoder"))?;
+        FfiFunction::try_from(decode)?.call_tuple((String::from(name),))?.try_into()
+    }
+
+    /// C++ `MemoryScope::Global()`, the default scope.
+    pub fn global() -> Result<Self> {
+        singleton(&GLOBAL_SCOPE, || Self::get("global"))
+    }
+}
+
+impl PtrType {
+    /// C++ `PtrType(element_type, scope)`: a pointer to `element_type` values in memory `scope`.
+    /// The element type cannot be `MissingType`.
+    pub fn new(element_type: impl Into<Type>, scope: MemoryScope) -> Result<Self> {
+        let element_type = element_type.into();
+        if element_type.as_node::<MissingTypeObj>().is_some() {
+            let condition = "!element_type.as<MissingType>().has_value()";
+            let message = "PtrType element_type cannot be Type::Missing()";
+            return Err(check_failed(INTERNAL_ERROR, condition, message));
+        }
+        Ok(Self::from_complete_fields(unknown_loc()?, element_type, scope))
+    }
+
+    /// C++ `PtrType::VoidPtrType()`: an untyped pointer to global memory.
+    pub fn void() -> Result<Self> {
+        let void = DLDataType { code: HANDLE, bits: 0, lanes: 0 };
+        Self::new(prim_type(void)?, MemoryScope::global()?)
+    }
+}
+
+impl TupleType {
+    /// C++ `TupleType(fields)`.
+    pub fn new(fields: impl IntoIterator<Item = Type>) -> Result<Self> {
+        Self::new_full(fields, unknown_loc()?)
+    }
+
+    pub fn new_full(fields: impl IntoIterator<Item = Type>, loc: Location) -> Result<Self> {
+        Ok(Self::from_complete_fields(loc, fields.into_iter().collect()))
+    }
+}
+
+impl TensorType {
+    /// C++ `TensorType(shape, dtype, scope)`: compact (no strides), at offset 0, with the default
+    /// alignment and offset factor, and no layout.
+    pub fn new(
+        shape: impl IntoIterator<Item = Expr>,
+        dtype: impl IntoPrimType,
+        scope: MemoryScope,
+    ) -> Result<Self> {
+        Self::new_full(shape, dtype, scope, [], None, 0, 0, None, unknown_loc()?)
+    }
+
+    /// C++ `TensorType(shape, dtype, scope, strides, elem_offset, data_alignment, offset_factor,
+    /// layout, loc)`. A missing `elem_offset` is an index-typed 0, a `data_alignment` of 0 or less
+    /// is `kAllocAlignment` and an `offset_factor` of 0 is 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        shape: impl IntoIterator<Item = Expr>,
+        dtype: impl IntoPrimType,
+        scope: MemoryScope,
+        strides: impl IntoIterator<Item = Expr>,
+        elem_offset: Option<Expr>,
+        data_alignment: i32,
+        offset_factor: i32,
+        layout: Option<Layout>,
+        loc: Location,
+    ) -> Result<Self> {
+        /// `runtime::kAllocAlignment`.
+        const ALLOC_ALIGNMENT: i32 = 64;
+        let elem_offset = match elem_offset {
+            Some(offset) => offset,
+            // `DefaultIndexType()`: int64, as TVM is built with `INDEX_DEFAULT_I64`.
+            None => int_imm(scalar_dtype(DLDataTypeCode::kDLInt, 64), 0)?.into(),
+        };
+        Ok(Self::from_complete_fields(
+            loc,
+            dtype.into_prim_type()?,
+            scope,
+            shape.into_iter().collect(),
+            strides.into_iter().collect(),
+            elem_offset,
+            if data_alignment <= 0 { ALLOC_ALIGNMENT } else { data_alignment },
+            if offset_factor == 0 { 1 } else { offset_factor },
+            layout,
+        ))
+    }
+}
+
+impl TensorTypeObj {
+    /// C++ `TensorTypeNode::DataPtrType()`: the type of the tensor's data pointer.
+    pub fn data_ptr_type(&self) -> Result<PtrType> {
+        PtrType::new(self.dtype.clone(), self.scope.clone())
+    }
+}
+
+impl Var {
+    /// C++ `Var(name, ty)`. A `TensorType` makes a tensor variable (C++ `TensorVar(name, ty)`).
+    pub fn new(name: impl Into<String>, ty: impl Into<Type>) -> Result<Self> {
+        Self::new_full(name, ty, unknown_loc()?)
+    }
+
+    pub fn new_full(name: impl Into<String>, ty: impl Into<Type>, loc: Location) -> Result<Self> {
+        Ok(Self::from_complete_fields(loc, ty.into(), name.into()))
+    }
+
+    /// C++ `PrimVar(name, dtype)`.
+    pub fn prim(name: &str, dtype: DLDataType) -> Result<Self> {
+        Self::new(name, prim_type(dtype)?)
+    }
+
+    /// C++ `TensorVar::data()`: `tensor_data_ptr(var)`, the data pointer of a tensor variable.
+    pub fn tensor_data(&self) -> Result<Expr> {
+        let ty: TensorType = self.ty.clone().try_cast()?;
+        let this: Expr = self.clone().into();
+        Ok(Call::new(ty.data_ptr_type()?, op("tirx.tensor_data_ptr")?, [this])?.into())
+    }
+}
+
+impl GlobalVar {
+    /// C++ `GlobalVar(name_hint)`.
+    pub fn new(name_hint: impl Into<String>) -> Result<Self> {
+        Self::new_full(name_hint, unknown_loc()?)
+    }
+
+    pub fn new_full(name_hint: impl Into<String>, loc: Location) -> Result<Self> {
+        Ok(Self::from_complete_fields(loc, MissingType::new()?.into(), name_hint.into()))
     }
 }
 
@@ -301,9 +473,64 @@ impl TensorLoad {
     }
 }
 
-/// `$node::new(a, b)` / `new_full(a, b, loc)` for a raw binary constructor.
+/// What a raw binary constructor checks, and the type it gives the node
+/// (`TVM_DEFINE_BINOP_CONSTRUCTOR` and its siblings in `src/ir/prim/expr.cc`).
+#[derive(Clone, Copy)]
+enum Operands {
+    /// `Add`, `Min`, ...: operands of one type, the node's.
+    Arith,
+    /// `LShift`, `BitwiseAnd`, ...: as `Arith`, of an integer type, or boolean if allowed.
+    Bitwise { allow_bool: bool },
+    /// `EQ`, `LT`, ...: operands of one type; the node is boolean.
+    Compare,
+    /// `And`, `Or`: boolean operands of one type; the node is boolean.
+    Logical,
+}
+
+fn bool_type(lanes: u16) -> Result<Type> {
+    Ok(prim_type(DLDataType { code: BOOL, bits: 8, lanes })?.into())
+}
+
+fn binary_type(node: &str, operands: Operands, a: &Expr, b: &Expr) -> Result<Type> {
+    let (a_ty, b_ty) = (prim_dtype(a)?, prim_dtype(b)?);
+    if let Operands::Logical = operands {
+        for (ty, condition) in [(a_ty, "a_ty"), (b_ty, "b_ty")] {
+            if ty.code != BOOL {
+                let condition = format!("{condition}.MatchesCode(DLDataTypeCode::kDLBool)");
+                return Err(check_failed(INTERNAL_ERROR, &condition, ""));
+            }
+        }
+        if a_ty != b_ty {
+            return Err(check_failed(TYPE_ERROR, "a_ty == b_ty", "mismatched types"));
+        }
+        return bool_type(a_ty.lanes);
+    }
+    if a_ty != b_ty {
+        let (a_name, b_name) = (a_ty.to_string(), b_ty.to_string());
+        let message = format!("mismatched types. {} vs. {}\n", a_name.as_str(), b_name.as_str());
+        return Err(check_failed(TYPE_ERROR, "a_ty->dtype == b_ty->dtype", &message));
+    }
+    match operands {
+        Operands::Bitwise { allow_bool } => {
+            if matches!(a_ty.code, INT | UINT) || (allow_bool && a_ty.code == BOOL) {
+                return Ok(a.ty.clone());
+            }
+            let condition = format!(
+                "a.ty().MatchesCode(DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt) || ({allow_bool} \
+                 && a.ty().MatchesCode(DLDataTypeCode::kDLBool))"
+            );
+            let operands = if allow_bool { "integer or boolean" } else { "integer" };
+            let message = format!("{node} requires {operands} operands");
+            Err(check_failed(TYPE_ERROR, &condition, &message))
+        }
+        Operands::Compare => bool_type(a_ty.lanes),
+        Operands::Arith | Operands::Logical => Ok(a.ty.clone()),
+    }
+}
+
+/// `$node::new(a, b)` / `new_full(a, b, loc)`: the raw binary constructors, with the C++ checks.
 macro_rules! raw_binary {
-    ($($node:ident => $global:literal),+ $(,)?) => {
+    ($($node:ident: $operands:expr),+ $(,)?) => {
         $(impl $node {
             #[doc = concat!("C++ `", stringify!($node), "(a, b)`: the raw constructor.")]
             pub fn new(a: impl IntoExpr, b: impl IntoExpr) -> Result<Self> {
@@ -313,13 +540,169 @@ macro_rules! raw_binary {
             #[doc = concat!("C++ `", stringify!($node), "(a, b, loc)`.")]
             pub fn new_full(a: impl IntoExpr, b: impl IntoExpr, loc: Location) -> Result<Self> {
                 let (a, b) = (a.into_expr()?, b.into_expr()?);
-                tvm_ffi::cached_global_func!($global).call_tuple((a, b, loc))?.try_into()
+                let ty = binary_type(stringify!($node), $operands, &a, &b)?;
+                Ok(Self::from_complete_fields(loc, ty, a, b))
             }
         })+
     };
 }
 
-raw_binary!(Add => "prim.Add", Sub => "prim.Sub", Mul => "prim.Mul");
+raw_binary!(
+    Add: Operands::Arith,
+    Sub: Operands::Arith,
+    Mul: Operands::Arith,
+    Div: Operands::Arith,
+    Mod: Operands::Arith,
+    FloorDiv: Operands::Arith,
+    FloorMod: Operands::Arith,
+    Min: Operands::Arith,
+    Max: Operands::Arith,
+    LShift: Operands::Bitwise { allow_bool: false },
+    RShift: Operands::Bitwise { allow_bool: false },
+    BitwiseAnd: Operands::Bitwise { allow_bool: true },
+    BitwiseOr: Operands::Bitwise { allow_bool: true },
+    BitwiseXor: Operands::Bitwise { allow_bool: true },
+    EQ: Operands::Compare,
+    NE: Operands::Compare,
+    LT: Operands::Compare,
+    LE: Operands::Compare,
+    GT: Operands::Compare,
+    GE: Operands::Compare,
+    And: Operands::Logical,
+    Or: Operands::Logical,
+);
+
+impl Not {
+    /// C++ `Not(a)`: the raw constructor; `a` is boolean.
+    pub fn new(a: impl IntoExpr) -> Result<Self> {
+        Self::new_full(a, unknown_loc()?)
+    }
+
+    pub fn new_full(a: impl IntoExpr, loc: Location) -> Result<Self> {
+        let a = a.into_expr()?;
+        let a_ty = prim_dtype(&a)?;
+        if a_ty.code != BOOL {
+            let condition = "a_ty.MatchesCode(DLDataTypeCode::kDLBool)";
+            return Err(check_failed(INTERNAL_ERROR, condition, ""));
+        }
+        Ok(Self::from_complete_fields(loc, bool_type(a_ty.lanes)?, a))
+    }
+}
+
+impl BitwiseNot {
+    /// C++ `BitwiseNot(a)`: the raw constructor; `a` is an integer or boolean.
+    pub fn new(a: impl IntoExpr) -> Result<Self> {
+        Self::new_full(a, unknown_loc()?)
+    }
+
+    pub fn new_full(a: impl IntoExpr, loc: Location) -> Result<Self> {
+        let a = a.into_expr()?;
+        if !matches!(prim_dtype(&a)?.code, INT | UINT | BOOL) {
+            let condition = "a_ty.MatchesCode(DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt) || \
+                             a_ty.MatchesCode(DLDataTypeCode::kDLBool)";
+            let message = "BitwiseNot requires an integer or boolean operand";
+            return Err(check_failed(TYPE_ERROR, condition, message));
+        }
+        Ok(Self::from_complete_fields(loc, a.ty.clone(), a))
+    }
+}
+
+/// The error of a failed C++ `TVM_FFI_ICHECK_NE` / `_LE` / ..., which prints both sides.
+fn compare_failed(condition: &str, lhs: impl Display, rhs: impl Display) -> tvm_ffi::Error {
+    let message = format!("Check failed: {condition} ({lhs} vs. {rhs}) : ");
+    tvm_ffi::Error::new(INTERNAL_ERROR, &message, "")
+}
+
+impl Shuffle {
+    /// C++ `Shuffle(vectors, indices)`: lane `i` of the result is lane `indices[i]` of the
+    /// concatenated `vectors`, which share an element type.
+    pub fn new(
+        vectors: impl IntoIterator<Item = Expr>,
+        indices: impl IntoIterator<Item = Expr>,
+    ) -> Result<Self> {
+        Self::new_full(vectors, indices, unknown_loc()?)
+    }
+
+    pub fn new_full(
+        vectors: impl IntoIterator<Item = Expr>,
+        indices: impl IntoIterator<Item = Expr>,
+        loc: Location,
+    ) -> Result<Self> {
+        let (vectors, indices): (Array<Expr>, Array<Expr>) =
+            (vectors.into_iter().collect(), indices.into_iter().collect());
+        let Some(first) = vectors.iter().next() else {
+            return Err(compare_failed("vectors.size() != 0U", 0, 0));
+        };
+        if indices.is_empty() {
+            return Err(compare_failed("indices.size() != 0U", 0, 0));
+        }
+        let base = element(prim_dtype(&first)?);
+        let mut total_lanes = 0;
+        for vector in &vectors {
+            let dtype = prim_dtype(&vector)?;
+            if element(dtype) != base {
+                return Err(check_failed(
+                    INTERNAL_ERROR,
+                    "val_ty.WithLanes(1)->dtype == base_type->dtype",
+                    "",
+                ));
+            }
+            total_lanes += lanes(dtype)?;
+        }
+        if indices.len() > total_lanes as usize {
+            let condition = "indices.size() <= static_cast<size_t>(total_lanes)";
+            return Err(compare_failed(condition, indices.len(), total_lanes));
+        }
+        let ty = prim_type(DLDataType { lanes: indices.len() as u16, ..base })?;
+        Ok(Self::from_complete_fields(loc, ty.into(), vectors, indices))
+    }
+
+    /// C++ `Shuffle::Concat(vectors)`: the lanes of the vectors in order; one vector is itself.
+    pub fn concat(vectors: impl IntoIterator<Item = Expr>) -> Result<Expr> {
+        let mut vectors: Vec<Expr> = vectors.into_iter().collect();
+        if vectors.len() <= 1 {
+            return vectors.pop().ok_or_else(|| compare_failed("vectors.size() != 0", 0, 0));
+        }
+        let mut indices = Vec::new();
+        for vector in &vectors {
+            for _ in 0..lanes(prim_dtype(vector)?)? {
+                indices.push(int32(indices.len() as i64)?.into());
+            }
+        }
+        Ok(Self::new(vectors, indices)?.into())
+    }
+
+    /// C++ `Shuffle::ExtractElement(vector, index)`: lane `index` of `vector`.
+    pub fn extract_element(vector: impl IntoExpr, index: i32) -> Result<Self> {
+        Self::new([vector.into_expr()?], [int32(index as i64)?.into()])
+    }
+}
+
+impl Tuple {
+    /// C++ `Tuple(fields)`: typed `TupleType` of the field types once every field has a type.
+    pub fn new(fields: impl IntoIterator<Item = Expr>) -> Result<Self> {
+        Self::new_full(fields, unknown_loc()?)
+    }
+
+    pub fn new_full(fields: impl IntoIterator<Item = Expr>, loc: Location) -> Result<Self> {
+        let fields: Array<Expr> = fields.into_iter().collect();
+        let types: Vec<Type> = fields.iter().map(|field| field.ty.clone()).collect();
+        let ty: Type = match types.iter().any(|ty| ty.as_node::<MissingTypeObj>().is_some()) {
+            true => MissingType::new()?.into(),
+            false => TupleType::new(types)?.into(),
+        };
+        Ok(Self::from_complete_fields(loc, ty, fields))
+    }
+}
+
+impl LambdaExpr {
+    /// C++ `LambdaExpr(vars, body)`: typed as a function from the variables' types to the body's.
+    pub fn new(vars: impl IntoIterator<Item = Var>, body: impl Into<Expr>) -> Result<Self> {
+        let (vars, body): (Array<Var>, Expr) = (vars.into_iter().collect(), body.into());
+        let ty = FuncType::new(vars.iter().map(|var| var.ty.clone()), body.ty.clone())?;
+        Ok(Self::from_complete_fields(unknown_loc()?, ty.into(), vars, body))
+    }
+}
 
 impl Select {
     /// C++ `Select(condition, true_value, false_value)`: the raw constructor.
@@ -401,17 +784,6 @@ impl Ramp {
     }
 }
 
-impl Not {
-    /// C++ `Not(a)`: the raw constructor.
-    pub fn new(a: impl IntoExpr) -> Result<Self> {
-        Self::new_full(a, unknown_loc()?)
-    }
-
-    pub fn new_full(a: impl IntoExpr, loc: Location) -> Result<Self> {
-        tvm_ffi::cached_global_func!("prim.Not").call_tuple((a.into_expr()?, loc))?.try_into()
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Statements
 
@@ -454,6 +826,57 @@ impl Evaluate {
         tvm_ffi::cached_global_func!("ir.Evaluate")
             .call_tuple((value.into_expr()?, loc))?
             .try_into()
+    }
+}
+
+impl Return {
+    /// C++ `Return(value)`; an `i32` is `IntImm::Int32`, as in C++ `Return(0)`.
+    pub fn new(value: impl IntoExpr) -> Result<Self> {
+        Self::new_full(value, unknown_loc()?)
+    }
+
+    pub fn new_full(value: impl IntoExpr, loc: Location) -> Result<Self> {
+        Ok(Self::from_complete_fields(loc, value.into_expr()?))
+    }
+}
+
+impl TensorStore {
+    /// C++ `TensorStore(dest, indices, value)`: runs the validation registered for the
+    /// destination's type (`__tvm_tensor_store_validate__`), such as the tensor rank and element
+    /// type checks of a `TensorType`.
+    pub fn new(
+        dest: impl Into<Expr>,
+        indices: impl IntoIterator<Item = Expr>,
+        value: impl IntoExpr,
+    ) -> Result<Self> {
+        Self::new_full(dest, indices, value, unknown_loc()?)
+    }
+
+    pub fn new_full(
+        dest: impl Into<Expr>,
+        indices: impl IntoIterator<Item = Expr>,
+        value: impl IntoExpr,
+        loc: Location,
+    ) -> Result<Self> {
+        static VALIDATE: OnceLock<Option<TypeAttrColumn>> = OnceLock::new();
+        let (dest, value) = (dest.into(), value.into_expr()?);
+        let indices: Array<Expr> = indices.into_iter().collect();
+        prim_dtype(&value)?;
+        for index in &indices {
+            prim_dtype(&index)?;
+        }
+        let ty_index = AnyView::from(&dest.ty).type_index();
+        let column = *VALIDATE.get_or_init(|| TypeAttrColumn::new("__tvm_tensor_store_validate__"));
+        let Some(validate) = column.and_then(|column| column.get(ty_index)) else {
+            let message = format!("Type {} does not support TensorStore", type_key(ty_index));
+            return Err(check_failed(TYPE_ERROR, "validate != nullptr", &message));
+        };
+        FfiFunction::try_from(validate)?.call_tuple((
+            dest.clone(),
+            indices.clone(),
+            value.clone(),
+        ))?;
+        Ok(Self::from_complete_fields(loc, dest, indices, value))
     }
 }
 
@@ -577,10 +1000,8 @@ impl Function {
     /// C++ `Function(params, body)`: a void function without attributes. Derives `ty` from the
     /// signature.
     pub fn new(params: Array<Var>, body: Option<SeqStmt>) -> Result<Self> {
-        let void: Type =
-            tvm_ffi::cached_global_func!("ir.MissingType").call_packed(&[])?.try_into()?;
         let attrs = DictAttrs::new(Map::new());
-        Self::new_full(params, body, void, attrs, unknown_loc()?)
+        Self::new_full(params, body, MissingType::new()?.into(), attrs, unknown_loc()?)
     }
 
     /// C++ `Function(params, body, ret_type, attrs, loc)`; a missing return type becomes void.
@@ -593,6 +1014,103 @@ impl Function {
     ) -> Result<Self> {
         tvm_ffi::cached_global_func!("tirx.Function")
             .call_tuple((params, body, ret_type, attrs, loc))?
+            .try_into()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Objects whose state Rust cannot see: these call the native constructor.
+
+impl ExecScope {
+    /// C++ `ExecScope(backend, name)`: an error unless `backend.name` is a registered execution
+    /// scope (a C++ registry).
+    pub fn new(backend: impl Into<String>, name: impl Into<String>) -> Result<Self> {
+        tvm_ffi::cached_global_func!("tirx.ExecScope")
+            .call_tuple((backend.into(), name.into()))?
+            .try_into()
+    }
+}
+
+impl TileLayout {
+    /// C++ `TileLayout(shard, replica, offset)`. `TileLayout` is opaque to Rust.
+    pub fn new(
+        shard: impl IntoIterator<Item = Iter>,
+        replica: impl IntoIterator<Item = Iter>,
+        offset: Map<Axis, Expr>,
+    ) -> Result<Self> {
+        let (shard, replica): (Array<Iter>, Array<Iter>) =
+            (shard.into_iter().collect(), replica.into_iter().collect());
+        tvm_ffi::cached_global_func!("tirx.TileLayout")
+            .call_tuple((shard, replica, offset))?
+            .try_into()
+    }
+}
+
+impl DispatchContext {
+    /// C++ `DispatchContext(target, exec_scope)`: no launch parameters, ranges, callbacks or
+    /// state. `DispatchContext` is opaque to Rust.
+    pub fn new(target: Target, exec_scope: ExecScope) -> Result<Self> {
+        let (launch_params, var_range_map) = (Map::new(), Map::new());
+        let (callbacks, shared_state, inter, intra) =
+            (Map::new(), Map::new(), Map::new(), Map::new());
+        Self::new_full(
+            target,
+            exec_scope,
+            launch_params,
+            var_range_map,
+            false,
+            callbacks,
+            shared_state,
+            inter,
+            intra,
+            "",
+        )
+    }
+
+    /// C++ `DispatchContext(target, exec_scope, launch_params, var_range_map, alloc_only,
+    /// callbacks, shared_state, inter, intra, scope_kind)`. A launch parameter is the pair
+    /// `[var, extent]`; its extent is a signed integer of the variable's type.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        target: Target,
+        exec_scope: ExecScope,
+        launch_params: Map<String, Array<Expr>>,
+        var_range_map: Map<Var, Range>,
+        alloc_only: bool,
+        callbacks: Map<String, ObjectRef>,
+        shared_state: Map<String, ObjectRef>,
+        inter: Map<String, Array<Expr>>,
+        intra: Map<String, Array<Expr>>,
+        scope_kind: impl Into<String>,
+    ) -> Result<Self> {
+        let args = [
+            Any::from(target),
+            Any::from(exec_scope),
+            Any::from(launch_params),
+            Any::from(var_range_map),
+            Any::from(alloc_only),
+            Any::from(callbacks),
+            Any::from(shared_state),
+            Any::from(inter),
+            Any::from(intra),
+            Any::from(scope_kind.into()),
+        ];
+        let args: Vec<AnyView> = args.iter().map(AnyView::from).collect();
+        tvm_ffi::cached_global_func!("tirx.DispatchContext").call_packed(&args)?.try_into()
+    }
+}
+
+impl UniqueNameSupply {
+    /// C++ `UniqueNameSupply()`: a supply of fresh names without a prefix. `UniqueNameSupply` is
+    /// opaque to Rust.
+    pub fn new() -> Result<Self> {
+        Self::new_full("")
+    }
+
+    /// C++ `UniqueNameSupply(prefix)`.
+    pub fn new_full(prefix: &str) -> Result<Self> {
+        tvm_ffi::cached_global_func!("ir.UniqueNameSupply")
+            .call_tuple((String::from(prefix),))?
             .try_into()
     }
 }

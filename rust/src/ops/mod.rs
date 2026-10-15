@@ -42,9 +42,11 @@
 //! location is `UnknownLoc()` and trailing optional fields take their C++ defaults. `X::new_full`
 //! takes every argument. Arguments convert the way C++ converts them implicitly: an `i32` is an
 //! `IntImm::Int32` ([`IntoExpr`], so `Evaluate::new(0)`), a statement is a body ([`IntoBody`]).
-//! Each calls the native constructor, so its checks and normalization are C++'s. The raw
-//! expression constructors (C++ `Add(a, b)`: type checks, no folding) are `prim::Add::new` and so
-//! on; the generated lossless allocations are `from_complete_fields`.
+//! Each has the C++ constructor's checks, normalization and errors: the variables, types, raw
+//! expression constructors (C++ `Add(a, b)`: type checks, no folding, as `prim::Add::new` and so
+//! on), `Shuffle`, `Tuple`, `Return` and `TensorStore` are written in Rust after it; the others
+//! call it. The generated lossless allocations are `from_complete_fields`: use them for what C++
+//! builds by `CopyOnWrite` or `make_object<T>(*node)`.
 
 mod arith;
 mod build;

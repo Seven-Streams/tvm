@@ -263,8 +263,7 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
             state.update(&gvar, with_attr(&function, TARGET, target_without_host.clone()));
             let host_func = with_attr(&host_func, TARGET, target_host.clone());
             let name = names.fresh(&format!("{}_host", gvar.name_hint.as_str()))?;
-            let host_gvar: GlobalVar =
-                tvm_ffi::cached_global_func!("ir.GlobalVar").call_tuple((name,))?.try_into()?;
+            let host_gvar = GlobalVar::new(name)?;
             state.add(host_gvar.clone(), host_func);
             replacements.insert(id, host_gvar);
         } else if by_host {
@@ -317,10 +316,7 @@ pub(crate) struct UniqueNames {
 
 impl UniqueNames {
     pub(crate) fn new(names: impl Iterator<Item = String>) -> Result<Self> {
-        let supply: crate::ir::UniqueNameSupply =
-            tvm_ffi::cached_global_func!("ir.UniqueNameSupply")
-                .call_tuple((String::from(""),))?
-                .try_into()?;
+        let supply = crate::ir::UniqueNameSupply::new()?;
         for name in names {
             tvm_ffi::cached_global_func!("ir.UniqueNameSupply_ReserveName").call_tuple((
                 supply.clone(),

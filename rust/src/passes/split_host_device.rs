@@ -33,7 +33,6 @@ use tvm_ffi::{
 use super::analyzer::is_const_int;
 use super::bind_target::{host_of, without_host, UniqueNames};
 use super::convert_ssa::convert_ssa_module;
-use super::util::memory_scope;
 use super::util::{MutatorExt, dict_with, get_attr, internal, module_pass, with_attr};
 use crate::ir::{
     AssertStmt, Attrs, BaseFunc, Bind, Call, CallObj, DictAttrs, Evaluate, Expr, GlobalVar,
@@ -90,7 +89,7 @@ impl Ops {
             decl_tensor: Op::get("tirx.decl_tensor")?,
             call_extern: Op::get("tirx.call_extern")?,
             call_ffi_kernel: Op::get("tirx.call_ffi_kernel")?,
-            shared_dyn: memory_scope("shared.dyn")?,
+            shared_dyn: MemoryScope::get("shared.dyn")?,
         })
     }
 }
@@ -125,19 +124,9 @@ fn device_type(target: &Target) -> Result<i64> {
         .try_into()
 }
 
-fn new_var(name: &str, ty: Type) -> Result<Var> {
-    tvm_ffi::cached_global_func!("ir.Var")
-        .call_tuple((String::from(name), ty, unknown_loc()?))?
-        .try_into()
-}
-
 /// `VoidType()`, the empty tuple type.
 fn void_type() -> Result<Type> {
-    let fields: Array<Type> = Array::new(vec![]);
-    let ty: TupleType = tvm_ffi::cached_global_func!("ir.TupleType")
-        .call_tuple((fields, unknown_loc()?))?
-        .try_into()?;
-    Ok(ty.into())
+    Ok(TupleType::new([])?.into())
 }
 
 /// `IsVoidType(ty)`.
@@ -354,16 +343,11 @@ impl HostDeviceSplitter<'_> {
         for param in &params {
             match param.ty.clone().try_cast::<TensorType>() {
                 Ok(ty) => {
-                    let kernel_tensor: Var = tvm_ffi::cached_global_func!("tirx.TensorVar")
-                        .call_tuple((param.name.clone(), ty.clone(), param.loc.clone()))?
-                        .try_into()?;
-                    let data_ptr: Type = tvm_ffi::cached_global_func!("ir.PtrType")
-                        .call_tuple((Type::from(ty.dtype.clone()), ty.scope.clone()))?
-                        .try_into()?;
-                    let data_param = new_var(&format!("{}_ptr", param.name.as_str()), data_ptr)?;
-                    let data: Expr = tvm_ffi::cached_global_func!("tirx.TensorData")
-                        .call_tuple((param.clone(),))?
-                        .try_into()?;
+                    let kernel_tensor =
+                        Var::new_full(param.name.clone(), ty.clone(), param.loc.clone())?;
+                    let data_ptr = ty.data_ptr_type()?;
+                    let data_param = Var::new(format!("{}_ptr", param.name.as_str()), data_ptr)?;
+                    let data = param.tensor_data()?;
                     kernel_params.push(data_param.clone());
                     call_args.push(data);
                     data_params.insert(ObjectIdentity::of(param), data_param);
@@ -383,11 +367,7 @@ impl HostDeviceSplitter<'_> {
         let int32_ty: Type = prim_type(int32_dtype())?.into();
         let success: Expr = int32(0)?.into();
         let kernel_ret_type = if can_propagate_errors {
-            let ret: Return = tvm_ffi::cached_global_func!("ir.Return")
-                .call_tuple((success.clone(), unknown_loc()?))?
-                .try_into()?;
-            let ret: Stmt = ret.into();
-            body = SeqStmt::new(vec![body, ret])?.into();
+            body = SeqStmt::new(vec![body, Return::new(success.clone())?.into()])?.into();
             int32_ty.clone()
         } else {
             void_type()?
@@ -445,9 +425,7 @@ impl HostDeviceSplitter<'_> {
             device_func = with_attr(&device_func, NUM_INPUTS, inputs);
         }
 
-        let symbol: GlobalVar = tvm_ffi::cached_global_func!("ir.GlobalVar")
-            .call_tuple((self.names.fresh(&self.kernel_name)?,))?
-            .try_into()?;
+        let symbol = GlobalVar::new(self.names.fresh(&self.kernel_name)?)?;
         if has_attr(&region.attrs, LAUNCH_FIELDS)? {
             let launch =
                 make_cuda_kernel_launch(&symbol, &mut device_func, call_args, region, self.ops)?;
@@ -456,7 +434,7 @@ impl HostDeviceSplitter<'_> {
         }
         self.device_funcs.push((symbol.clone(), device_func));
         if can_propagate_errors {
-            let code = new_var("kernel_error_code", int32_ty.clone())?;
+            let code = Var::new("kernel_error_code", int32_ty.clone())?;
             let kernel_call = call(int32_ty, symbol, call_args, None)?;
             let succeeded = code.equal(&success).expr()?;
             let assert_success: Stmt = AssertStmt::new(
@@ -761,12 +739,7 @@ fn make_cuda_kernel_launch(
         let int64 = tvm_ffi::DLDataType { code: 0, bits: 64, lanes: 1 };
         let pool: Expr = int_imm(int64, i64::try_from(pool_bytes)? as i128)?.into();
         required_bytes = Some(match required_bytes {
-            Some(required) => {
-                let max: crate::prim::Max = tvm_ffi::cached_global_func!("prim.Max")
-                    .call_tuple((required, pool, unknown_loc()?))?
-                    .try_into()?;
-                max.into()
-            }
+            Some(required) => crate::prim::Max::new(required, pool)?.into(),
             None => pool,
         });
     }

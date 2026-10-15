@@ -32,9 +32,7 @@ use tvm_ffi::{
 use super::data_type_rewriter::{
     copy_with_type, tensor_dtype, DataTypeRewrite, DataTypeRewriterBase, DataTypeRewriterState,
 };
-use super::util::{
-    MutatorExt, function_pass, int32_dtype, internal, memory_scope, prim_dtype, prim_type,
-};
+use super::util::{MutatorExt, function_pass, int32_dtype, internal, prim_dtype, prim_type};
 use crate::ir::{Bind, CallObj, Expr, IntImm, Op, PrimType, SeqStmt, Stmt, Var};
 use crate::prim::Cast;
 use crate::runtime::MemoryScope;
@@ -233,7 +231,7 @@ fn rewrite(func: Function) -> Result<Function> {
         base: DataTypeRewriterBase::new(true)?,
         target: prim_type(int32_dtype())?,
         alloc_tensor: Op::get("tirx.alloc_tensor")?,
-        local: memory_scope("local")?,
+        local: MemoryScope::get("local")?,
         func: func.clone(),
     };
     narrower.base.clamp_shift_amounts = true;

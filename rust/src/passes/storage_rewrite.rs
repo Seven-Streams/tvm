@@ -34,7 +34,7 @@ use std::collections::HashMap;
 
 use tvm_ffi::object::ObjectRef;
 use tvm_ffi::{
-    dispatch, structural_mutate, structural_walk, Any, AnyView, Array, ContextPolicy, DLDataType,
+    dispatch, structural_mutate, structural_walk, Any, Array, ContextPolicy, DLDataType,
     DLDataTypeCode, DefRegionKind, Error, FieldGetter, Map, Mutator, ObjectCore, ObjectIdentity,
     ObjectRefCast, ObjectRefCore, Result, String, StructuralView, VisitContext, VisitInterrupt,
     WalkOrder, WalkResult, WalkWithContextPolicy, INTERNAL_ERROR, TYPE_ERROR, VALUE_ERROR,
@@ -43,12 +43,12 @@ use tvm_ffi::{
 use super::util::{function_pass, get_attr, MutatorExt};
 use crate::ir::{
     AssertStmtObj, Attrs, Bind, BindObj, Call, CallObj, DictAttrs, Evaluate, EvaluateObj, Expr,
-    For, ForObj, IfObj, IntImmObj, Location, Op, PrimType, PrimTypeObj, PtrTypeObj, RegionStmt,
+    For, ForObj, IfObj, IntImmObj, Op, PrimType, PrimTypeObj, PtrType, PtrTypeObj, RegionStmt,
     RegionStmtObj, ReturnObj, SeqStmt, Stmt, StringImm, TensorLoad, TensorLoadObj, TensorStore,
     TensorStoreObj, Type, Var, WhileObj,
 };
 use crate::ops::{ex, int32, int_imm, make_const, prim_dtype, prim_type, unknown_loc, PrimOps};
-use crate::prim::{Let, Ramp, RampObj};
+use crate::prim::{Let, Ramp, RampObj, Shuffle};
 use crate::runtime::{MemoryScope, MemoryScopeObj};
 use crate::sym::Analyzer;
 use crate::target::Target;
@@ -118,12 +118,6 @@ impl Ops {
             return None;
         }
         call.args.get(0).ok()?.try_cast::<Var>().ok()
-    }
-
-    /// `TensorVar::data()`: the pointer the tensor's definition establishes.
-    fn tensor_data(&self, tensor: &Var) -> Result<Expr> {
-        let ty = data_ptr_type(&tensor_type(tensor)?)?;
-        Ok(Call::new(ty, self.tensor_data_ptr.clone(), [tensor.clone().into()])?.into())
     }
 }
 
@@ -199,13 +193,6 @@ fn dtype_of(ty: &TensorType) -> DLDataType {
     ty.dtype.dtype
 }
 
-/// `TensorTypeNode::DataPtrType()`.
-fn data_ptr_type(ty: &TensorType) -> Result<Type> {
-    tvm_ffi::cached_global_func!("ir.PtrType")
-        .call_tuple((Type::from(ty.dtype.clone()), ty.scope.clone()))?
-        .try_into()
-}
-
 /// A copy of `ty` with the dtype, shape and layout replaced (C++ `make_object<TensorTypeNode>(*ty)`
 /// and edits).
 fn retyped(
@@ -214,7 +201,7 @@ fn retyped(
     shape: Array<Expr>,
     layout: Option<Layout>,
 ) -> TensorType {
-    TensorType::new(
+    TensorType::from_complete_fields(
         ty.loc.clone(),
         dtype,
         ty.scope.clone(),
@@ -227,8 +214,7 @@ fn retyped(
     )
 }
 
-/// `TensorType({extent}, dtype, scope, {}, nullopt, data_alignment, offset_factor)`, defaults
-/// filled by the native constructor.
+/// `TensorType({extent}, dtype, scope, {}, std::nullopt, data_alignment, offset_factor)`.
 fn flat_tensor_type(
     extent: Expr,
     dtype: DLDataType,
@@ -236,25 +222,8 @@ fn flat_tensor_type(
     data_alignment: i32,
     offset_factor: i32,
 ) -> Result<TensorType> {
-    let shape = Array::new(vec![extent]);
-    let dtype = prim_type(dtype)?;
-    let strides: Array<Expr> = Array::new(vec![]);
-    let elem_offset = Any::new();
-    let layout: Option<Layout> = None;
-    let loc = unknown_loc()?;
-    tvm_ffi::cached_global_func!("tirx.TensorType")
-        .call_packed(&[
-            AnyView::from(&shape),
-            AnyView::from(&dtype),
-            AnyView::from(scope),
-            AnyView::from(&strides),
-            AnyView::from(&elem_offset),
-            AnyView::from(&data_alignment),
-            AnyView::from(&offset_factor),
-            AnyView::from(&layout),
-            AnyView::from(&loc),
-        ])?
-        .try_into()
+    let (scope, loc) = (scope.clone(), unknown_loc()?);
+    TensorType::new_full([extent], dtype, scope, [], None, data_alignment, offset_factor, None, loc)
 }
 
 /// `TensorTypeNode::ConstantAllocationSize()`: the element count when every extent is constant.
@@ -289,17 +258,6 @@ fn structural_equal(lhs: &Type, rhs: &Type) -> Result<bool> {
 fn expr_deep_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
     tvm_ffi::cached_global_func!("prim.expr_deep_equal")
         .call_tuple((lhs.clone(), rhs.clone()))?
-        .try_into()
-}
-
-fn tensor_store(
-    dest: Expr,
-    indices: Array<Expr>,
-    value: Expr,
-    loc: Location,
-) -> Result<TensorStore> {
-    tvm_ffi::cached_global_func!("ir.TensorStore")
-        .call_tuple((dest, indices, value, loc))?
         .try_into()
 }
 
@@ -928,7 +886,7 @@ impl StoragePlanRewriter {
         } else {
             let ty = tensor_type(buf)?;
             let copy = retyped(&ty, ty.dtype.clone(), ty.shape.clone(), ty.layout.clone());
-            Var::new(buf.loc.clone(), copy.into(), backing.name.clone())
+            Var::new_full(backing.name.clone(), copy, buf.loc.clone())?
         };
         self.remap.insert(ObjectIdentity::of(buf), remapped.clone());
         self.remapped_backing.insert(ObjectIdentity::of(&remapped), backing.clone());
@@ -961,7 +919,8 @@ impl StoragePlanRewriter {
         let backing = self.alloc_var(e)?;
         let buf = self.remap_tensor(&dest, &backing)?;
         let indices = self.remap_indices(&dest, &node.indices, e)?;
-        Ok(TensorStore::new(node.loc.clone(), buf.into(), indices, node.value.clone()))
+        let (loc, value) = (node.loc.clone(), node.value.clone());
+        Ok(TensorStore::from_complete_fields(loc, buf.into(), indices, value))
     }
 
     /// `VisitTensorAccess` for a load.
@@ -1525,7 +1484,7 @@ impl StoragePlanRewriter {
             first_type.data_alignment,
             first_type.offset_factor,
         )?;
-        let buf = Var::new(unknown_loc()?, ty.into(), first.var.name.clone());
+        let buf = Var::new(first.var.name.clone(), ty)?;
         let binding = self.alloc_binding(&buf, is_volatile)?;
         let entry = &mut self.alloc_vec[e];
         entry.alloc_var = Some(buf);
@@ -1572,7 +1531,7 @@ impl StoragePlanRewriter {
         let alloc_size = make_const(shape_type, alloc_elements as i64)?;
         let ty =
             flat_tensor_type(alloc_size, entry.elem_type, &entry.scope, (align / 8) as i32, 0)?;
-        let buf = Var::new(unknown_loc()?, ty.into(), first.var.name.clone());
+        let buf = Var::new(first.var.name.clone(), ty)?;
         let mut any_volatile = entry.is_volatile;
         for &child in &children {
             self.alloc_vec[child].alloc_var = Some(buf.clone());
@@ -1631,7 +1590,7 @@ impl StoragePlanRewriter {
         let view = Call::new_full(
             Some(ty.clone()),
             self.ops.decl_tensor.clone().into(),
-            Array::new(vec![self.ops.tensor_data(backing)?]),
+            Array::new(vec![backing.tensor_data()?]),
             attrs,
             Array::new(vec![ty]),
             call.loc.clone(),
@@ -1669,8 +1628,7 @@ impl StoragePlanRewriter {
                 Ok(call.into())
             }
             Some(value) => {
-                let access =
-                    tensor_store(tensor.into(), Array::new(indices), value, op.loc.clone())?;
+                let access = TensorStore::new_full(tensor, indices, value, op.loc.clone())?;
                 let access = self.remap_store(access)?;
                 let mut args = vec![access.dest.clone(), access.value.clone()];
                 args.extend(access.indices.iter());
@@ -1705,7 +1663,7 @@ impl StoragePlanRewriter {
         let node = if value.same_as(&op.value) && indices.same_as(&op.indices) {
             op
         } else {
-            tensor_store(op.dest.clone(), indices, value, op.loc.clone())?
+            TensorStore::new_full(op.dest.clone(), &indices, value, op.loc.clone())?
         };
         Ok(self.remap_store(node)?.into())
     }
@@ -1740,7 +1698,7 @@ impl StoragePlanRewriter {
                         bits_offset.is_multiple_of(8),
                         "a packed offset is a whole number of bytes"
                     );
-                    let data = self.ops.tensor_data(&self.alloc_var(e)?)?;
+                    let data = self.alloc_var(e)?.tensor_data()?;
                     if bits_offset != 0 || !structural_equal(&data.ty, &op.ty)? {
                         let int64 =
                             DLDataType { code: DLDataTypeCode::kDLInt as u8, bits: 64, lanes: 1 };
@@ -2247,17 +2205,15 @@ impl VectorTypeRewriter {
                     let factor = lanes(preferred)? / lanes(var_info.element_dtype)?;
                     let shape = divided_shape(&ty.shape, factor)?;
                     let ty = retyped(&ty, prim_type(preferred)?, shape, None);
-                    Var::new(old.loc.clone(), ty.into(), old.name.clone())
+                    Var::new_full(old.name.clone(), ty, old.loc.clone())?
                 }
                 Err(_) => {
                     let pointer = old
                         .ty
                         .as_node::<PtrTypeObj>()
                         .ok_or_else(|| Error::new(TYPE_ERROR, "expected a pointer variable", ""))?;
-                    let ty: Type = tvm_ffi::cached_global_func!("ir.PtrType")
-                        .call_tuple((Type::from(prim_type(preferred)?), pointer.scope.clone()))?
-                        .try_into()?;
-                    Var::new(old.loc.clone(), ty, old.name.clone())
+                    let ty = PtrType::new(prim_type(preferred)?, pointer.scope.clone())?;
+                    Var::new_full(old.name.clone(), ty, old.loc.clone())?
                 }
             };
             rewrite_map.insert(
@@ -2339,10 +2295,8 @@ impl VectorTypeRewriter {
             return Ok((node, -1));
         };
         let dest = self.remap_tensor(&dest)?;
-        Ok((
-            TensorStore::new(node.loc.clone(), dest.into(), indices, node.value.clone()),
-            shuffle_index,
-        ))
+        let (loc, value) = (node.loc.clone(), node.value.clone());
+        Ok((TensorStore::from_complete_fields(loc, dest.into(), indices, value), shuffle_index))
     }
 
     fn visit_load(&mut self, node: TensorLoad) -> Result<(TensorLoad, i64)> {
@@ -2369,7 +2323,7 @@ impl VectorTypeRewriter {
                 let ty = tensor_type(buf)?;
                 let shape = divided_shape(&ty.shape, info.factor()?)?;
                 let ty = retyped(&ty, prim_type(info.new_element_dtype)?, shape, None);
-                remapped = Var::new(buf.loc.clone(), ty.into(), buf.name.clone());
+                remapped = Var::new_full(buf.name.clone(), ty, buf.loc.clone())?;
             }
         }
         self.remap.insert(id, remapped.clone());
@@ -2413,8 +2367,7 @@ impl VectorTypeRewriter {
                 )?
             }
             Some(value) => {
-                let access =
-                    tensor_store(tensor.into(), Array::new(indices), value, op.loc.clone())?;
+                let access = TensorStore::new_full(tensor, indices, value, op.loc.clone())?;
                 let (modified, shuffle_index) = self.visit_store(access)?;
                 check!(
                     shuffle_index < 0,
@@ -2506,11 +2459,8 @@ impl VectorTypeRewriter {
             return Ok(node.into());
         }
         if shuffle_index >= 0 {
-            let lane = Array::new(vec![Expr::from(int32(shuffle_index)?)]);
-            let shuffle: Expr = tvm_ffi::cached_global_func!("prim.Shuffle")
-                .call_tuple((Array::new(vec![Expr::from(modified)]), lane, unknown_loc()?))?
-                .try_into()?;
-            return Ok(shuffle.into());
+            let element = Shuffle::extract_element(modified, shuffle_index as i32)?;
+            return Ok(element.into());
         }
         Ok(modified.into())
     }
@@ -2521,7 +2471,7 @@ impl VectorTypeRewriter {
         let node = if value.same_as(&op.value) && indices.same_as(&op.indices) {
             op
         } else {
-            tensor_store(op.dest.clone(), indices, value, op.loc.clone())?
+            TensorStore::new_full(op.dest.clone(), &indices, value, op.loc.clone())?
         };
         let (modified, shuffle_index) = self.visit_store(node)?;
         check!(shuffle_index < 0, "a store is not rewritten into a shuffle");
@@ -2536,7 +2486,7 @@ impl VectorTypeRewriter {
             if let Ok(var) = op.args.get(0)?.try_cast::<Var>() {
                 if is_tensor(&var) {
                     let tensor = self.remap_tensor(&var)?;
-                    return Ok(self.ops.tensor_data(&tensor)?.into());
+                    return Ok(tensor.tensor_data()?.into());
                 }
             }
         }
@@ -2600,7 +2550,7 @@ impl PointerVarSubstituter {
         if !call.op.same_as(&self.tensor_data_ptr) || call.args.len() != 1 {
             return Ok(call.into());
         }
-        let ty = data_ptr_type(&tensor_type(&tensor_var(&call.args.get(0)?)?)?)?;
+        let ty: Type = tensor_type(&tensor_var(&call.args.get(0)?)?)?.data_ptr_type()?.into();
         if structural_equal(&call.ty, &ty)? {
             return Ok(call.into());
         }

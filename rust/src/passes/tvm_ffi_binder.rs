@@ -30,7 +30,7 @@ use std::collections::HashMap;
 
 use tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 use tvm_ffi::{
-    Any, AnyView, Array, BigInt, DLDataType, DLDataTypeExt, Error, ObjectIdentity, ObjectRefCast,
+    AnyView, Array, BigInt, DLDataType, DLDataTypeExt, Error, ObjectIdentity, ObjectRefCast,
     ObjectRefCore, Result, String, TYPE_ERROR,
 };
 
@@ -38,13 +38,14 @@ use super::util::internal;
 use super::analyzer::is_const_int;
 use crate::ir::{
     AssertStmt, Bind, Call, Evaluate, Expr, FloatImmObj, If, IntImmObj, Op, PrimType, PrimTypeObj,
-    PtrTypeObj, SeqStmt, Stmt, StringImm, Type, Var, VarObj,
+    PtrType, PtrTypeObj, SeqStmt, Stmt, StringImm, Type, Var, VarObj,
 };
 use crate::ops::{if_then_else, int32, int_imm, make_const, prim_dtype, prim_type, Ex, PrimOps};
 use crate::prim::{
     AddObj, CastObj, DivObj, FloorDivObj, FloorModObj, MaxObj, MinObj, ModObj, MulObj, Not, Select,
     SubObj,
 };
+use crate::runtime::MemoryScope;
 use crate::sym::Analyzer;
 use crate::tirx::{TensorType, TensorTypeObj};
 
@@ -91,22 +92,6 @@ pub(crate) fn scalar(code: u8, bits: u8) -> Result<PrimType> {
 /// `PrimType::Void()`, `handle(0, 0)`.
 fn void() -> Result<PrimType> {
     prim_type(DLDataType { code: 3, bits: 0, lanes: 0 })
-}
-
-/// `PtrType(element, scope)`; a string scope names a registered memory scope.
-fn ptr_type(element: Type, scope: impl Into<Any>) -> Result<Type> {
-    tvm_ffi::cached_global_func!("ir.PtrType").call_tuple((element, scope.into()))?.try_into()
-}
-
-/// `PtrType::VoidPtrType()`, in the default `global` scope.
-pub(crate) fn void_ptr() -> Result<Type> {
-    ptr_type(void()?.into(), String::from("global"))
-}
-
-/// `Var(name, ty)`.
-pub(crate) fn new_var(name: &str, ty: Type) -> Result<Var> {
-    let loc = crate::ops::unknown_loc()?;
-    tvm_ffi::cached_global_func!("ir.Var").call_tuple((String::from(name), ty, loc))?.try_into()
 }
 
 /// `IntImm::Int32(value)` as an expression.
@@ -661,14 +646,14 @@ impl AbiBinder {
             .logical_or(type_index.greater_equal(TypeIndex::kTVMFFIStaticObjectBegin as i32))
             .expr()?;
         self.emit_type_index_check(index, accepted, expected)?;
-        let value = self.load_union_value(index, &void_ptr()?)?;
+        let value = self.load_union_value(index, &PtrType::void()?.into())?;
         let from_tensor = call(
-            void_ptr()?,
+            PtrType::void()?,
             &self.ops.handle_add_byte_offset,
             vec![value.clone(), i32_imm(OBJECT_CELL_OFFSET as i64)?],
         )?;
         let is_tensor = type_index.equal(TypeIndex::kTVMFFITensor as i32).expr()?;
-        call(void_ptr()?, &self.ops.if_then_else, vec![is_tensor, from_tensor, value])
+        call(PtrType::void()?, &self.ops.if_then_else, vec![is_tensor, from_tensor, value])
     }
 
     fn decode_bool(&mut self, index: i64, type_index: &Expr) -> Result<Expr> {
@@ -708,8 +693,7 @@ impl AbiBinder {
     fn decode_param(&mut self, index: i64) -> Result<()> {
         let param = self.params[index as usize].clone();
         let name = param.name.as_str().to_string();
-        let type_index: Expr =
-            new_var(&format!("{name}.type_index"), scalar(INT, 32)?.into())?.into();
+        let type_index: Expr = Var::new(format!("{name}.type_index"), scalar(INT, 32)?)?.into();
         let args = vec![
             self.packed_args.clone().into(),
             i32_imm(index)?,
@@ -719,7 +703,7 @@ impl AbiBinder {
         self.init_nest.push(Bind::new(type_index.clone().try_cast()?, load)?.into());
         let path = vec![Step::Item(index)];
         if param.ty.as_node::<TensorTypeObj>().is_some() {
-            let handle = new_var(&format!("{name}.handle"), void_ptr()?)?;
+            let handle = Var::new(format!("{name}.handle"), PtrType::void()?)?;
             let value = self.decode_opaque_handle(index, &type_index)?;
             self.bind_pointer(&handle, value, &path, true)?;
             self.tensor_handles.insert(ObjectIdentity::of(&param), handle);
@@ -800,8 +784,8 @@ impl AbiBinder {
 
     /// `DLTensorGetFieldPtr`: bind the shape or strides pointer of a DLTensor.
     fn field_ptr(&mut self, handle: &Var, field: i32, name: &str) -> Result<Var> {
-        let pointer_type = ptr_type(scalar(INT, 64)?.into(), String::from("global"))?;
-        let ptr = new_var(name, pointer_type.clone())?;
+        let pointer_type = PtrType::new(scalar(INT, 64)?, MemoryScope::global()?)?;
+        let ptr = Var::new(name, pointer_type.clone())?;
         let args = vec![handle.clone().into(), i32_imm(0)?, i32_imm(field as i64)?];
         let load = call(pointer_type, &self.ops.abi_field_get, args)?;
         self.init_nest.push(Bind::new(ptr.clone(), load)?.into());
@@ -1034,8 +1018,8 @@ impl AbiBinder {
         )?;
 
         // data pointer.
-        let raw_data = call(void_ptr()?, &self.ops.abi_field_get, field(DL_TENSOR_DATA)?)?;
-        let data_ptr_type = ptr_type(tensor.dtype.clone().into(), tensor.scope.clone())?;
+        let raw_data = call(PtrType::void()?, &self.ops.abi_field_get, field(DL_TENSOR_DATA)?)?;
+        let data_ptr_type = tensor.data_ptr_type()?;
         let typed_data = call(data_ptr_type, &self.ops.reinterpret, vec![raw_data])?;
         let mut alloc_size = Ex::from(int_imm(index_type(tensor)?.dtype, 1));
         for extent in tensor.shape.iter() {
@@ -1051,7 +1035,8 @@ impl AbiBinder {
         self.asserts.push(AssertStmt::new(non_null, text("ValueError")?, parts)?.into());
         if tensor.data_alignment > 1 {
             let direct_address = self.direct_address()?;
-            let as_handle = call(void_ptr()?, &self.ops.reinterpret, vec![typed_data.clone()])?;
+            let as_handle =
+                call(PtrType::void()?, &self.ops.reinterpret, vec![typed_data.clone()])?;
             let as_int = call(uint64.clone(), &self.ops.reinterpret, vec![as_handle])?;
             let alignment = int_imm(uint64.dtype, tensor.data_alignment as i128)?;
             let aligned = as_int.truncmod(alignment).equal(int_imm(uint64.dtype, 0)?);

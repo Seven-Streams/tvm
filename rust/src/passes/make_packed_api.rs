@@ -32,15 +32,14 @@ use tvm_ffi::{
 
 use super::analyzer::is_const_int;
 use super::tvm_ffi_binder::{
-    i32_imm, new_var, repr, scalar, void_ptr, AbiBinder, FFI_ANY_TYPE_INDEX, FFI_ANY_UNION_VALUE,
-    FFI_ANY_ZERO_PADDING,
+    i32_imm, repr, scalar, AbiBinder, FFI_ANY_TYPE_INDEX, FFI_ANY_UNION_VALUE, FFI_ANY_ZERO_PADDING,
 };
 use super::util::{MutatorExt, dict_with, get_attr, internal, module_pass, module_with_function};
 use crate::ir::{
-    Bind, Call, DictAttrs, Evaluate, Expr, For, GlobalVarObj, If, IntImm, Op, PtrTypeObj,
+    Bind, Call, DictAttrs, Evaluate, Expr, For, GlobalVarObj, If, IntImm, Op, PtrType, PtrTypeObj,
     RegionStmt, Return, SeqStmt, Stmt, StringImm, Type, Var,
 };
-use crate::ops::{int_imm, prim_dtype, unknown_loc, PrimOps};
+use crate::ops::{int_imm, prim_dtype, PrimOps};
 use crate::prim::Cast;
 use crate::target::Target;
 use crate::tirx::Function;
@@ -126,7 +125,7 @@ impl ReturnRewriter {
             store(FFI_ANY_TYPE_INDEX, i32_imm(type_index)?)?,
             store(FFI_ANY_ZERO_PADDING, i32_imm(0)?)?,
             store(FFI_ANY_UNION_VALUE, value)?,
-            Return::new(unknown_loc()?, i32_imm(0)?).into(),
+            Return::new(0)?.into(),
         ])
     }
 }
@@ -168,7 +167,7 @@ impl SubroutineCallRewriter<'_> {
                 args.extend(call.args.iter());
                 // An empty handle, for the current `call_cpacked` convention.
                 let zero: Expr = int_imm(scalar(UINT, 64)?.dtype, 0)?.into();
-                let null_handle = zero.reinterpret(void_ptr()?).expr()?;
+                let null_handle = zero.reinterpret(PtrType::void()?).expr()?;
                 args.push(null_handle);
                 self.made_change = true;
                 return Ok(Call::new(call.ty.clone(), self.call_cpacked.clone(), args)?.into());
@@ -235,11 +234,11 @@ fn make_packed_function(func: Function) -> Result<Function> {
     let target_host: Target = target_host.try_cast()?;
 
     let int32: Type = scalar(INT, 32)?.into();
-    let self_handle = new_var("self_handle", void_ptr()?)?;
-    let packed_args = new_var("args", void_ptr()?)?;
-    let num_packed_args = new_var("num_args", int32.clone())?;
-    let result = new_var("result", void_ptr()?)?;
-    let device_id = new_var("dev_id", int32.clone())?;
+    let self_handle = Var::new("self_handle", PtrType::void()?)?;
+    let packed_args = Var::new("args", PtrType::void()?)?;
+    let num_packed_args = Var::new("num_args", int32.clone())?;
+    let result = Var::new("result", PtrType::void()?)?;
+    let device_id = Var::new("dev_id", int32.clone())?;
     let device_type: Expr = int_imm(scalar(INT, 32)?.dtype, target_device_type as i128)?.into();
 
     let mut binder = AbiBinder::new(
@@ -280,7 +279,7 @@ fn make_packed_function(func: Function) -> Result<Function> {
     )?
     .into();
     if need_set_device && target_device_type != DL_CPU {
-        let status = new_var("set_device_status", int32.clone())?;
+        let status = Var::new("set_device_status", int32.clone())?;
         let set_device_args = vec![
             StringImm::new("TVMBackendSetDevice")?.into(),
             device_type.clone(),
@@ -294,7 +293,7 @@ fn make_packed_function(func: Function) -> Result<Function> {
         body = SeqStmt::new(vec![set_device, check_status, body])?.into();
     }
     // An error code of zero on success.
-    body = SeqStmt::new(vec![body, Return::new(unknown_loc()?, i32_imm(0)?).into()])?.into();
+    body = SeqStmt::new(vec![body, Return::new(0)?.into()])?.into();
     binding.decl_tensors.push(body);
     body = SeqStmt::new(binding.decl_tensors)?.into();
     if !binding.asserts.is_empty() {

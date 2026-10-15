@@ -30,11 +30,10 @@ use tvm_ffi::{
 
 use super::analyzer::{AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::flattened_tensor::{
-    as_tensor_var, elem_offset, flattened_tensor, structural_equal, tensor_data, tensor_type,
-    tensor_var,
+    as_tensor_var, elem_offset, flattened_tensor, structural_equal, tensor_type,
 };
 use super::util::{function_pass, get_attr, int_imm, prim_dtype, MutatorExt};
-use crate::ir::{Bind, Call, CallObj, Expr, Op, SeqStmt, Stmt, TensorLoad, TensorStore, Type, Var};
+use crate::ir::{Bind, Call, CallObj, Expr, Op, SeqStmt, Stmt, TensorLoad, TensorStore, Var};
 use crate::ops::{int32, unknown_loc, Ex, PrimOps};
 use crate::sym::Analyzer;
 use crate::tirx::{Axis, ComposeLayout, Layout, TensorType, TileLayout};
@@ -102,7 +101,7 @@ impl LayoutApplier {
                     if let Some(mapped) = self.remap.get(&ObjectIdentity::of(&root)) {
                         root = mapped.clone();
                     }
-                    return Ok(tensor_data(&root)?.into());
+                    return Ok(root.tensor_data()?.into());
                 }
             }
         }
@@ -113,7 +112,7 @@ impl LayoutApplier {
         let var = op.var.clone();
         // `Bind(t, source)` of a tensor declares `t` over the source's data.
         if let Some((source, _)) = as_tensor_var(&op.value) {
-            let declaration = self.declaration(&var, tensor_data(&source)?)?;
+            let declaration = self.declaration(&var, source.tensor_data()?)?;
             let binding = Bind::new_full(var, declaration.clone(), op.loc.clone())?;
             let result = self.mutate_decl_tensor(&binding, &declaration, m)?;
             return Ok(result.unwrap_or(binding).into());
@@ -131,7 +130,7 @@ impl LayoutApplier {
                 // projections work for views and parameters too.
                 let ty = tensor_type(&var)?;
                 let pointer = Call::new(
-                    data_ptr_type(&ty)?,
+                    ty.data_ptr_type()?,
                     self.reinterpret.clone(),
                     vec![call.args.get(0)?],
                 )?;
@@ -151,7 +150,8 @@ impl LayoutApplier {
         let tensor: Var = op.dest.clone().try_cast()?;
         let indices = self.simplified_elem_offset(&tensor, &indices)?;
         let flattened = self.flattened(&mut Site::Body(m), &tensor, false)?;
-        Ok(TensorStore::new(op.loc.clone(), flattened.into(), indices, value).into())
+        Ok(TensorStore::from_complete_fields(op.loc.clone(), flattened.into(), indices, value)
+            .into())
     }
 
     fn mutate_load(&mut self, op: TensorLoad, m: &mut Mutator) -> Result<Any> {
@@ -161,13 +161,6 @@ impl LayoutApplier {
         let flattened = self.flattened(&mut Site::Body(m), &tensor, false)?;
         Ok(TensorLoad::new_full(flattened, indices.iter(), op.loc.clone())?.into())
     }
-}
-
-/// C++ `TensorTypeNode::DataPtrType()`: `PtrType(dtype, scope)`.
-fn data_ptr_type(ty: &TensorType) -> Result<Type> {
-    tvm_ffi::cached_global_func!("ir.PtrType")
-        .call_tuple((Type::from(ty.dtype.clone()), ty.scope.clone()))?
-        .try_into()
 }
 
 fn axis_is(predicate: &str, axis: &Axis) -> Result<bool> {
@@ -358,7 +351,7 @@ impl LayoutApplier {
             new_strides.push(self.mutate_expr(site, &stride)?);
         }
         let elem_offset = self.mutate_expr(site, &buf_ty.elem_offset)?;
-        let ty = TensorType::new(
+        let ty = TensorType::from_complete_fields(
             base_ty.loc.clone(),
             base_ty.dtype.clone(),
             base_ty.scope.clone(),
@@ -372,7 +365,7 @@ impl LayoutApplier {
         if structural_equal(&buf_ty, &ty)? {
             return Ok(buf.clone());
         }
-        let flattened = tensor_var(&flattened.name, ty, &flattened.loc)?;
+        let flattened = Var::new_full(flattened.name.clone(), ty, flattened.loc.clone())?;
         self.remap.insert(ObjectIdentity::of(buf), flattened.clone());
         Ok(flattened)
     }
@@ -429,7 +422,7 @@ fn flatten(body: SeqStmt, params: &Array<Var>) -> Result<(Stmt, Array<Var>)> {
         let flattened = applier.flattened(&mut Site::Params, &tensor, false)?;
         let mut source = tensor.clone();
         if ty.layout.is_some() {
-            let without_layout = TensorType::new(
+            let without_layout = TensorType::from_complete_fields(
                 ty.loc.clone(),
                 ty.dtype.clone(),
                 ty.scope.clone(),
@@ -440,7 +433,7 @@ fn flatten(body: SeqStmt, params: &Array<Var>) -> Result<(Stmt, Array<Var>)> {
                 ty.offset_factor,
                 None,
             );
-            source = tensor_var(&tensor.name, without_layout, &tensor.loc)?;
+            source = Var::new_full(tensor.name.clone(), without_layout, tensor.loc.clone())?;
         }
         if !flattened.same_as(&source) {
             aliased.push((flattened, source.clone()));
@@ -449,7 +442,7 @@ fn flatten(body: SeqStmt, params: &Array<Var>) -> Result<(Stmt, Array<Var>)> {
     }
     let mut stmt: Stmt = structural_mutate(body, &mut applier)?.try_into()?;
     for (buf, source) in aliased {
-        let declaration = applier.declaration(&buf, tensor_data(&source)?)?;
+        let declaration = applier.declaration(&buf, source.tensor_data()?)?;
         stmt = SeqStmt::new(vec![Bind::new(buf, declaration)?.into(), stmt])?.into();
     }
     Ok((stmt, Array::new(new_params)))
