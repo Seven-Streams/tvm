@@ -159,6 +159,30 @@ impl<T: Into<Stmt>> IntoBody for T {
     }
 }
 
+/// A primitive type argument: a `PrimType`, or a `DLDataType` for the C++ overloads that take
+/// one (`cast(value, DLDataType)`).
+pub trait IntoPrimType {
+    fn into_prim_type(self) -> Result<PrimType>;
+}
+
+impl IntoPrimType for PrimType {
+    fn into_prim_type(self) -> Result<PrimType> {
+        Ok(self)
+    }
+}
+
+impl IntoPrimType for &PrimType {
+    fn into_prim_type(self) -> Result<PrimType> {
+        Ok(self.clone())
+    }
+}
+
+impl IntoPrimType for DLDataType {
+    fn into_prim_type(self) -> Result<PrimType> {
+        prim_type(self)
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Locations, constants and names
 

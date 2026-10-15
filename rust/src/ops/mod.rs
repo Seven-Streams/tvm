@@ -26,7 +26,8 @@
 //! an `f64` a float64 `FloatImm`. C++ has no `PrimExpr(bool)`, so there is no `bool` literal. As in
 //! C++, `/` and `%` are not defined: name the division (`truncdiv`, `floordiv`, `div`, ...).
 //! Comparisons and `&&` / `||` are [`PrimOps`] methods named after the C++ functions, because
-//! Rust's comparison traits return `bool`. Operators build an [`Ex`], which keeps the first error
+//! Rust's comparison traits return `bool`; so is `cast`, the folding C++ `cast()` (`Cast::new` is
+//! the raw node). Operators build an [`Ex`], which keeps the first error
 //! instead of panicking; `.expr()` turns it back into a `Result`:
 //!
 //! ```ignore

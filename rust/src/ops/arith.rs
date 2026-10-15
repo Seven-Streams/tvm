@@ -25,8 +25,13 @@ use std::ops::{
 
 use tvm_ffi::{BigInt, DLDataType, DLDataTypeCode, ObjectRefCore, Result};
 
-use super::build::{big_int_imm, float_imm, int_imm, make_const, prim_dtype, scalar_dtype, unknown_loc};
-use crate::ir::{Call, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, TensorLoad, Var};
+use super::build::{
+    big_int_imm, float_imm, int_imm, make_const, prim_dtype, scalar_dtype, unknown_loc,
+    IntoPrimType,
+};
+use crate::ir::{
+    Call, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, PrimType, TensorLoad, Var,
+};
 use crate::prim;
 
 // ---------------------------------------------------------------------------------------------
@@ -245,6 +250,11 @@ fn binary(lhs: Ex, rhs: impl Operand, op: BinaryOp) -> Ex {
 fn binary_literal(lhs: impl Operand, rhs: Ex, op: BinaryOp) -> Ex {
     let lhs = lhs.operand(&rhs);
     binary(lhs, rhs, op)
+}
+
+/// C++ `cast(value, t)`.
+fn op_cast(a: Expr, ty: PrimType, loc: Location) -> Result<Expr> {
+    tvm_ffi::cached_global_func!("prim._cast").call_tuple((a, ty, loc))?.try_into()
 }
 
 fn unary(value: Ex, op: UnaryOp) -> Ex {
@@ -471,6 +481,14 @@ pub trait PrimOps {
     /// C++ `~a`.
     fn bitwise_not(&self) -> Ex {
         unary(self.to_ex(), op_bitwise_not)
+    }
+    /// C++ `cast(a, t)`: `a` as type `t`. A value already of type `t` is itself, a constant is
+    /// folded to `t`, a scalar cast to a vector type is broadcast, and a broadcast or an integer
+    /// ramp is cast element by element; anything else is a `Cast` node, which
+    /// [`Cast::new`](crate::prim::Cast::new) builds in every case.
+    fn cast(&self, ty: impl IntoPrimType) -> Ex {
+        let ty = ty.into_prim_type();
+        self.to_ex().map(|a| op_cast(a, ty?, unknown_loc()?))
     }
 }
 

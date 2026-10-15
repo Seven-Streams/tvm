@@ -22,8 +22,8 @@
 
 use tvm::ir::{Expr, Location, PrimType, Var};
 use tvm::ops::{ex, float_imm, int_imm, let_, make_const, select, PrimOps};
-use tvm::prim::{Not, Sub};
-use tvm::tvm_ffi::{DLDataType, DLDataTypeExt, ObjectRefCore, String as FfiString};
+use tvm::prim::{Broadcast, BroadcastObj, Cast, CastObj, Not, RampObj, Sub};
+use tvm::tvm_ffi::{DLDataType, DLDataTypeExt, ObjectRefCore, String as FfiString, TYPE_ERROR};
 
 mod common;
 use common::{global, load_tvm_compiler, structural_equal};
@@ -36,14 +36,33 @@ fn loc() -> Location {
     tvm::ops::unknown_loc().unwrap()
 }
 
+fn prim(ty: &str) -> PrimType {
+    global("ir.PrimType").call_tuple((dtype(ty),)).unwrap().try_into().unwrap()
+}
+
 fn var(name: &str, ty: &str) -> Var {
-    let ty: PrimType = global("ir.PrimType").call_tuple((dtype(ty),)).unwrap().try_into().unwrap();
-    global("ir.Var").call_tuple((FfiString::from(name), ty, loc())).unwrap().try_into().unwrap()
+    global("ir.Var")
+        .call_tuple((FfiString::from(name), prim(ty), loc()))
+        .unwrap()
+        .try_into()
+        .unwrap()
 }
 
 /// The C++ operator's global applied to two expressions.
 fn native(op: &str, a: impl Into<Expr>, b: impl Into<Expr>) -> Expr {
     global(op).call_tuple((a.into(), b.into(), loc())).unwrap().try_into().unwrap()
+}
+
+/// C++ `cast(value, t)` through its global.
+fn native_cast(value: &Expr, ty: &str) -> Expr {
+    global("prim._cast").call_tuple((value.clone(), prim(ty), loc())).unwrap().try_into().unwrap()
+}
+
+/// `Ramp(base, stride, lanes)`.
+fn ramp(base: &Var, stride: i64, lanes: i64) -> Expr {
+    let (base, stride, lanes): (Expr, _, _) =
+        (base.clone().into(), imm("int32", stride), imm("int32", lanes));
+    global("prim.Ramp").call_tuple((base, stride, lanes, loc())).unwrap().try_into().unwrap()
 }
 
 fn imm(ty: &str, value: i64) -> Expr {
@@ -168,4 +187,54 @@ fn identity_is_kept_when_nothing_folds_away() {
     let x = var("x", "int32");
     // `x + 0` folds back to `x` itself, as in C++.
     assert!((&x + 0).expr().unwrap().same_as(&Expr::from(x)));
+}
+
+#[test]
+fn cast_folds_and_broadcasts_as_cpp() {
+    load_tvm_compiler();
+    let x = var("x", "int32");
+    let f = var("f", "float32");
+
+    // A value already of the type is itself.
+    assert!(x.cast(dtype("int32")).expr().unwrap().same_as(&x));
+
+    let cases: Vec<(Expr, &str)> = vec![
+        // A constant folds to the new type; anything else becomes a `Cast` node.
+        (imm("int32", 5), "int64"),
+        (fimm("float32", 2.5), "int32"),
+        (imm("int32", 1), "float16"),
+        (x.clone().into(), "int64"),
+        // A scalar cast to a vector type is broadcast, its element cast first if needed.
+        (x.clone().into(), "int32x4"),
+        (f.clone().into(), "int32x4"),
+        (imm("int32", 3), "int64x4"),
+        // A broadcast, and a ramp cast to an integer type, are cast element by element.
+        (Broadcast::new(&f, 4).unwrap().into(), "int32x4"),
+        (ramp(&x, 1, 4), "int64x4"),
+        (ramp(&x, 1, 4), "float32x4"),
+    ];
+    for (value, ty) in &cases {
+        assert!(same(value.cast(dtype(ty)), &native_cast(value, ty)), "{ty}");
+    }
+    assert!(same(imm("int32", 5).cast(dtype("int64")), &imm("int64", 5)));
+    let node = |value: &Expr, ty: &str| value.cast(dtype(ty)).expr().unwrap();
+    let broadcast = node(&f.clone().into(), "int32x4");
+    let element = &broadcast.as_node::<BroadcastObj>().unwrap().value;
+    assert!(element.as_node::<CastObj>().is_some());
+    assert!(node(&ramp(&x, 1, 4), "int64x4").as_node::<RampObj>().is_some());
+    assert!(node(&ramp(&x, 1, 4), "float32x4").as_node::<CastObj>().is_some());
+    let raw: Expr = Cast::new(&x, prim("int64")).unwrap().into();
+    assert!(same(x.cast(dtype("int64")), &raw));
+
+    // The type may be given as a `PrimType` too, and the cast chains with the operators.
+    assert!(same(x.cast(prim("int64")), &native_cast(&x.clone().into(), "int64")));
+    let sum = native("prim._OpAdd", native_cast(&x.clone().into(), "int64"), imm("int64", 1));
+    assert!(same(x.cast(dtype("int64")) + 1, &sum));
+
+    // A void value cannot be cast, with the C++ error.
+    let Err(error) = var("v", "void").cast(dtype("int32")).expr() else {
+        panic!("a void value was cast")
+    };
+    assert_eq!(error.kind(), TYPE_ERROR);
+    assert!(error.message().contains("void sentinel type"), "{}", error.message());
 }
