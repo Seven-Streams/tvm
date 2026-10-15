@@ -20,25 +20,24 @@
 //! `tirx.DecorateDeviceScope` (`src/tirx/transform/decorate_device_scope.cc`): wrap the body in a
 //! `tirx.device_scope` region.
 
-use tvm_ffi::{Any, Array, Map, Result, String};
+use tvm_ffi::{Array, Map, Result};
 
-use super::util::{function_pass, seq_stmt_from, unknown_loc};
-use crate::ir::{DictAttrs, Expr, Op, RegionStmt, Var};
+use super::util::{function_pass};
+use crate::ir::{DictAttrs, Op, RegionStmt, SeqStmt};
 use crate::transform::Pass;
 
 pub fn decorate_device_scope() -> Result<Pass> {
     let device_scope = Op::get("tirx.device_scope")?;
     function_pass("tirx.DecorateDeviceScope", 0, move |func, _module, _context| {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
+        let no_attrs = DictAttrs::new(Map::new());
         let region = RegionStmt::new(
             device_scope.clone(),
-            Array::<Expr>::new(vec![]),
-            Array::<Var>::new(vec![]),
-            DictAttrs::new(Map::<String, Any>::new()),
+            Array::new(vec![]),
+            Array::new(vec![]),
+            no_attrs,
             body,
-            Array::<Var>::new(vec![]),
-            unknown_loc()?,
         )?;
-        Ok(Some(func.with_body(Some(seq_stmt_from(region.into())?))))
+        Ok(Some(func.with_body(Some(SeqStmt::from_stmt(region.into())?))))
     })
 }

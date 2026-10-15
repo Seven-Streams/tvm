@@ -29,7 +29,7 @@ use tvm_ffi::{
 
 use super::convert_ssa::convert_ssa_stmt;
 use super::side_effect::{side_effect, READ_STATE};
-use super::util::{function_pass, seq_stmt_from, sequential, unknown_loc};
+use super::util::{function_pass, sequential};
 use crate::ir::{
     Call, Expr, For, If, IntImmObj, Op, PrimTypeObj, RegionStmt, SeqStmt, Stmt, TensorLoad, Type,
     Var,
@@ -95,8 +95,9 @@ impl IfHoister {
         for (condition, preserve_else) in
             std::mem::take(&mut self.loops[index].conditions).into_iter().rev()
         {
-            let else_case = if preserve_else { Some(seq_stmt_from(stmt.clone())?) } else { None };
-            stmt = If::new(unknown_loc()?, condition, seq_stmt_from(stmt)?, else_case).into();
+            let else_case =
+                if preserve_else { Some(SeqStmt::from_stmt(stmt.clone())?) } else { None };
+            stmt = If::new(condition, stmt, else_case)?.into();
         }
         Ok(stmt.into())
     }
@@ -292,7 +293,7 @@ pub fn insert_hoisted_if() -> Result<Pass> {
             likely: likely.clone(),
         };
         let body: Stmt = structural_mutate(body, &mut hoister)?.try_into()?;
-        let body = convert_ssa_stmt(seq_stmt_from(body)?)?;
+        let body = convert_ssa_stmt(SeqStmt::from_stmt(body)?)?;
         Ok(Some(func.with_body(Some(body))))
     })
 }

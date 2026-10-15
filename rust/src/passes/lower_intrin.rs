@@ -27,11 +27,11 @@ use tvm_ffi::{
 };
 
 use super::analyzer::{AnalyzerBase, AnalyzerScope, AnalyzerState};
-use super::util::{
-    function_pass, get_attr, int_imm, prim_dtype, prim_type, seq_stmt_from, unknown_loc, MutatorExt,
+use super::util::{function_pass, get_attr, int_imm, prim_dtype, MutatorExt};
+use crate::ir::{
+    Call, Expr, IntImmObj, Op, OpAttrMap, OpObj, PrimType, PrimTypeObj, SeqStmt, Stmt, Var,
 };
-use crate::ir::{Call, Expr, IntImmObj, Op, OpAttrMap, OpObj, PrimType, PrimTypeObj, Stmt, Type, Var};
-use crate::ops::{let_, select, Ex, PrimOps};
+use crate::ops::{let_, max_value, select, Ex, PrimOps};
 use crate::prim::{
     Add, Broadcast, BroadcastObj, Cast, CastObj, FloorDiv, FloorDivObj, FloorMod, FloorModObj, Max,
     Mul, MulObj, EQ, NE,
@@ -202,17 +202,17 @@ impl IntrinInjecter {
         let rhs = swap_broadcast_cast(&b)?;
         match (&self.rules.fma, prim_dtype(&op.clone().into())?.code == DL_FLOAT) {
             (Some(fma), true) => {
-                let call = call(&op.ty, &self.rules.fma_op, vec![lhs, rhs, c])?;
+                let call: Expr =
+                    Call::new(op.ty.clone(), self.rules.fma_op.clone(), vec![lhs, rhs, c])?.into();
                 let fused = fma.call_tuple((call,))?;
                 if fused.type_index() != 0 {
                     return m.mutate(self, &Expr::try_from(fused)?);
                 }
             }
             _ if !lhs.same_as(&a) || !rhs.same_as(&b) => {
-                let product: Expr =
-                    m.mutate_as(self, &Mul::new(lhs, rhs, unknown_loc()?)?.into())?;
+                let product: Expr = m.mutate_as(self, &Mul::new(lhs, rhs)?.into())?;
                 let c: Expr = m.mutate_as(self, &c)?;
-                return Ok(Add::new(product, c, unknown_loc()?)?.into());
+                return Ok(Add::new(product, c)?.into());
             }
             _ => {}
         }
@@ -229,11 +229,8 @@ impl IntrinInjecter {
         if bound.min_value >= 0 {
             return Ok(None);
         }
-        let dtype = DLDataType { lanes: 1, ..prim_dtype(a)? };
-        let max_value: Expr = tvm_ffi::cached_global_func!("prim.max_value")
-            .call_tuple((prim_type(dtype)?, unknown_loc()?))?
-            .try_into()?;
-        let Some(dtype_max) = int_value(&max_value) else { return Ok(None) };
+        let limit = max_value(DLDataType { lanes: 1, ..prim_dtype(a)? })?;
+        let Some(dtype_max) = int_value(&limit) else { return Ok(None) };
         let (b, min, max, dtype_max) =
             (b as i128, bound.min_value as i128, bound.max_value as i128, dtype_max as i128);
         if b - 1 > dtype_max + min {
@@ -269,8 +266,8 @@ impl IntrinInjecter {
                 return m.mutate_as(self, &floor);
             }
             // Neither sign known: correct the truncating quotient when the signs differ.
-            let rmod = prim_var("rmod", dtype)?;
-            let rdiv = prim_var("rdiv", dtype)?;
+            let rmod = Var::prim("rmod", dtype)?;
+            let rdiv = Var::prim("rdiv", dtype)?;
             let corrected = select(signs_agree(b, &rmod), &rdiv, &rdiv - 1);
             return let_(&rmod, a.truncmod(b), let_(&rdiv, a.truncdiv(b), corrected)).expr();
         }
@@ -308,7 +305,7 @@ impl IntrinInjecter {
                 let floor: Expr = m.mutate_as(self, &floor)?;
                 return (a - &floor * b).expr();
             }
-            let rmod = prim_var("rmod", dtype)?;
+            let rmod = Var::prim("rmod", dtype)?;
             return let_(&rmod, a.truncmod(b), select(signs_agree(b, &rmod), &rmod, &rmod + b))
                 .expr();
         }
@@ -359,29 +356,9 @@ fn swap_broadcast_cast(expr: &Expr) -> Result<Expr> {
     if !widens {
         return Ok(expr.clone());
     }
-    let broadcast = Broadcast::new(cast.value.clone(), bcast.lanes.clone(), unknown_loc()?)?;
+    let broadcast = Broadcast::new(&cast.value, &bcast.lanes)?;
     let ty: PrimType = bcast.ty.clone().try_cast()?;
-    Ok(Cast::new(broadcast.into(), ty, unknown_loc()?)?.into())
-}
-
-/// `Call(ty, op, args)`.
-fn call(ty: &Type, op: &Op, args: Vec<Expr>) -> Result<Expr> {
-    let call = Call::new(
-        Some(ty.clone()),
-        op.clone().into(),
-        tvm_ffi::Array::new(args),
-        None,
-        tvm_ffi::Array::new(vec![]),
-        unknown_loc()?,
-    )?;
-    Ok(call.into())
-}
-
-/// `PrimVar(name, dtype)`.
-fn prim_var(name: &str, dtype: DLDataType) -> Result<Var> {
-    tvm_ffi::cached_global_func!("ir.Var")
-        .call_tuple((String::from(name), prim_type(dtype)?, unknown_loc()?))?
-        .try_into()
+    Ok(Cast::new(Expr::from(broadcast), ty)?.into())
 }
 
 fn int_value(expr: &Expr) -> Option<i64> {
@@ -425,6 +402,6 @@ pub fn lower_intrin() -> Result<Pass> {
             support_bitwise_op: true,
         };
         let body: Stmt = tvm_ffi::structural_mutate(body, &mut injecter)?.try_into()?;
-        Ok(Some(func.with_body(Some(seq_stmt_from(body)?))))
+        Ok(Some(func.with_body(Some(SeqStmt::from_stmt(body)?))))
     })
 }

@@ -24,7 +24,7 @@ use tvm::runtime::{MemoryScope, MemoryScopeObj};
 use tvm::tvm_ffi::tvm_ffi_sys::{TVMFFIByteArray, TVMFFITypeKeyToIndex};
 use tvm::tvm_ffi::{
     Any, AnyView, Array, BigInt, DLDataType, DLDataTypeExt, FieldGetter, ObjectCore, ObjectRefCast,
-    Map, ObjectRefCore, String as FfiString, TypeIndex,
+    ObjectRefCore, String as FfiString, TypeIndex,
 };
 
 mod common;
@@ -105,7 +105,7 @@ fn hand_written_op_layout_matches_native() {
     load_tvm_compiler();
     let names: Array<FfiString> =
         global("ir.ListOpNames").call_packed(&[]).unwrap().try_into().unwrap();
-    assert!(names.len() > 0);
+    assert!(!names.is_empty());
 
     let (mut with_attrs, mut with_validator) = (0, 0);
     for name in names.iter() {
@@ -250,7 +250,7 @@ fn rust_allocated_nodes_equal_native_ones() {
         .unwrap()
         .try_into()
         .unwrap();
-    let rust_range = Range::new(int_imm(0).into(), expr.clone(), loc.clone());
+    let rust_range = Range::from_complete_fields(int_imm(0).into(), expr.clone(), loc.clone());
     assert!(structural_equal(&rust_range, &native_range));
 
     let native_stmt: Evaluate = global("ir.Evaluate")
@@ -350,22 +350,30 @@ fn custom_new_runs_the_native_constructor() {
     assert!(!UnknownLoc::from_complete_fields().same_as(&UnknownLoc::new().unwrap()));
 
     // `SeqStmt(seq)` flattens a nested sequence; the lossless allocation keeps it.
-    let eval = Evaluate::new(imm("int32", 1), loc.clone()).unwrap();
-    let inner = SeqStmt::new(Array::new(vec![eval.clone().into()]), None).unwrap();
-    let nested: Array<Stmt> = Array::new(vec![inner.clone().into(), eval.clone().into()]);
-    assert_eq!(SeqStmt::new(nested.clone(), None).unwrap().seq.len(), 2);
-    assert_eq!(SeqStmt::from_complete_fields(loc.clone(), nested).seq.len(), 2);
-    assert!(SeqStmt::from_complete_fields(loc.clone(), Array::new(vec![inner.into()]))
-        .seq
-        .get(0)
-        .unwrap()
-        .as_node::<SeqStmtObj>()
-        .is_some());
+    let eval = Evaluate::new(imm("int32", 1)).unwrap();
+    let inner = SeqStmt::new(vec![eval.clone().into()]).unwrap();
+    let nested: Vec<Stmt> = vec![inner.clone().into(), eval.clone().into()];
+    assert_eq!(SeqStmt::new(nested.clone()).unwrap().seq.len(), 2);
+    let kept = SeqStmt::from_complete_fields(loc.clone(), Array::new(vec![inner.clone().into()]));
+    assert!(kept.seq.get(0).unwrap().as_node::<SeqStmtObj>().is_some());
+    // The implicit `Stmt -> SeqStmt` conversion passes a sequence through and wraps anything else.
+    assert!(SeqStmt::from_stmt(inner.clone().into()).unwrap().same_as(&inner));
+    assert_eq!(SeqStmt::from_stmt(eval.clone().into()).unwrap().seq.len(), 1);
 
-    // `Call(None, op, args)` infers the result type.
+    // `Evaluate(0)`: an `i32` argument is `IntImm::Int32`, as C++ converts it.
+    let zero: Evaluate = global("ir.Evaluate")
+        .call_tuple((imm("int32", 0), loc.clone()))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(structural_equal(&Evaluate::new(0).unwrap(), &zero));
+
+    // `Call(ret_ty, op, args)` has no attrs or type arguments; `new_full` with no `ret_ty` infers it.
     let exp = Op::get("prim.exp").unwrap();
     let x = var("x", prim("float32"));
-    let call = Call::new(
+    let short = Call::new(prim("float32"), exp.clone(), vec![x.clone().into()]).unwrap();
+    assert!(short.attrs.is_none() && short.ty_args.is_empty());
+    let call = Call::new_full(
         None,
         exp.into(),
         Array::new(vec![x.into()]),
@@ -376,14 +384,31 @@ fn custom_new_runs_the_native_constructor() {
     .unwrap();
     assert!(structural_equal(&call.ty, &prim("float32")));
 
-    // `For(...)` promotes an int32 literal bound to an int64 loop variable's dtype.
+    // `For(...)` promotes an int32 literal bound to an int64 loop variable's dtype; a statement body
+    // is converted to a sequence.
     let i = var("i", prim("int64"));
-    let body = SeqStmt::new(Array::new(vec![eval.into()]), None).unwrap();
-    let for_ =
-        For::new(i, imm("int32", 0), imm("int64", 4), 0, body, Map::new(), None, loc.clone())
-            .unwrap();
+    let for_ = For::new(i, 0, imm("int64", 4), 0, eval.clone()).unwrap();
     assert!(structural_equal(&for_.min.ty, &prim("int64")));
+    assert_eq!(for_.body.seq.len(), 1);
+
+    // `If(c, then)` takes any statement as an arm.
+    let p = var("p", prim("bool"));
+    let branch = If::new(&p, eval.clone(), None).unwrap();
+    assert!(branch.else_case.is_none() && branch.then_case.seq.len() == 1);
+
+    // `Range(begin, end)` stores `end - begin`; `Range::FromMinExtent` stores the extent.
+    let range = Range::new(2, 10).unwrap();
+    assert!(structural_equal(&range.extent, &imm("int32", 8)));
+    let range = Range::from_min_extent(2, 10).unwrap();
+    assert!(structural_equal(&range.extent, &imm("int32", 10)));
+
+    // `PrimVar(name, dtype)`, `StringImm(value)`, `FuncType(args, ret)`.
+    let v = Var::prim("v", dtype("int64")).unwrap();
+    assert!(structural_equal(&v.ty, &prim("int64")));
+    assert_eq!(StringImm::new("s").unwrap().value.as_str(), "s");
+    let ty = FuncType::new(vec![prim("int32")], prim("float32")).unwrap();
+    assert_eq!(ty.arg_types.len(), 1);
 
     // `Bind(var, value)` rejects a value of another type.
-    assert!(Bind::new(var("y", prim("int64")), imm("int32", 1), loc.clone()).is_err());
+    assert!(Bind::new(var("y", prim("int64")), imm("int32", 1)).is_err());
 }

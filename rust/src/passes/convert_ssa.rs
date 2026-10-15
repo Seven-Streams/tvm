@@ -31,7 +31,7 @@ use tvm_ffi::{
     ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, WalkOrder, WalkResult,
 };
 
-use super::util::{module_pass, unknown_loc, MutatorExt};
+use super::util::{module_pass, MutatorExt};
 use crate::SameField;
 use crate::ir::{
     Bind, BaseFunc, Expr, For, FuncType, GlobalVar, If, IRModule, RegionStmt, SeqStmt, Type, Var,
@@ -99,7 +99,7 @@ impl ConvertSsa {
         {
             return Ok(op);
         }
-        Ok(If::new(unknown_loc()?, condition, then_case, else_case))
+        If::new(condition, then_case, else_case)
     }
 
     /// Body parameters are defined for the body; results after the region.
@@ -204,11 +204,8 @@ impl ConvertSsa {
                 return Ok(func);
             }
             let params = Array::new(params);
-            let ty = FuncType::new(
-                unknown_loc()?,
-                params.iter().map(|param| param.ty.clone()).collect::<Array<Type>>(),
-                func.ret_type.clone(),
-            );
+            let ty =
+                FuncType::new(params.iter().map(|param| param.ty.clone()), func.ret_type.clone())?;
             // C++ `CopyOnWrite()` then `ty = func_type_annotation()`, not the constructor.
             Ok(Function::from_complete_fields(
                 func.loc.clone(),

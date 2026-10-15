@@ -113,7 +113,7 @@ fn unary_operators_follow_neg_and_logical_not() {
     assert!(same(-ex(imm("int64", i64::MIN)), &imm("int64", i64::MIN)));
     assert!(same(-ex(fimm("float32", 0.0)), &fimm("float32", -0.0)));
     // `!p` is the raw `Not`; a constant folds.
-    let not_p = Not::new(p.clone().into(), loc()).unwrap();
+    let not_p = Not::new(&p).unwrap();
     assert!(same(!&p, &not_p.into()));
     assert!(same(!ex(imm("bool", 1)), &imm("bool", 0)));
 }
@@ -137,7 +137,7 @@ fn raw_constructors_and_free_functions() {
         global("prim.Let").call_tuple((r, modulo, select, loc())).unwrap().try_into().unwrap();
     assert!(structural_equal(&built, &expected));
     // The raw `Sub` does not fold; the operator does.
-    let raw = Sub::new(imm("int32", 3), imm("int32", 1), loc()).unwrap();
+    let raw = Sub::new(3, 1).unwrap();
     assert!(!structural_equal(&Expr::from(raw), &imm("int32", 2)));
     assert!(same(ex(imm("int32", 3)) - 1, &imm("int32", 2)));
 }

@@ -17,121 +17,16 @@
  * under the License.
  */
 
-//! Expression arithmetic with the semantics of the C++ `PrimExpr` operators
-//! (`include/tvm/ir/prim/op.h`).
-//!
-//! `a + b` calls the global behind C++ `a + b` (`prim._OpAdd`), so operand type matching and
-//! constant folding are the native ones. A literal on either side is typed the way C++ types it:
-//! an integer becomes `MakeConst(other.ty(), v)`, an `f32` a float32 `FloatImm`, an `f64` a
-//! float64 `FloatImm`, a `bool` a bool `IntImm`. As in C++, `/` and `%` are not defined: name the
-//! division (`truncdiv`, `floordiv`, `div`, ...). Comparisons and `&&` / `||` are [`PrimOps`]
-//! methods named after the C++ functions, because Rust's comparison traits return `bool`.
-//!
-//! Operators build an [`Ex`], which keeps the first error instead of panicking; `.expr()` turns
-//! it back into a `Result`:
-//!
-//! ```ignore
-//! select(rmod.greater_equal(0), &rdiv, &rdiv - 1).expr()?
-//! ```
-//!
-//! The raw constructors (C++ `Add(a, b)`: type checks, no folding) are `prim::Add::new` and so on.
+//! The operators: `Ex`, literals, the native operations and `PrimOps`.
 
-use std::cell::OnceCell;
 use std::ops::{
     Add, AddAssign, BitAnd, BitOr, BitXor, Mul, MulAssign, Neg, Not, Shl, Shr, Sub, SubAssign,
 };
 
 use tvm_ffi::{BigInt, DLDataType, DLDataTypeCode, ObjectRefCore, Result};
 
-use crate::ir::{
-    Call, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, PrimType, PrimTypeObj,
-    UnknownLoc, Var,
-};
-
-// ---------------------------------------------------------------------------------------------
-// Constants and types
-
-thread_local! {
-    static UNKNOWN_LOC: OnceCell<Location> = const { OnceCell::new() };
-}
-
-/// The process-wide `UnknownLoc()` singleton, as a `Location`, fetched once per thread.
-pub fn unknown_loc() -> Result<Location> {
-    UNKNOWN_LOC.with(|cell| {
-        if let Some(loc) = cell.get() {
-            return Ok(loc.clone());
-        }
-        let loc: Location = UnknownLoc::new()?.into();
-        let _ = cell.set(loc.clone());
-        Ok(loc)
-    })
-}
-
-pub fn int32_dtype() -> DLDataType {
-    DLDataType { code: DLDataTypeCode::kDLInt as u8, bits: 32, lanes: 1 }
-}
-
-fn scalar_dtype(code: DLDataTypeCode, bits: u8) -> DLDataType {
-    DLDataType { code: code as u8, bits, lanes: 1 }
-}
-
-/// `PrimType(dtype)` through the native constructor.
-pub fn prim_type(dtype: DLDataType) -> Result<PrimType> {
-    tvm_ffi::cached_global_func!("ir.PrimType").call_tuple((dtype,))?.try_into()
-}
-
-/// The dtype of a PrimExpr (`expr.ty()`); an error for any other expression.
-pub fn prim_dtype(expr: &Expr) -> Result<DLDataType> {
-    match expr.ty.as_node::<PrimTypeObj>() {
-        Some(ty) => Ok(ty.dtype),
-        None => Err(tvm_ffi::Error::new(tvm_ffi::TYPE_ERROR, "expected a PrimType expression", "")),
-    }
-}
-
-/// `IntImm::Int32(value)`, the C++ meaning of a bare integer argument such as `Evaluate(0)`.
-pub fn int32(value: i64) -> Result<IntImm> {
-    int_imm(int32_dtype(), value as i128)
-}
-
-/// `IntImm(dtype, value)` through the native constructor.
-pub fn int_imm(dtype: DLDataType, value: i128) -> Result<IntImm> {
-    big_int_imm(dtype, BigInt::from(value))
-}
-
-fn big_int_imm(dtype: DLDataType, value: BigInt) -> Result<IntImm> {
-    tvm_ffi::cached_global_func!("ir.IntImm").call_tuple((dtype, value, unknown_loc()?))?.try_into()
-}
-
-/// `FloatImm(dtype, value)` through the native constructor.
-pub fn float_imm(dtype: DLDataType, value: f64) -> Result<FloatImm> {
-    tvm_ffi::cached_global_func!("ir.FloatImm")
-        .call_tuple((dtype, value, unknown_loc()?))?
-        .try_into()
-}
-
-/// `prim::MakeConst(dtype, value)`, which has no global: an `IntImm` or `FloatImm` by type code,
-/// broadcast for a fixed-length vector type. An integer literal next to an expression is typed so.
-pub fn make_const(dtype: DLDataType, value: i64) -> Result<Expr> {
-    let scalar = DLDataType { lanes: 1, ..dtype };
-    let element: Expr = match dtype.code {
-        // kDLInt, kDLUInt, kDLBool
-        0 | 1 | 6 => int_imm(scalar, value as i128)?.into(),
-        // kDLFloat, kDLBfloat, and the float8/6/4 codes
-        2 | 4 | 7..=17 => float_imm(scalar, value as f64)?.into(),
-        _ => {
-            return Err(tvm_ffi::Error::new(
-                tvm_ffi::INTERNAL_ERROR,
-                "cannot make const for this type",
-                "",
-            ))
-        }
-    };
-    if dtype.lanes == 1 {
-        return Ok(element);
-    }
-    let lanes: Expr = int32(dtype.lanes as i64)?.into();
-    Ok(crate::prim::Broadcast::new(element, lanes, unknown_loc()?)?.into())
-}
+use super::build::{big_int_imm, float_imm, int_imm, make_const, prim_dtype, scalar_dtype, unknown_loc};
+use crate::ir::{Call, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, Var};
 
 // ---------------------------------------------------------------------------------------------
 // `Ex`
@@ -236,13 +131,6 @@ impl Operand for f32 {
 impl Operand for f64 {
     fn operand(self, _peer: &Ex) -> Ex {
         float_imm(scalar_dtype(DLDataTypeCode::kDLFloat, 64), self).into()
-    }
-}
-
-/// C++ `bool`: a bool `IntImm`.
-impl Operand for bool {
-    fn operand(self, _peer: &Ex) -> Ex {
-        int_imm(scalar_dtype(DLDataTypeCode::kDLBool, 8), self as i128).into()
     }
 }
 
@@ -367,7 +255,7 @@ fn wrap_signed(value: BigInt, bits: u8) -> Result<BigInt> {
 fn logical_not(a: Expr) -> Result<Expr> {
     match a.as_node::<IntImmObj>() {
         Some(imm) => Ok(int_imm(prim_dtype(&a)?, imm.value.is_zero() as i128)?.into()),
-        None => Ok(crate::prim::Not::new(a, unknown_loc()?)?.into()),
+        None => Ok(crate::prim::Not::new(a)?.into()),
     }
 }
 
@@ -587,9 +475,7 @@ pub fn if_then_else(condition: impl Into<Ex>, t: impl Into<Ex>, f: impl Into<Ex>
 pub fn select(condition: impl Into<Ex>, t: impl Into<Ex>, f: impl Into<Ex>) -> Ex {
     let (c, t, f) = (condition.into(), t.into(), f.into());
     match (c.0, t.0, f.0) {
-        (Ok(c), Ok(t), Ok(f)) => {
-            Ex(unknown_loc().and_then(|loc| Ok(crate::prim::Select::new(c, t, f, loc)?.into())))
-        }
+        (Ok(c), Ok(t), Ok(f)) => Ex(crate::prim::Select::new(c, t, f).map(Into::into)),
         (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Ex(Err(error)),
     }
 }
@@ -597,8 +483,9 @@ pub fn select(condition: impl Into<Ex>, t: impl Into<Ex>, f: impl Into<Ex>) -> E
 /// The raw `Let(var, value, body)` (C++ `prim::Let`), from operands under construction.
 pub fn let_(var: &Var, value: impl Into<Ex>, body: impl Into<Ex>) -> Ex {
     match (value.into().0, body.into().0) {
-        (Ok(value), Ok(body)) => Ex(unknown_loc()
-            .and_then(|loc| Ok(crate::prim::Let::new(var.clone(), value, body, loc)?.into()))),
+        (Ok(value), Ok(body)) => {
+            Ex(crate::prim::Let::new(var.clone(), value, body).map(Into::into))
+        }
         (Err(error), _) | (_, Err(error)) => Ex(Err(error)),
     }
 }

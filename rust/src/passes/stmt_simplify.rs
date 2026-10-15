@@ -30,9 +30,7 @@ use tvm_ffi::{
 
 use super::analyzer::{bind_range, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::side_effect::{side_effect, PURE};
-use super::util::{
-    function_pass, int32, make_const, prim_dtype, seq_stmt_from, unknown_loc, MutatorExt,
-};
+use super::util::{function_pass, make_const, prim_dtype, MutatorExt};
 use crate::ir::{
     Bind, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, Op, PrimTypeObj, SeqStmt, Stmt,
     StringImm, TensorLoadObj, TensorStore, Var, VarObj,
@@ -117,7 +115,7 @@ impl StmtSimplifier {
         match (self.prove(&op.condition)?, &op.else_case) {
             (Some(true), _) => m.mutate(self, &op.then_case),
             (Some(false), Some(else_case)) => m.mutate(self, else_case),
-            (Some(false), None) => Ok(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into()),
+            (Some(false), None) => Ok(Evaluate::new(0)?.into()),
             (None, _) => m.default_mutate(self, &op),
         }
     }
@@ -126,7 +124,7 @@ impl StmtSimplifier {
     fn mutate_store(&mut self, op: TensorStore, m: &mut Mutator) -> Result<Any> {
         let store: TensorStore = m.default_mutate_as(self, &op)?;
         if stores_loaded_value(&store)? {
-            return Ok(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into());
+            return Ok(Evaluate::new(0)?.into());
         }
         Ok(store.into())
     }
@@ -279,7 +277,7 @@ impl StringInliner {
             return Ok(UnchangedOr::unchanged());
         };
         self.strings.insert(ObjectIdentity::of(&bind.var), value);
-        Ok(UnchangedOr::changed(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into()))
+        Ok(UnchangedOr::changed(Evaluate::new(0)?.into()))
     }
 
     fn map_var(&mut self, var: Var) -> UnchangedOr<Any> {
@@ -306,6 +304,6 @@ pub fn stmt_simplify() -> Result<Pass> {
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };
         let body = inline_string_bindings(body)?;
         let body: Stmt = tvm_ffi::structural_mutate(body, &mut simplifier)?.try_into()?;
-        Ok(Some(func.with_body(Some(seq_stmt_from(body)?))))
+        Ok(Some(func.with_body(Some(SeqStmt::from_stmt(body)?))))
     })
 }

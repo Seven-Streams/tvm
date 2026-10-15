@@ -33,7 +33,7 @@ use tvm_ffi::{
 };
 
 use super::side_effect::{side_effect, PURE};
-use super::util::{int32_dtype, int_imm, prim_dtype, prim_type, unknown_loc, ContextExt};
+use super::util::{int32_dtype, int_imm, prim_dtype, prim_type, ContextExt};
 use crate::ir::{
     AssertStmt, Bind, Call, Evaluate, Expr, For, If, Op, PrimType, Range, RegionStmt, SeqStmt,
     StringImm, Var,
@@ -164,7 +164,7 @@ fn descend<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, value: Any) -> Resu
 /// The loop variable ranges over the loop for all of it; the body may also assume the loop runs.
 fn descend_for<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: For) -> Result<For> {
     ctx.scoped(|ctx| {
-        let range = Range::new(op.min.clone(), op.extent.clone(), unknown_loc()?);
+        let range = Range::from_min_extent(&op.min, &op.extent)?;
         ctx.base().analyzer.bind_range(&op.loop_var, &range)?;
         let min = ctx.mutate_as(&op.min)?;
         let extent = ctx.mutate_as(&op.extent)?;
@@ -211,10 +211,8 @@ fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Resul
         })?;
         let else_case: Option<SeqStmt> = match &op.else_case {
             Some(else_case) => {
-                let negated = ctx
-                    .base()
-                    .analyzer
-                    .rewrite_simplify(&Not::new(real_condition.clone(), unknown_loc()?)?.into())?;
+                let negated =
+                    ctx.base().analyzer.rewrite_simplify(&Not::new(&real_condition)?.into())?;
                 Some(ctx.scoped(|ctx| {
                     if pure {
                         ctx.base().assume(&negated)?;
@@ -230,7 +228,7 @@ fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Resul
         if is_const_int(&real_condition, 0) {
             return Ok(match else_case {
                 Some(else_case) => else_case.into(),
-                None => Evaluate::new(int_imm(int32_dtype(), 0)?.into(), unknown_loc()?)?.into(),
+                None => Evaluate::new(0)?.into(),
             });
         }
         Ok(op
@@ -251,7 +249,7 @@ fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionSt
             let var = op.body_params.get(0)?;
             let extent = op.args.get(1)?;
             let zero: Expr = int_imm(prim_dtype(&extent)?, 0)?.into();
-            ctx.base().analyzer.bind_range(&var, &Range::new(zero, extent, unknown_loc()?))?;
+            ctx.base().analyzer.bind_range(&var, &Range::from_min_extent(zero, extent)?)?;
         }
         if let Some(fields) = op.attrs.dict.get(&String::from("cuda.launch_fields"))? {
             let fields: tvm_ffi::Array<String> = fields.try_into()?;
@@ -272,19 +270,8 @@ fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionSt
 
 /// `Call(int32, Op::Get(intrinsic), {StringImm(axis)})`.
 fn launch_index(intrinsic: &str, axis: &str) -> Result<Expr> {
-    let axis: StringImm = tvm_ffi::cached_global_func!("ir.StringImm")
-        .call_tuple((String::from(axis), unknown_loc()?))?
-        .try_into()?;
-    let args: tvm_ffi::Array<Expr> = tvm_ffi::Array::new(vec![axis.into()]);
-    let call = Call::new(
-        Some(prim_type(int32_dtype())?.into()),
-        Op::get(intrinsic)?.into(),
-        args,
-        None,
-        tvm_ffi::Array::new(vec![]),
-        unknown_loc()?,
-    )?;
-    Ok(call.into())
+    let axis: Expr = StringImm::new(axis)?.into();
+    Ok(Call::new(prim_type(int32_dtype())?, Op::get(intrinsic)?, vec![axis])?.into())
 }
 
 /// A pure asserted condition holds for the rest of the scope.
@@ -307,7 +294,7 @@ fn descend_if_then_else<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Ca
         ctx.base().assume_facts(&cond_new)?;
         ctx.mutate_as(&true_value)
     })?;
-    let not_cond: Expr = Not::new(cond_new.clone(), unknown_loc()?)?.into();
+    let not_cond: Expr = Not::new(&cond_new)?.into();
     let false_new: Expr = ctx.scoped(|ctx| {
         ctx.base().assume(&not_cond)?;
         ctx.mutate_as(&false_value)
@@ -321,7 +308,7 @@ fn descend_if_then_else<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Ca
     if cond_new.same_as(&cond) && true_new.same_as(&true_value) && false_new.same_as(&false_value) {
         return Ok(op.into());
     }
-    let call = Call::new(
+    let call = Call::new_full(
         Some(op.ty.clone()),
         op.op.clone(),
         tvm_ffi::Array::new(vec![cond_new, true_new, false_new]),
@@ -342,7 +329,7 @@ fn descend_let<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Let) -> Res
     if value.same_as(&op.value) && body.same_as(&op.body) {
         return Ok(op.into());
     }
-    Ok(Let::new(op.var.clone(), value, body, unknown_loc()?)?.into())
+    Ok(Let::new(op.var.clone(), value, body)?.into())
 }
 
 /// `select(c, t, f)`: `t` under `c`, `f` under `!c`; a constant `c` selects its value.
@@ -352,8 +339,7 @@ fn descend_select<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Select) 
         ctx.base().assume_facts(&cond)?;
         ctx.mutate_as(&op.true_value)
     })?;
-    let negated =
-        ctx.base().analyzer.rewrite_simplify(&Not::new(cond.clone(), unknown_loc()?)?.into())?;
+    let negated = ctx.base().analyzer.rewrite_simplify(&Not::new(&cond)?.into())?;
     let false_value: Expr = ctx.scoped(|ctx| {
         ctx.base().assume(&negated)?;
         ctx.mutate_as(&op.false_value)
@@ -370,7 +356,7 @@ fn descend_select<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Select) 
     {
         return Ok(op.into());
     }
-    Ok(Select::new(cond, true_value, false_value, unknown_loc()?)?.into())
+    Ok(Select::new(cond, true_value, false_value)?.into())
 }
 
 fn is_prim_expr(expr: &Expr) -> bool {
@@ -483,7 +469,7 @@ pub fn is_const_int(expr: &Expr, value: i64) -> bool {
 
 /// `analyzer->Bind(var, Range::FromMinExtent(min, extent))`.
 pub fn bind_range(analyzer: &Analyzer, var: &Var, min: &Expr, extent: &Expr) -> Result<()> {
-    analyzer.bind_range(var, &Range::new(min.clone(), extent.clone(), unknown_loc()?))
+    analyzer.bind_range(var, &Range::from_min_extent(min, extent)?)
 }
 
 #[allow(dead_code)]

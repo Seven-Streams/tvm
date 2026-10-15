@@ -28,7 +28,7 @@ use tvm_ffi::{
 };
 
 use super::convert_ssa::convert_ssa_stmt;
-use super::util::{function_pass, int32, int_imm, prim_type, seq_stmt_from, unknown_loc, MutatorExt};
+use super::util::{function_pass, int_imm, prim_type, MutatorExt};
 use crate::ir::{
     Evaluate, Expr, For, IntImm, IntImmObj, PrimTypeObj, PtrType, SeqStmt, Stmt, TensorLoad,
     TensorStore, Var,
@@ -130,7 +130,7 @@ impl LoopUnroller {
         if !changed {
             return Ok(op.into());
         }
-        Ok(SeqStmt::new(Array::new(seq), Some(op.loc.clone()))?.into())
+        Ok(SeqStmt::new_full(seq, op.loc.clone())?.into())
     }
 }
 
@@ -250,7 +250,7 @@ fn annotation(op: &For, key: &str) -> Result<Option<i64>> {
 /// The loop body repeated `extent` times, the loop variable replaced by each value in turn.
 fn unroll(op: &For, extent: i64) -> Result<Stmt> {
     if extent == 0 {
-        return Ok(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into());
+        return Ok(Evaluate::new(0)?.into());
     }
     let dtype =
         op.loop_var.ty.as_node::<PrimTypeObj>().expect("a loop variable is a PrimVar").dtype;
@@ -272,7 +272,7 @@ fn unroll(op: &For, extent: i64) -> Result<Stmt> {
         )?;
         unrolled.push(step.try_into()?);
     }
-    Ok(SeqStmt::new(Array::new(unrolled), None)?.into())
+    Ok(SeqStmt::new(unrolled)?.into())
 }
 
 /// `runtime::MemoryScope::Get(name)`. Rust has no lookup of a registered enum value by name, so
@@ -322,8 +322,11 @@ pub fn unroll_loop() -> Result<Pass> {
             warp: memory_scope("warp")?,
         };
         let result: Stmt = structural_mutate(body.clone(), &mut unroller)?.try_into()?;
-        let body =
-            if result.same_as(&body) { body } else { convert_ssa_stmt(seq_stmt_from(result)?)? };
+        let body = if result.same_as(&body) {
+            body
+        } else {
+            convert_ssa_stmt(SeqStmt::from_stmt(result)?)?
+        };
         Ok(Some(func.with_body(Some(body))))
     })
 }

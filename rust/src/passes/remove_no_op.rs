@@ -29,7 +29,8 @@ use tvm_ffi::{
 
 use super::analyzer::{is_const_int, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::side_effect::{side_effect, READ_STATE};
-use super::util::{function_pass, int32, seq_stmt_from, unknown_loc, MutatorExt};
+use super::util::{function_pass, MutatorExt};
+use crate::ir::TensorLoad;
 use crate::ops::PrimOps;
 use crate::ir::{
     CallObj, Evaluate, EvaluateObj, Expr, For, ForObj, If, IfObj, IntImmObj, IntSet, Op,
@@ -64,12 +65,12 @@ impl NoOpRemover {
         let else_is_no_op = op.else_case.as_ref().is_none_or(is_no_op);
         let rewritten = match (then_is_no_op, else_is_no_op, &op.else_case) {
             (true, true, _) => Some(evaluate(&op.condition)?),
-            (false, true, Some(_)) => Some(
-                If::new(unknown_loc()?, op.condition.clone(), op.then_case.clone(), None).into(),
-            ),
-            (true, false, Some(else_case)) => Some(
-                If::new(unknown_loc()?, (!&op.condition).expr()?, else_case.clone(), None).into(),
-            ),
+            (false, true, Some(_)) => {
+                Some(If::new(&op.condition, op.then_case.clone(), None)?.into())
+            }
+            (true, false, Some(else_case)) => {
+                Some(If::new(!&op.condition, else_case.clone(), None)?.into())
+            }
             _ => None,
         };
         Ok(rewritten.unwrap_or(stmt))
@@ -147,9 +148,7 @@ impl NoOpRemover {
 
     fn stores_existing_value(&self, store: &TensorStore) -> Result<bool> {
         let dest: Var = store.dest.clone().try_cast()?;
-        let load: Expr = tvm_ffi::cached_global_func!("ir.TensorLoad")
-            .call_tuple((dest.clone(), store.indices.clone(), unknown_loc()?))?
-            .try_into()?;
+        let load: Expr = TensorLoad::new(dest.clone(), store.indices.iter())?.into();
         let unchanged = (&store.value - &load).equal(0).expr()?;
         if is_const_int(&self.base.analyzer.simplify(&unchanged, 2)?, 1) {
             return Ok(true);
@@ -198,13 +197,13 @@ fn is_no_op<S: ObjectRefCore>(stmt: &S) -> bool {
 }
 
 fn evaluate_zero() -> Result<Stmt> {
-    Ok(Evaluate::new(int32(0)?.into(), unknown_loc()?)?.into())
+    Ok(Evaluate::new(0)?.into())
 }
 
 /// `MakeEvaluate(value)`: the evaluation if it has an effect, else a no-op.
 fn evaluate(value: &Expr) -> Result<Stmt> {
     if side_effect(value)? > READ_STATE {
-        return Ok(Evaluate::new(value.clone(), unknown_loc()?)?.into());
+        return Ok(Evaluate::new(value)?.into());
     }
     evaluate_zero()
 }
@@ -214,7 +213,7 @@ fn evaluate_effects(values: &[Expr]) -> Result<Stmt> {
     let mut effects = Vec::new();
     for value in values {
         if side_effect(value)? > READ_STATE {
-            effects.push(Evaluate::new(value.clone(), unknown_loc()?)?.into());
+            effects.push(Evaluate::new(value)?.into());
         }
     }
     Ok(seq_stmt(effects)?.into())
@@ -222,7 +221,7 @@ fn evaluate_effects(values: &[Expr]) -> Result<Stmt> {
 
 /// `SeqStmt(stmts)`, which flattens and drops no-ops.
 fn seq_stmt(stmts: Vec<Stmt>) -> Result<SeqStmt> {
-    SeqStmt::new(Array::new(stmts), None)
+    SeqStmt::new(stmts)
 }
 
 pub fn remove_no_op() -> Result<Pass> {
@@ -258,6 +257,6 @@ pub fn remove_no_op() -> Result<Pass> {
             profiler_ops,
         };
         let body: Stmt = tvm_ffi::structural_mutate(body, &mut remover)?.try_into()?;
-        Ok(Some(func.with_body(Some(seq_stmt_from(body)?))))
+        Ok(Some(func.with_body(Some(SeqStmt::from_stmt(body)?))))
     })
 }

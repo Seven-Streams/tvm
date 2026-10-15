@@ -84,7 +84,7 @@ fn fixture() -> Fixture {
         .unwrap();
     // A typed `Analyzer` handle goes through `call_tuple` like any other object.
     let analyzer: Analyzer = global("sym.Analyzer").call_tuple(()).unwrap().try_into().unwrap();
-    let range = Range::new(int32(0), int32(16), loc.clone());
+    let range = Range::from_complete_fields(int32(0), int32(16), loc.clone());
     global("sym.AnalyzerBind").call_tuple((analyzer.clone(), x.clone(), range)).unwrap();
     Fixture { loc, analyzer, x }
 }
@@ -176,7 +176,7 @@ fn iter_maps_decompose_into_marks_and_splits() {
         op("prim._OpFloorMod", &x_expr, &int32(4)),
     ]);
     let iters: Map<Var, Range> =
-        [(x.clone(), Range::new(int32(0), int32(16), loc))].into_iter().collect();
+        [(x.clone(), Range::from_complete_fields(int32(0), int32(16), loc))].into_iter().collect();
     let result: IterMapResult = global("sym.DetectIterMap")
         .call_tuple((indices, iters, int32(1), 0i32, false, analyzer))
         .unwrap()

@@ -26,8 +26,8 @@ pub mod transform;
 
 // Every object registered under `tirx` gets its block in this file; `skip` leaves one out.
 // tvm-ffi-stubgen(prefix): tirx
-// `Function`'s native constructor derives `ty` from the signature, so `new` is hand-written
-// below; the generated lossless allocation is `from_complete_fields`.
+// `Function`'s native constructor derives `ty` from the signature, so `new` is hand-written in
+// `ops/build.rs`; the generated lossless allocation is `from_complete_fields`.
 // tvm-ffi-stubgen(custom-new): tirx.Function
 
 // tvm-ffi-stubgen(begin): import-section
@@ -352,20 +352,6 @@ impl_with_fields!(Function, FunctionObj, new(loc, ty, attrs, params, ret_type, b
 });
 
 impl Function {
-    /// `Function(params, body, ret_type, attrs, loc)` (the `custom-new` constructor): derives `ty`
-    /// from the signature; a missing return type becomes void.
-    pub fn new(
-        params: Array<Var>,
-        body: Option<SeqStmt>,
-        ret_type: Type,
-        attrs: DictAttrs,
-        loc: Location,
-    ) -> tvm_ffi::Result<Self> {
-        tvm_ffi::cached_global_func!("tirx.Function")
-            .call_tuple((params, body, ret_type, attrs, loc))?
-            .try_into()
-    }
-
     /// A copy with `attrs` replaced (C++ `CopyOnWrite()->attrs = attrs`).
     pub fn with_attrs(&self, attrs: DictAttrs) -> Self {
         let obj = FunctionObj::new(

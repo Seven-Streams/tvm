@@ -24,7 +24,7 @@ use tvm_ffi::{
     ObjectRefCore, RValueRef, Result, String,
 };
 
-use crate::ir::{BaseFunc, DictAttrs, GlobalVar, IRModule, SeqStmt, Stmt};
+use crate::ir::{BaseFunc, DictAttrs, GlobalVar, IRModule};
 use crate::tirx::Function;
 use crate::transform::{Pass, PassContext, PassInfo};
 
@@ -136,14 +136,6 @@ impl<S> ContextExt for MutateContext<'_, S> {
     {
         self.mutate(value)?.try_into()
     }
-}
-
-/// The C++ implicit `Stmt -> SeqStmt` conversion: a SeqStmt passes through, anything else is
-/// wrapped (with flattening and no-op removal) by the native constructor.
-pub fn seq_stmt_from(stmt: Stmt) -> Result<SeqStmt> {
-    tvm_ffi::cached_global_func!("ir.SeqStmt")
-        .call_packed(&[AnyView::from(&stmt), AnyView::new()])?
-        .try_into()
 }
 
 /// `attrs.GetAttr<Any>(key)`.

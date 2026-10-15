@@ -23,7 +23,7 @@
 // Every object registered under `prim` gets its block in this file; `skip` leaves one out.
 // tvm-ffi-stubgen(prefix): prim
 // The raw constructors (C++ `Add(a, b)` etc.: type checks, no folding) that passes build
-// directly: `new` is hand-written at the end of this file and calls the native constructor; the
+// directly: `new` is hand-written in `ops/build.rs` and calls the native constructor; the
 // generated lossless allocation is `from_complete_fields`. The folding operators are in `ops`.
 // tvm-ffi-stubgen(custom-new): prim.Add
 // tvm-ffi-stubgen(custom-new): prim.Broadcast
@@ -1712,61 +1712,3 @@ impl Sub {
 
 tvm_ffi::impl_object_upcast!(Sub => Expr);
 // tvm-ffi-stubgen(end)
-
-// The `custom-new` raw constructors: each calls the native constructor, which checks operand
-// types and folds nothing. Arguments follow the C++ constructor.
-
-macro_rules! raw_binary_new {
-    ($($node:ident => $global:literal),+ $(,)?) => {
-        $(impl $node {
-            #[doc = concat!("`", stringify!($node), "(a, b, loc)`: the raw constructor.")]
-            pub fn new(a: Expr, b: Expr, loc: Location) -> tvm_ffi::Result<Self> {
-                tvm_ffi::cached_global_func!($global).call_tuple((a, b, loc))?.try_into()
-            }
-        })+
-    };
-}
-
-raw_binary_new!(Add => "prim.Add", Sub => "prim.Sub", Mul => "prim.Mul");
-
-impl Select {
-    /// `Select(condition, true_value, false_value, loc)`: the raw constructor.
-    pub fn new(
-        condition: Expr,
-        true_value: Expr,
-        false_value: Expr,
-        loc: Location,
-    ) -> tvm_ffi::Result<Self> {
-        tvm_ffi::cached_global_func!("prim.Select")
-            .call_tuple((condition, true_value, false_value, loc))?
-            .try_into()
-    }
-}
-
-impl Let {
-    /// `Let(var, value, body, loc)`: the raw constructor.
-    pub fn new(var: Var, value: Expr, body: Expr, loc: Location) -> tvm_ffi::Result<Self> {
-        tvm_ffi::cached_global_func!("prim.Let").call_tuple((var, value, body, loc))?.try_into()
-    }
-}
-
-impl Cast {
-    /// `Cast(value, ty, loc)`: the raw constructor.
-    pub fn new(value: Expr, ty: super::ir::PrimType, loc: Location) -> tvm_ffi::Result<Self> {
-        tvm_ffi::cached_global_func!("prim.Cast").call_tuple((value, ty, loc))?.try_into()
-    }
-}
-
-impl Broadcast {
-    /// `Broadcast(value, lanes, loc)`: the raw constructor.
-    pub fn new(value: Expr, lanes: Expr, loc: Location) -> tvm_ffi::Result<Self> {
-        tvm_ffi::cached_global_func!("prim.Broadcast").call_tuple((value, lanes, loc))?.try_into()
-    }
-}
-
-impl Not {
-    /// `Not(a, loc)`: the raw constructor.
-    pub fn new(a: Expr, loc: Location) -> tvm_ffi::Result<Self> {
-        tvm_ffi::cached_global_func!("prim.Not").call_tuple((a, loc))?.try_into()
-    }
-}

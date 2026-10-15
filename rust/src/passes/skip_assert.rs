@@ -22,7 +22,7 @@
 
 use tvm_ffi::{dispatch, structural_mutate, Result, Unchanged};
 
-use super::util::{function_pass, int32, unknown_loc};
+use super::util::{function_pass};
 use crate::ir::{AssertStmt, Evaluate, Expr, SeqStmt};
 use crate::transform::Pass;
 
@@ -31,7 +31,7 @@ struct AssertSkipper;
 #[dispatch(mutate)]
 impl AssertSkipper {
     fn mutate_assert(&mut self, _assert: AssertStmt) -> Result<Evaluate> {
-        Evaluate::new(int32(0)?.into(), unknown_loc()?)
+        Evaluate::new(0)
     }
 
     fn mutate_expr(&mut self, _expr: Expr) -> Unchanged {
