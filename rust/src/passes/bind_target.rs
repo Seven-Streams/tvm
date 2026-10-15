@@ -175,14 +175,16 @@ struct ModuleState {
 }
 
 impl ModuleState {
-    fn update(&mut self, gvar: &GlobalVar, func: BaseFunc) {
+    fn update(&mut self, gvar: &GlobalVar, func: impl Into<BaseFunc>) {
+        let func = func.into();
         match self.functions.iter_mut().find(|(key, _)| key.same_as(gvar)) {
             Some(entry) => entry.1 = func,
             None => self.add(gvar.clone(), func),
         }
     }
 
-    fn add(&mut self, gvar: GlobalVar, func: BaseFunc) {
+    fn add(&mut self, gvar: GlobalVar, func: impl Into<BaseFunc>) {
+        let func = func.into();
         if !self.global_var_map.iter().any(|(name, _)| name.as_str() == gvar.name_hint.as_str()) {
             self.global_var_map.push((gvar.name_hint.clone(), gvar.clone()));
         }
@@ -227,7 +229,6 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
     };
     let names = UniqueNames::new(state.functions.iter().map(|(gvar, _)| gvar.name_hint.clone()))?;
     let mut replacements: HashMap<ObjectIdentity, GlobalVar> = HashMap::new();
-    let target_any = Any::from(target.clone());
     for (gvar, func) in module.functions.iter() {
         let Ok(function) = func.clone().try_cast::<Function>() else { continue };
         let exposed = is_externally_exposed(&func)?;
@@ -236,20 +237,20 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
             if let Some(host) = host_of(target)? {
                 if host_of(&func_target)?.is_none() && exposed {
                     let bound = with_host(&func_target, Some(&host))?;
-                    state.update(&gvar, with_attr(&function, TARGET, Any::from(bound)).into());
+                    state.update(&gvar, with_attr(&function, TARGET, bound));
                 }
             }
             continue;
         }
         if has_nonzero_attr(&function.attrs, IS_HOST_FUNC)? {
             let host = with_host(&target_host, Some(&target_host))?;
-            let bound = with_attr(&function, TARGET, Any::from(host));
+            let bound = with_attr(&function, TARGET, host);
             let attrs = dict_without(&bound.attrs, IS_HOST_FUNC);
-            state.update(&gvar, bound.with_attrs(attrs).into());
+            state.update(&gvar, bound.with_attrs(attrs));
             continue;
         }
         if exposed {
-            state.update(&gvar, with_attr(&function, TARGET, target_any.clone()).into());
+            state.update(&gvar, with_attr(&function, TARGET, target.clone()));
             continue;
         }
         let id = ObjectIdentity::of(&gvar);
@@ -259,25 +260,18 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
             let host_func: Function = tvm_ffi::cached_global_func!("tirx.RenewDef")
                 .call_tuple((function.clone(),))?
                 .try_into()?;
-            state.update(
-                &gvar,
-                with_attr(&function, TARGET, Any::from(target_without_host.clone())).into(),
-            );
-            let host_func = with_attr(&host_func, TARGET, Any::from(target_host.clone()));
+            state.update(&gvar, with_attr(&function, TARGET, target_without_host.clone()));
+            let host_func = with_attr(&host_func, TARGET, target_host.clone());
             let name = names.fresh(&format!("{}_host", gvar.name_hint.as_str()))?;
             let host_gvar: GlobalVar =
                 tvm_ffi::cached_global_func!("ir.GlobalVar").call_tuple((name,))?.try_into()?;
-            state.add(host_gvar.clone(), host_func.into());
+            state.add(host_gvar.clone(), host_func);
             replacements.insert(id, host_gvar);
         } else if by_host {
-            state
-                .update(&gvar, with_attr(&function, TARGET, Any::from(target_host.clone())).into());
+            state.update(&gvar, with_attr(&function, TARGET, target_host.clone()));
         } else {
             // Called from device only, or not called at all: both bind the device target.
-            state.update(
-                &gvar,
-                with_attr(&function, TARGET, Any::from(target_without_host.clone())).into(),
-            );
+            state.update(&gvar, with_attr(&function, TARGET, target_without_host.clone()));
         }
     }
 
@@ -303,7 +297,7 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
                 _ => false,
             };
             let updated = if unchanged { function } else { function.with_body(body) };
-            state.update(&gvar, updated.into());
+            state.update(&gvar, updated);
         }
     }
 

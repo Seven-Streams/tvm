@@ -26,7 +26,8 @@ use std::ops::{
 use tvm_ffi::{BigInt, DLDataType, DLDataTypeCode, ObjectRefCore, Result};
 
 use super::build::{big_int_imm, float_imm, int_imm, make_const, prim_dtype, scalar_dtype, unknown_loc};
-use crate::ir::{Call, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, Var};
+use crate::ir::{Call, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, TensorLoad, Var};
+use crate::prim;
 
 // ---------------------------------------------------------------------------------------------
 // `Ex`
@@ -90,7 +91,40 @@ macro_rules! ex_from_expr_like {
     };
 }
 
-ex_from_expr_like!(Expr, Var, IntImm, FloatImm, Call);
+// Any expression node converts, as any C++ `PrimExpr` subclass does.
+ex_from_expr_like!(Expr, Var, IntImm, FloatImm, Call, TensorLoad);
+ex_from_expr_like!(
+    prim::Add,
+    prim::And,
+    prim::BitwiseAnd,
+    prim::BitwiseNot,
+    prim::BitwiseOr,
+    prim::BitwiseXor,
+    prim::Broadcast,
+    prim::Cast,
+    prim::Div,
+    prim::EQ,
+    prim::FloorDiv,
+    prim::FloorMod,
+    prim::GE,
+    prim::GT,
+    prim::LE,
+    prim::LShift,
+    prim::LT,
+    prim::Let,
+    prim::Max,
+    prim::Min,
+    prim::Mod,
+    prim::Mul,
+    prim::NE,
+    prim::Not,
+    prim::Or,
+    prim::RShift,
+    prim::Ramp,
+    prim::Select,
+    prim::Shuffle,
+    prim::Sub,
+);
 
 // ---------------------------------------------------------------------------------------------
 // Operands and literals

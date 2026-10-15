@@ -357,8 +357,8 @@ fn custom_new_runs_the_native_constructor() {
     let kept = SeqStmt::from_complete_fields(loc.clone(), Array::new(vec![inner.clone().into()]));
     assert!(kept.seq.get(0).unwrap().as_node::<SeqStmtObj>().is_some());
     // The implicit `Stmt -> SeqStmt` conversion passes a sequence through and wraps anything else.
-    assert!(SeqStmt::from_stmt(inner.clone().into()).unwrap().same_as(&inner));
-    assert_eq!(SeqStmt::from_stmt(eval.clone().into()).unwrap().seq.len(), 1);
+    assert!(SeqStmt::from_stmt(inner.clone()).unwrap().same_as(&inner));
+    assert_eq!(SeqStmt::from_stmt(eval.clone()).unwrap().seq.len(), 1);
 
     // `Evaluate(0)`: an `i32` argument is `IntImm::Int32`, as C++ converts it.
     let zero: Evaluate = global("ir.Evaluate")

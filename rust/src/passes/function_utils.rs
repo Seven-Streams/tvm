@@ -19,7 +19,7 @@
 
 //! `tirx.AnnotateEntryFunc` and `tirx.Filter` (`src/tirx/transform/function_utils.cc`).
 
-use tvm_ffi::{Any, Function as FfiFunction, ObjectRefCast, Result, String};
+use tvm_ffi::{Function as FfiFunction, ObjectRefCast, Result, String};
 
 use super::util::{
     function_pass, get_attr, has_nonzero_attr, module_pass, module_with_function, with_attr,
@@ -39,8 +39,8 @@ pub fn annotate_entry_func() -> Result<Pass> {
             let (gvar, base_func) = &entries[0];
             if !has_nonzero_attr(&base_func.attrs, IS_ENTRY_FUNC)? {
                 if let Ok(func) = base_func.clone().try_cast::<Function>() {
-                    let marked = with_attr(&func, IS_ENTRY_FUNC, Any::from(true));
-                    return Ok(module_with_function(&module, gvar, marked.into()));
+                    let marked = with_attr(&func, IS_ENTRY_FUNC, true);
+                    return Ok(module_with_function(&module, gvar, marked));
                 }
             }
             return Ok(module);
@@ -58,8 +58,8 @@ pub fn annotate_entry_func() -> Result<Pass> {
         }
         if external.len() == 1 && !external_non_functions {
             let (gvar, func) = &external[0];
-            let marked = with_attr(func, IS_ENTRY_FUNC, Any::from(true));
-            return Ok(module_with_function(&module, gvar, marked.into()));
+            let marked = with_attr(func, IS_ENTRY_FUNC, true);
+            return Ok(module_with_function(&module, gvar, marked));
         }
         Ok(module)
     })

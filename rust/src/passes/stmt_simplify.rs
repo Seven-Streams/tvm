@@ -148,7 +148,7 @@ impl StmtSimplifier {
         let substituted: Expr = structural_map(
             condition.clone(),
             |var: Var| match bindings.get(&ObjectIdentity::of(&var)) {
-                Some(value) => UnchangedOr::changed(Any::from(value.clone())),
+                Some(value) => UnchangedOr::changed(value.clone()),
                 None => UnchangedOr::unchanged(),
             },
             WalkOrder::PreOrder,

@@ -358,7 +358,7 @@ fn swap_broadcast_cast(expr: &Expr) -> Result<Expr> {
     }
     let broadcast = Broadcast::new(&cast.value, &bcast.lanes)?;
     let ty: PrimType = bcast.ty.clone().try_cast()?;
-    Ok(Cast::new(Expr::from(broadcast), ty)?.into())
+    Ok(Cast::new(broadcast, ty)?.into())
 }
 
 fn int_value(expr: &Expr) -> Option<i64> {

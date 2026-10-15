@@ -261,9 +261,9 @@ fn unroll(op: &For, extent: i64) -> Result<Stmt> {
         let loop_var = &op.loop_var;
         let step = structural_map(
             op.body.clone(),
-            |var: Var, kind: DefRegionKind| -> UnchangedOr<Any> {
+            |var: Var, kind: DefRegionKind| -> UnchangedOr<Expr> {
                 if kind == DefRegionKind::None && var.same_as(loop_var) {
-                    UnchangedOr::changed(Any::from(value.clone()))
+                    UnchangedOr::changed(value.clone())
                 } else {
                     UnchangedOr::unchanged()
                 }

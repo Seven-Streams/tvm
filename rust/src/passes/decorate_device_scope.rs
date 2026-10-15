@@ -22,7 +22,7 @@
 
 use tvm_ffi::{Array, Map, Result};
 
-use super::util::{function_pass};
+use super::util::function_pass;
 use crate::ir::{DictAttrs, Op, RegionStmt, SeqStmt};
 use crate::transform::Pass;
 
@@ -38,6 +38,6 @@ pub fn decorate_device_scope() -> Result<Pass> {
             no_attrs,
             body,
         )?;
-        Ok(Some(func.with_body(Some(SeqStmt::from_stmt(region.into())?))))
+        Ok(Some(func.with_body(Some(SeqStmt::from_stmt(region)?))))
     })
 }

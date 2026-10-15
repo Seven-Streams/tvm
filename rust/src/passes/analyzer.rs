@@ -248,7 +248,7 @@ fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionSt
         if op.op.same_as(&ctx.base().launch_thread) {
             let var = op.body_params.get(0)?;
             let extent = op.args.get(1)?;
-            let zero: Expr = int_imm(prim_dtype(&extent)?, 0)?.into();
+            let zero = int_imm(prim_dtype(&extent)?, 0)?;
             ctx.base().analyzer.bind_range(&var, &Range::from_min_extent(zero, extent)?)?;
         }
         if let Some(fields) = op.attrs.dict.get(&String::from("cuda.launch_fields"))? {
@@ -411,7 +411,7 @@ fn floordiv_facts(
     if ![lo, hi].iter().all(|v| (minimum..limit).contains(v)) {
         return Ok(());
     }
-    let (lo, hi): (Expr, Expr) = (int_imm(dtype, lo)?.into(), int_imm(dtype, hi)?.into());
+    let (lo, hi) = (int_imm(dtype, lo)?, int_imm(dtype, hi)?);
     let a = &div.a;
     match kind {
         Compare::Eq => {

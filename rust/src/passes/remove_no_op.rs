@@ -148,8 +148,8 @@ impl NoOpRemover {
 
     fn stores_existing_value(&self, store: &TensorStore) -> Result<bool> {
         let dest: Var = store.dest.clone().try_cast()?;
-        let load: Expr = TensorLoad::new(dest.clone(), store.indices.iter())?.into();
-        let unchanged = (&store.value - &load).equal(0).expr()?;
+        let load = TensorLoad::new(dest.clone(), store.indices.iter())?;
+        let unchanged = (&store.value - load).equal(0).expr()?;
         if is_const_int(&self.base.analyzer.simplify(&unchanged, 2)?, 1) {
             return Ok(true);
         }

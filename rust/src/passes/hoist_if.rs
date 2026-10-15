@@ -214,23 +214,19 @@ impl LiftWalker<'_> {
     }
 
     fn walk_div(&mut self, op: Div) -> WalkResult {
-        let divisor = op.b.clone();
-        self.division(op.into(), &divisor)
+        self.division(&op, &op.b)
     }
 
     fn walk_mod(&mut self, op: Mod) -> WalkResult {
-        let divisor = op.b.clone();
-        self.division(op.into(), &divisor)
+        self.division(&op, &op.b)
     }
 
     fn walk_floordiv(&mut self, op: FloorDiv) -> WalkResult {
-        let divisor = op.b.clone();
-        self.division(op.into(), &divisor)
+        self.division(&op, &op.b)
     }
 
     fn walk_floormod(&mut self, op: FloorMod) -> WalkResult {
-        let divisor = op.b.clone();
-        self.division(op.into(), &divisor)
+        self.division(&op, &op.b)
     }
 
     /// A float-to-integer cast cannot be hoisted.
@@ -238,7 +234,7 @@ impl LiftWalker<'_> {
         if is_integer(&op.ty) && !is_integer(&op.value.ty) {
             return WalkResult::Interrupt;
         }
-        self.advance(op.into())
+        self.advance(&op)
     }
 
     /// Only `likely` hints can be hoisted among calls.
@@ -246,18 +242,18 @@ impl LiftWalker<'_> {
         if !op.op.same_as(self.likely) {
             return WalkResult::Interrupt;
         }
-        self.advance(op.into())
+        self.advance(&op)
     }
 
     fn walk_expr(&mut self, expr: Expr) -> WalkResult {
-        self.advance(expr)
+        self.advance(&expr)
     }
 }
 
 impl LiftWalker<'_> {
     /// Each shared subexpression is walked once.
-    fn advance(&mut self, expr: Expr) -> WalkResult {
-        if self.visited.insert(ObjectIdentity::of(&expr)) {
+    fn advance(&mut self, expr: &impl ObjectRefCore) -> WalkResult {
+        if self.visited.insert(ObjectIdentity::of(expr)) {
             WalkResult::Advance
         } else {
             WalkResult::Skip
@@ -265,7 +261,7 @@ impl LiftWalker<'_> {
     }
 
     /// Division by anything but a positive constant may trap or depend on the loop.
-    fn division(&mut self, expr: Expr, divisor: &Expr) -> WalkResult {
+    fn division(&mut self, expr: &impl ObjectRefCore, divisor: &Expr) -> WalkResult {
         match divisor.as_node::<IntImmObj>() {
             Some(value) if value.value > tvm_ffi::BigInt::from(0i64) => self.advance(expr),
             _ => WalkResult::Interrupt,

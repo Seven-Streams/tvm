@@ -155,7 +155,7 @@ pub trait IntoBody {
 
 impl<T: Into<Stmt>> IntoBody for T {
     fn into_body(self) -> Result<SeqStmt> {
-        SeqStmt::from_stmt(self.into())
+        SeqStmt::from_stmt(self)
     }
 }
 
@@ -397,7 +397,8 @@ impl SeqStmt {
 
     /// The C++ implicit `Stmt -> SeqStmt` conversion (`SeqStmt(stmt)`): a `SeqStmt` passes
     /// through, any other statement is wrapped with its own location.
-    pub fn from_stmt(stmt: Stmt) -> Result<Self> {
+    pub fn from_stmt(stmt: impl Into<Stmt>) -> Result<Self> {
+        let stmt = stmt.into();
         if stmt.as_node::<SeqStmtObj>().is_some() {
             return stmt.try_cast();
         }

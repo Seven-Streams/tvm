@@ -77,8 +77,8 @@ pub fn native_pass(factory: &str) -> Result<Pass> {
 }
 
 /// `WithAttr(func, key, value)`.
-pub fn with_attr(func: &Function, key: &str, value: Any) -> Function {
-    func.with_attrs(dict_with(&func.attrs, key, value))
+pub fn with_attr(func: &Function, key: &str, value: impl Into<Any>) -> Function {
+    func.with_attrs(dict_with(&func.attrs, key, value.into()))
 }
 
 pub use crate::ops::{int32, int32_dtype, int_imm, make_const, prim_dtype, prim_type, unknown_loc};
@@ -170,7 +170,12 @@ pub fn dict_with(attrs: &DictAttrs, key: &str, value: Any) -> DictAttrs {
 }
 
 /// `mod->Update(gvar, func)`: the entry for `gvar` is replaced in place.
-pub fn module_with_function(module: &IRModule, gvar: &GlobalVar, func: BaseFunc) -> IRModule {
+pub fn module_with_function(
+    module: &IRModule,
+    gvar: &GlobalVar,
+    func: impl Into<BaseFunc>,
+) -> IRModule {
+    let func = func.into();
     let functions: Map<GlobalVar, BaseFunc> = module
         .functions
         .iter()
