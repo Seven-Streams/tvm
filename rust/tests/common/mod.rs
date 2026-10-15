@@ -81,9 +81,11 @@ pub fn assert_type_contract<N: ObjectCore, P: ObjectCore>(complete: bool) {
     }
 }
 
+#[allow(unused_macros)]
 macro_rules! assert_type_contracts {
     ($complete:expr; $($node:ty : $parent:ty),* $(,)?) => {
         $($crate::common::assert_type_contract::<$node, $parent>($complete);)*
     };
 }
+#[allow(unused_imports)]
 pub(crate) use assert_type_contracts;
