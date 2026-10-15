@@ -145,7 +145,7 @@ fn is_externally_exposed(func: &BaseFunc) -> Result<bool> {
     Ok(get_attr(&func.attrs, GLOBAL_SYMBOL)?.map(|s| String::try_from(s).is_ok()).unwrap_or(false))
 }
 
-fn host_of(target: &Target) -> Result<Option<Target>> {
+pub(crate) fn host_of(target: &Target) -> Result<Option<Target>> {
     target.host()?.map(|host| host.try_cast::<Target>()).transpose()
 }
 
@@ -157,7 +157,7 @@ fn with_host(target: &Target, host: Option<&Target>) -> Result<Target> {
 }
 
 /// `Target::WithoutHost`; `target.WithHost(target, None)` copies the node with the host cleared.
-fn without_host(target: &Target) -> Result<Target> {
+pub(crate) fn without_host(target: &Target) -> Result<Target> {
     if host_of(target)?.is_none() {
         return Ok(target.clone());
     }
@@ -311,12 +311,12 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
 }
 
 /// `UniqueNameSupply(begin, end, f)`: a supply with every existing name reserved.
-struct UniqueNames {
+pub(crate) struct UniqueNames {
     supply: crate::ir::UniqueNameSupply,
 }
 
 impl UniqueNames {
-    fn new(names: impl Iterator<Item = String>) -> Result<Self> {
+    pub(crate) fn new(names: impl Iterator<Item = String>) -> Result<Self> {
         let supply: crate::ir::UniqueNameSupply =
             tvm_ffi::cached_global_func!("ir.UniqueNameSupply")
                 .call_tuple((String::from(""),))?
@@ -332,7 +332,7 @@ impl UniqueNames {
     }
 
     /// `FreshName(name, add_prefix=false)`.
-    fn fresh(&self, name: &str) -> Result<String> {
+    pub(crate) fn fresh(&self, name: &str) -> Result<String> {
         tvm_ffi::cached_global_func!("ir.UniqueNameSupply_FreshName")
             .call_tuple((self.supply.clone(), String::from(name), false, true))?
             .try_into()

@@ -207,7 +207,7 @@ fn stores_loaded_value(store: &TensorStore) -> Result<bool> {
 
 /// `AnalyzerObj::MarkGlobalNonNegValue`, which has no global: for `value = symbol * scale +
 /// offset` with a positive constant scale, bound `symbol >= -offset`.
-fn mark_global_non_neg_value(analyzer: &Analyzer, value: &Expr) -> Result<()> {
+pub(crate) fn mark_global_non_neg_value(analyzer: &Analyzer, value: &Expr) -> Result<()> {
     let dtype = prim_dtype(value)?;
     let constant = |expr: &Expr| {
         expr.as_node::<IntImmObj>().map(|imm| imm.value.to_i64().unwrap_or(0) as i128)

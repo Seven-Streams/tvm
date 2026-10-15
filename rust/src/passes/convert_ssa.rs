@@ -220,32 +220,35 @@ impl ConvertSsa {
 }
 
 pub fn convert_ssa() -> Result<Pass> {
-    module_pass("tirx.ConvertSSA", 0, |module, _context| {
-        let mut converter = ConvertSsa::new();
-        let mut made_change = false;
-        let mut functions: Vec<(GlobalVar, BaseFunc)> = Vec::new();
-        for (gvar, base_func) in module.functions.iter() {
-            let mut base_func = base_func;
-            if let Ok(func) = base_func.clone().try_cast::<Function>() {
-                let updated = converter.visit_function(func)?;
-                if !updated.same_as(&base_func) {
-                    made_change = true;
-                    base_func = updated.into();
-                }
+    module_pass("tirx.ConvertSSA", 0, |module, _context| convert_ssa_module(module))
+}
+
+/// `ConvertSSA()(mod)`: the pass applied to `module`.
+pub(crate) fn convert_ssa_module(module: IRModule) -> Result<IRModule> {
+    let mut converter = ConvertSsa::new();
+    let mut made_change = false;
+    let mut functions: Vec<(GlobalVar, BaseFunc)> = Vec::new();
+    for (gvar, base_func) in module.functions.iter() {
+        let mut base_func = base_func;
+        if let Ok(func) = base_func.clone().try_cast::<Function>() {
+            let updated = converter.visit_function(func)?;
+            if !updated.same_as(&base_func) {
+                made_change = true;
+                base_func = updated.into();
             }
-            functions.push((gvar, base_func));
         }
-        if !made_change {
-            return Ok(module);
-        }
-        Ok(IRModule::new(
-            functions.into_iter().collect(),
-            module.source_map.clone(),
-            module.attrs.clone(),
-            module.global_infos.clone(),
-            module.global_var_map.clone(),
-        ))
-    })
+        functions.push((gvar, base_func));
+    }
+    if !made_change {
+        return Ok(module);
+    }
+    Ok(IRModule::new(
+        functions.into_iter().collect(),
+        module.source_map.clone(),
+        module.attrs.clone(),
+        module.global_infos.clone(),
+        module.global_var_map.clone(),
+    ))
 }
 
 /// `tirx::ConvertSSA(Stmt)`: a fresh converter run over one statement.

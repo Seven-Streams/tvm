@@ -28,10 +28,10 @@ use tvm_ffi::{
 };
 
 use super::convert_ssa::convert_ssa_stmt;
-use super::util::{function_pass, int_imm, prim_type, MutatorExt};
+use super::util::{MutatorExt, function_pass, int_imm, memory_scope};
 use crate::ir::{
-    Evaluate, Expr, For, IntImm, IntImmObj, PrimTypeObj, PtrType, SeqStmt, Stmt, TensorLoad,
-    TensorStore, Var,
+    Evaluate, Expr, For, IntImm, IntImmObj, PrimTypeObj, SeqStmt, Stmt, TensorLoad, TensorStore,
+    Var,
 };
 use crate::runtime::MemoryScope;
 use crate::sym::Analyzer;
@@ -273,15 +273,6 @@ fn unroll(op: &For, extent: i64) -> Result<Stmt> {
         unrolled.push(step.try_into()?);
     }
     Ok(SeqStmt::new(unrolled)?.into())
-}
-
-/// `runtime::MemoryScope::Get(name)`. Rust has no lookup of a registered enum value by name, so
-/// this lets a native `PtrType` constructor convert the name.
-fn memory_scope(name: &str) -> Result<MemoryScope> {
-    let ptr: PtrType = tvm_ffi::cached_global_func!("ir.PtrType")
-        .call_tuple((prim_type(super::util::int32_dtype())?, String::from(name)))?
-        .try_into()?;
-    Ok(ptr.scope.clone())
 }
 
 /// `ctx->GetConfigOrDefault<UnrollLoopConfig>("tirx.UnrollLoop")`.

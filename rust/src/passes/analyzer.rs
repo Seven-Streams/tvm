@@ -27,9 +27,11 @@
 //! body, a branch assumes its condition for its arm, and so on. Children re-enter the pass's
 //! handlers.
 
+use std::collections::HashSet;
+
 use tvm_ffi::{
-    match_any, Any, MutContextPolicy, MutateContext, MutateValue, ObjectRefCore, Result, String,
-    UnchangedOr,
+    match_any, structural_walk, Any, Array, Map, MutContextPolicy, MutateContext, MutateValue,
+    ObjectIdentity, ObjectRefCore, Result, String, UnchangedOr, WalkOrder, WalkResult,
 };
 
 use super::side_effect::{side_effect, PURE};
@@ -49,6 +51,11 @@ pub struct AnalyzerBase {
     /// Each scope leaves its constraints, newest first, when it ends. The bottom scope lives as
     /// long as the mutator, as in C++.
     scopes: Vec<Vec<ConstraintContext>>,
+    /// `iter_vars_`: each loop variable and launched thread index with its range, in the order
+    /// first entered. Never removed, as in C++.
+    iter_vars: Vec<(Var, Range)>,
+    /// `iter_predicates_`: the conditions over loop variables of the enclosing branches.
+    iter_predicates: Vec<Expr>,
     likely: Op,
     if_then_else: Op,
     launch_thread: Op,
@@ -59,6 +66,8 @@ impl AnalyzerBase {
         Ok(Self {
             analyzer,
             scopes: vec![Vec::new()],
+            iter_vars: Vec::new(),
+            iter_predicates: Vec::new(),
             likely: Op::get("prim.likely")?,
             if_then_else: Op::get("prim.if_then_else")?,
             launch_thread: Op::get("tirx.launch_thread")?,
@@ -79,6 +88,65 @@ impl AnalyzerBase {
         let mut derived = Vec::new();
         collect_derived_facts(condition, &mut derived)?;
         derived.iter().try_for_each(|fact| self.assume(fact))
+    }
+
+    /// `iter_vars_.Set(var, dom)`.
+    fn record_iter_var(&mut self, var: &Var, dom: &Range) {
+        match self.iter_vars.iter_mut().find(|(known, _)| known.same_as(var)) {
+            Some(entry) => entry.1 = dom.clone(),
+            None => self.iter_vars.push((var.clone(), dom.clone())),
+        }
+    }
+
+    /// The heuristic of C++ `WithRecordIterPredicate`: whether `condition` mentions a recorded
+    /// loop variable.
+    fn mentions_iter_var(&self, condition: &Expr) -> Result<bool> {
+        let vars: HashSet<ObjectIdentity> =
+            self.iter_vars.iter().map(|(var, _)| ObjectIdentity::of(var)).collect();
+        let walker = |var: Var| match vars.contains(&ObjectIdentity::of(&var)) {
+            true => WalkResult::Interrupt,
+            false => WalkResult::Advance,
+        };
+        Ok(structural_walk(condition, walker, WalkOrder::PreOrder)?.is_some())
+    }
+
+    /// C++ `IterMapSimplifyWithContext(indices, non_trivial_only)`: `sym::IterMapSimplify` over
+    /// the recorded loop variables, under the conjunction of the recorded branch conditions.
+    pub fn iter_map_simplify_with_context(
+        &self,
+        indices: &Array<Expr>,
+        non_trivial_only: bool,
+    ) -> Result<Array<Expr>> {
+        let bool_dtype = tvm_ffi::DLDataType { code: 6, bits: 8, lanes: 1 };
+        let mut predicate = crate::ops::Ex::from(int_imm(bool_dtype, 1));
+        for condition in &self.iter_predicates {
+            predicate = predicate.logical_and(condition);
+        }
+        let iters: Map<Var, Range> = self.iter_vars.iter().cloned().collect();
+        // `IterMapLevel::Surjective`, with trivial iterators simplified.
+        let simplified: Array<Expr> = tvm_ffi::cached_global_func!("sym.IterMapSimplify")
+            .call_tuple((
+                indices.clone(),
+                iters,
+                predicate.expr()?,
+                1i32,
+                true,
+                self.analyzer.clone(),
+            ))?
+            .try_into()?;
+        if !non_trivial_only {
+            return Ok(simplified);
+        }
+        let mut kept = Vec::with_capacity(indices.len());
+        for (index, value) in indices.iter().zip(simplified.iter()) {
+            let is_prim_var =
+                index.as_node::<crate::ir::VarObj>().is_some() && is_prim_expr(&index);
+            kept.push(match value.as_node::<crate::ir::IntImmObj>().is_some() && is_prim_var {
+                true => index,
+                false => value,
+            });
+        }
+        Ok(Array::new(kept))
     }
 
     fn enter_scope(&mut self) {
@@ -166,6 +234,7 @@ fn descend_for<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: For) -> Res
     ctx.scoped(|ctx| {
         let range = Range::from_min_extent(&op.min, &op.extent)?;
         ctx.base().analyzer.bind_range(&op.loop_var, &range)?;
+        ctx.base().record_iter_var(&op.loop_var, &range);
         let min = ctx.mutate_as(&op.min)?;
         let extent = ctx.mutate_as(&op.extent)?;
         let step = ctx.mutate_as(&op.step)?;
@@ -207,7 +276,10 @@ fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Resul
             if pure {
                 ctx.base().assume_facts(&real_condition)?;
             }
-            ctx.mutate_as(&op.then_case)
+            // C++ records `IntImm::Bool(true)`, which mentions no loop variable, when impure.
+            with_iter_predicate(ctx, pure.then_some(&real_condition), |ctx| {
+                ctx.mutate_as(&op.then_case)
+            })
         })?;
         let else_case: Option<SeqStmt> = match &op.else_case {
             Some(else_case) => {
@@ -249,7 +321,9 @@ fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionSt
             let var = op.body_params.get(0)?;
             let extent = op.args.get(1)?;
             let zero = int_imm(prim_dtype(&extent)?, 0)?;
-            ctx.base().analyzer.bind_range(&var, &Range::from_min_extent(zero, extent)?)?;
+            let dom = Range::from_min_extent(zero, extent)?;
+            ctx.base().analyzer.bind_range(&var, &dom)?;
+            ctx.base().record_iter_var(&var, &dom);
         }
         if let Some(fields) = op.attrs.dict.get(&String::from("cuda.launch_fields"))? {
             let fields: tvm_ffi::Array<String> = fields.try_into()?;
@@ -266,6 +340,26 @@ fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionSt
         }
         ctx.default_mutate(&op)
     })
+}
+
+/// C++ `WithRecordIterPredicate(condition, body)`: `condition` is recorded for `body` when it
+/// mentions a loop variable.
+fn with_iter_predicate<S: AnalyzerState, T>(
+    ctx: &mut MutateContext<'_, S>,
+    condition: Option<&Expr>,
+    body: impl FnOnce(&mut MutateContext<'_, S>) -> Result<T>,
+) -> Result<T> {
+    let record = match condition {
+        Some(condition) => ctx.base().mentions_iter_var(condition)?,
+        None => false,
+    };
+    if !record {
+        return body(ctx);
+    }
+    ctx.base().iter_predicates.push(condition.expect("recorded").clone());
+    let result = body(ctx);
+    ctx.base().iter_predicates.pop();
+    result
 }
 
 /// `Call(int32, Op::Get(intrinsic), {StringImm(axis)})`.
@@ -292,12 +386,12 @@ fn descend_if_then_else<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Ca
     let cond_new: Expr = ctx.mutate_as(&cond)?;
     let true_new: Expr = ctx.scoped(|ctx| {
         ctx.base().assume_facts(&cond_new)?;
-        ctx.mutate_as(&true_value)
+        with_iter_predicate(ctx, Some(&cond_new), |ctx| ctx.mutate_as(&true_value))
     })?;
     let not_cond: Expr = Not::new(&cond_new)?.into();
     let false_new: Expr = ctx.scoped(|ctx| {
         ctx.base().assume(&not_cond)?;
-        ctx.mutate_as(&false_value)
+        with_iter_predicate(ctx, Some(&not_cond), |ctx| ctx.mutate_as(&false_value))
     })?;
     if is_const_int(&cond_new, 0) {
         return Ok(false_new.into());

@@ -196,3 +196,17 @@ pub fn dict_without(attrs: &DictAttrs, key: &str) -> DictAttrs {
         attrs.dict.iter().filter(|(k, _)| k.as_str() != key).collect::<Map<String, Any>>(),
     )
 }
+
+/// An `InternalError`, what a failed C++ `TVM_FFI_ICHECK` or `TVM_FFI_THROW(InternalError)` raises.
+pub fn internal(message: &str) -> tvm_ffi::Error {
+    tvm_ffi::Error::new(tvm_ffi::INTERNAL_ERROR, message, "")
+}
+
+/// `runtime::MemoryScope::Get(name)`. Rust has no lookup of a registered enum value by name, so
+/// this lets a native `PtrType` constructor convert the name.
+pub fn memory_scope(name: &str) -> Result<crate::runtime::MemoryScope> {
+    let ptr: crate::ir::PtrType = tvm_ffi::cached_global_func!("ir.PtrType")
+        .call_tuple((crate::ops::prim_type(int32_dtype())?, String::from(name)))?
+        .try_into()?;
+    Ok(ptr.scope.clone())
+}
