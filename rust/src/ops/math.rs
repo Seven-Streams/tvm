@@ -25,9 +25,6 @@
 //! error it raises. Like the C++ functions, they make nodes with the native constructors and
 //! combine expressions with the operators of [`super::arith`].
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use tvm_ffi::{
     AnyView, Array, BigInt, DLDataType, DLDataTypeCode, DLDataTypeExt, Error, ErrorKind,
     ObjectRefCast, ObjectRefCore, Result, INTERNAL_ERROR, TYPE_ERROR,
@@ -132,18 +129,9 @@ where
         .unwrap_or_default()
 }
 
-thread_local! {
-    static OPS: RefCell<HashMap<&'static str, Op>> = RefCell::new(HashMap::new());
-}
-
 /// `Op::Get(name)`, fetched once per thread as the C++ functions keep theirs in `static`s.
 pub(super) fn op(name: &'static str) -> Result<Op> {
-    if let Some(op) = OPS.with(|ops| ops.borrow().get(name).cloned()) {
-        return Ok(op);
-    }
-    let op = Op::get(name)?;
-    OPS.with(|ops| ops.borrow_mut().insert(name, op.clone()));
-    Ok(op)
+    crate::ir::cached_op(name)
 }
 
 /// `Call(ty, Op::Get(name), args, {}, {}, loc)`; without `ty` the constructor infers it.

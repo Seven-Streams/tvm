@@ -22,7 +22,8 @@
 
 mod op_def;
 
-pub use op_def::{sig, OpDef, Signature};
+pub(crate) use op_def::cached_op;
+pub use op_def::{register_ops, sig, OpDef, OpHandle, Signature};
 
 // Every object registered under `ir` gets its block in this file; `skip` leaves one out.
 // tvm-ffi-stubgen(prefix): ir

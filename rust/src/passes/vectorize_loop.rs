@@ -109,18 +109,12 @@ fn with_lanes(dtype: DLDataType, lanes: i32, scalable: bool) -> DLDataType {
 }
 
 thread_local! {
-    static OPS: RefCell<HashMap<&'static str, Op>> = RefCell::new(HashMap::new());
     static GLOBALS: RefCell<HashMap<&'static str, FfiFunction>> = RefCell::new(HashMap::new());
 }
 
 /// `Op::Get(name)`, fetched once per thread as C++ keeps it in a `static`.
 fn op(name: &'static str) -> Result<Op> {
-    if let Some(op) = OPS.with(|ops| ops.borrow().get(name).cloned()) {
-        return Ok(op);
-    }
-    let op = Op::get(name)?;
-    OPS.with(|ops| ops.borrow_mut().insert(name, op.clone()));
-    Ok(op)
+    crate::ir::cached_op(name)
 }
 
 /// A global function, fetched once per thread.

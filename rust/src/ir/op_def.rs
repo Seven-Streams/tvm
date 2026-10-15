@@ -17,7 +17,8 @@
  * under the License.
  */
 
-//! Registering operators from Rust: C++ `OpDef` and its signature descriptors.
+//! Registering operators from Rust: C++ `OpDef` and its signature descriptors, and the handles
+//! that keep operators in `static`s.
 //!
 //! Every hook an operator gets here is native, as the C++ ones are: a Rust function compiled into
 //! the C ABI adapter that C++ `NativeFunctionView` calls through a function pointer, without
@@ -25,16 +26,20 @@
 //! `OpDef::signature` does from `sig::arg<T>`; each signature is its own compiled function.
 
 use std::any::TypeId;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::OnceLock;
 
 use tvm_ffi::tvm_ffi_sys::{TVMFFIAny, TVMFFITypeIndex};
 use tvm_ffi::{
-    Any, AnyView, Array, Error, ObjectArc, ObjectRefCore, Result, String, TYPE_ERROR, VALUE_ERROR,
+    Any, AnyView, Array, Error, ObjectArc, ObjectRefCore, Result, String, INTERNAL_ERROR,
+    TYPE_ERROR, VALUE_ERROR,
 };
 
-use super::{Attrs, CallObj, Expr, Op, OpObj, SeqCell, Type};
+use super::{Attrs, CallObj, Expr, Op, OpObj, RegionStmtObj, SeqCell, Type, Var};
 use crate::ops::type_key;
 use sig::{ArgType, Checks};
 
@@ -165,6 +170,31 @@ impl OpDef {
         })
     }
 
+    /// `FRegionGetBodyParams`, which makes the operator a region operation: the variables a
+    /// region binds in its body, from its Call (the operation, operands and attributes), which
+    /// the `RegionStmt` constructor checks the body parameters against. A region that binds none
+    /// returns none. `body_params` is a function or a closure that captures nothing.
+    pub fn set_region_body_params<F>(self, body_params: F) -> Self
+    where
+        F: Fn(&CallObj) -> Result<Array<Var>> + 'static,
+    {
+        let _ = body_params;
+        let hook: Hook = region_body_params_abi::<F>;
+        self.set_attr("FRegionGetBodyParams", hook as *mut c_void)
+    }
+
+    /// `FRegionValidate`: a check of a complete region statement, run by the `RegionStmt`
+    /// constructor after the body parameters. `validate` is a function or a closure that
+    /// captures nothing.
+    pub fn set_region_validate<F>(self, validate: F) -> Self
+    where
+        F: Fn(&RegionStmtObj) -> Result<()> + 'static,
+    {
+        let _ = validate;
+        let hook: RegionHook = region_validate_abi::<F>;
+        self.set_attr("FRegionValidate", hook as *mut c_void)
+    }
+
     fn attr(self, key: &str, value: Any, replace: bool) -> Self {
         let key = String::from(key);
         self.invoke(
@@ -186,6 +216,96 @@ impl OpDef {
     fn then(self, step: impl FnOnce(&Op) -> Result<()>) -> Self {
         Self(self.0.and_then(|op| step(&op).map(|_| op)))
     }
+}
+
+/// A handle to an operator, kept in a `static` as C++ keeps one in `const Op& xxx_op()`: either
+/// an operator registered elsewhere (C++ or Python), looked up by name, or one Rust defines,
+/// registered once, by [`register_ops`] or on first use. [`OpHandle::get`] returns the operator,
+/// fetched once per thread.
+///
+/// ```ignore
+/// static LAUNCH_THREAD: OpHandle = OpHandle::registered("tirx.launch_thread");
+/// static CLAMP: OpHandle = OpHandle::define("my_ext.clamp", "Clamp an index to a bound.", |def| {
+///     def.signature(Signature::new().arg::<IntExpr>("index", "").arg::<IntExpr>("bound", ""))
+///         .set_attr("TCallEffectKind", 0i64)
+///         .set_infer_type(first_arg_type)
+/// });
+///
+/// let clamped = Call::new(ty, CLAMP.get()?, [index, bound])?;
+/// ```
+pub struct OpHandle {
+    name: &'static str,
+    /// The documentation and the definition of an operator Rust defines.
+    definition: Option<(&'static str, fn(OpDef) -> OpDef)>,
+    /// The outcome of the definition, which runs once: the error's text if it failed.
+    defined: OnceLock<std::result::Result<(), std::string::String>>,
+}
+
+impl OpHandle {
+    /// The operator `name`, registered elsewhere.
+    pub const fn registered(name: &'static str) -> Self {
+        Self { name, definition: None, defined: OnceLock::new() }
+    }
+
+    /// The operator `name`, defined here: `define` adds to `OpDef::new(name, doc)`. An operator
+    /// of that name registered elsewhere is an error, as Rust does not take operators over.
+    pub const fn define(name: &'static str, doc: &'static str, define: fn(OpDef) -> OpDef) -> Self {
+        Self { name, definition: Some((doc, define)), defined: OnceLock::new() }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Register the operator if Rust defines it and it is not registered yet. The caller that
+    /// runs a failing definition gets its error; later ones get an error that names it.
+    pub fn register(&self) -> Result<()> {
+        let Some((doc, define)) = self.definition else { return Ok(()) };
+        let mut failure = None;
+        let outcome = self.defined.get_or_init(|| match define(OpDef::new(self.name, doc)).op() {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let text = format!("{}: {}", error.kind(), error.message());
+                failure = Some(error);
+                Err(text)
+            }
+        });
+        match (failure, outcome) {
+            (Some(error), _) => Err(error),
+            (None, Ok(())) => Ok(()),
+            (None, Err(text)) => {
+                let message = format!("Operator {} failed to register: {text}", self.name);
+                Err(Error::new(INTERNAL_ERROR, &message, ""))
+            }
+        }
+    }
+
+    /// The operator, registered first if Rust defines it.
+    pub fn get(&self) -> Result<Op> {
+        self.register()?;
+        cached_op(self.name)
+    }
+}
+
+/// Register the operators of `ops` that Rust defines and are not registered yet, in order; the
+/// first failure is the error. Registering again does nothing, so a library can call it from
+/// every entry point.
+pub fn register_ops(ops: &[&OpHandle]) -> Result<()> {
+    ops.iter().try_for_each(|op| op.register())
+}
+
+thread_local! {
+    static OPS: RefCell<HashMap<&'static str, Op>> = RefCell::new(HashMap::new());
+}
+
+/// `Op::Get(name)`, fetched once per thread, as C++ keeps an operator in a `static`.
+pub(crate) fn cached_op(name: &'static str) -> Result<Op> {
+    if let Some(op) = OPS.with(|ops| ops.borrow().get(name).cloned()) {
+        return Ok(op);
+    }
+    let op = Op::get(name)?;
+    OPS.with(|ops| ops.borrow_mut().insert(name, op.clone()));
+    Ok(op)
 }
 
 /// The arguments an operator takes, for [`OpDef::signature`]: the fixed value and type arguments
@@ -283,6 +403,10 @@ impl<L> Signature<L> {
 /// the result, or the error, in an owned `TVMFFIAny`.
 type Hook = extern "C" fn(*const CallObj) -> TVMFFIAny;
 
+/// The C ABI of a native hook on a region statement, `NativeFunctionView<R(const
+/// RegionStmtNode*)>`.
+type RegionHook = extern "C" fn(*const RegionStmtObj) -> TVMFFIAny;
+
 extern "C" fn validate_abi<F: Fn(&CallObj) -> Result<()>>(call: *const CallObj) -> TVMFFIAny {
     call_hook(call, zero_sized::<F>())
 }
@@ -293,6 +417,18 @@ extern "C" fn infer_type_abi<F: Fn(&CallObj) -> Result<Type>>(call: *const CallO
 
 extern "C" fn validate_signature<L: Checks>(call: *const CallObj) -> TVMFFIAny {
     call_hook(call, sig::validate::<L>)
+}
+
+extern "C" fn region_body_params_abi<F: Fn(&CallObj) -> Result<Array<Var>>>(
+    call: *const CallObj,
+) -> TVMFFIAny {
+    call_hook(call, zero_sized::<F>())
+}
+
+extern "C" fn region_validate_abi<F: Fn(&RegionStmtObj) -> Result<()>>(
+    region: *const RegionStmtObj,
+) -> TVMFFIAny {
+    call_hook(region, zero_sized::<F>())
 }
 
 /// The only value of `F`, a function or a closure that captures nothing.
@@ -307,16 +443,13 @@ fn zero_sized<F>() -> F {
     unsafe { std::mem::zeroed() }
 }
 
-/// Run `hook` on the Call C++ passes and return its result as the hook ABI does. A panic, which
-/// must not unwind into C++, becomes an error.
-fn call_hook<R: Into<Any>>(
-    call: *const CallObj,
-    hook: impl Fn(&CallObj) -> Result<R>,
-) -> TVMFFIAny {
+/// Run `hook` on the node C++ passes (the Call or region being typed or checked) and return its
+/// result as the hook ABI does. A panic, which must not unwind into C++, becomes an error.
+fn call_hook<N, R: Into<Any>>(node: *const N, hook: impl Fn(&N) -> Result<R>) -> TVMFFIAny {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: C++ passes the Call being typed or checked, alive for the call.
-        match unsafe { call.as_ref() } {
-            Some(call) => hook(call).map(Into::into),
+        // SAFETY: C++ passes the node being typed or checked, alive for the call.
+        match unsafe { node.as_ref() } {
+            Some(node) => hook(node).map(Into::into),
             None => Err(Error::new(TYPE_ERROR, "Invalid Op Call", "")),
         }
     }));

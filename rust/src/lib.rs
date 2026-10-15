@@ -135,15 +135,33 @@ impl_same_field_by_identity!(
     tvm_ffi::Map<tvm_ffi::String, tvm_ffi::Any>,
 );
 
+/// The operators this crate defines, which [`tvm_rust_register_ops`] registers. List every
+/// `OpHandle::define` here, so that IR using it can be built or parsed before Rust code fetches
+/// the operator.
+static OPS: &[&ir::OpHandle] = &[];
+
 /// Entry point for a host process that loads this crate as a shared library: registers every
-/// Rust pass as `rust.tirx.transform.<Name>`. Returns 0 on success; on failure prints the
-/// error and returns -1.
+/// operator this crate defines, each once, so calling it again does nothing. Returns 0 on
+/// success; on failure prints the error and returns -1.
+#[no_mangle]
+pub extern "C" fn tvm_rust_register_ops() -> i32 {
+    report("tvm_rust_register_ops", ir::register_ops(OPS))
+}
+
+/// Entry point for a host process that loads this crate as a shared library: registers this
+/// crate's operators, then every Rust pass as `rust.tirx.transform.<Name>`. Returns 0 on success;
+/// on failure prints the error and returns -1.
 #[no_mangle]
 pub extern "C" fn tvm_rust_register_passes() -> i32 {
-    match passes::register_globals() {
+    let registered = ir::register_ops(OPS).and_then(|()| passes::register_globals());
+    report("tvm_rust_register_passes", registered)
+}
+
+fn report(entry: &str, result: tvm_ffi::Result<()>) -> i32 {
+    match result {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("tvm_rust_register_passes: {error}");
+            eprintln!("{entry}: {error}");
             -1
         }
     }
