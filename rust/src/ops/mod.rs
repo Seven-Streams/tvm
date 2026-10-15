@@ -20,8 +20,10 @@
 //! Building IR with the semantics of the C++ API: the `PrimExpr` operators
 //! (`include/tvm/ir/prim/op.h`) and the node constructors.
 //!
-//! Operators (`arith`). `a + b` calls the global behind C++ `a + b` (`prim._OpAdd`), so operand
-//! type matching and constant folding are the native ones. A literal on either side is typed the
+//! Operators (`arith`). `a + b` is C++ `a + b` (`add` in `src/ir/prim/op.cc`), written in Rust:
+//! the operand types are matched (`BinaryOpMatchTypes`), constants are folded as
+//! `TryConstFold` folds them (`fold`, after `src/ir/prim/const_fold.h`), with the same checks and
+//! errors, and anything else is the raw node. A literal on either side is typed the
 //! way C++ types it: an integer becomes `MakeConst(other.ty(), v)`, an `f32` a float32 `FloatImm`,
 //! an `f64` a float64 `FloatImm`. C++ has no `PrimExpr(bool)`, so there is no `bool` literal. As in
 //! C++, `/` and `%` are not defined: name the division (`truncdiv`, `floordiv`, `div`, ...).
@@ -31,8 +33,9 @@
 //!
 //! Math (`math`). `cast`, the math functions (`floor`, `abs`, `isinf`, `pow`, `exp`, ...),
 //! `reinterpret`, and the type matching of binary operations ([`match_types`]) are written in
-//! Rust after their C++ definitions, with the same folding, checks and errors. Operators build an [`Ex`], which keeps the first error
-//! instead of panicking; `.expr()` turns it back into a `Result`:
+//! Rust after their C++ definitions, with the same folding, checks and errors. Operators build an
+//! [`Ex`], which keeps the first error instead of panicking; `.expr()` turns it back into a
+//! `Result`:
 //!
 //! ```ignore
 //! select(rmod.greater_equal(0), &rdiv, &rdiv - 1).expr()?
@@ -42,14 +45,22 @@
 //! location is `UnknownLoc()` and trailing optional fields take their C++ defaults. `X::new_full`
 //! takes every argument. Arguments convert the way C++ converts them implicitly: an `i32` is an
 //! `IntImm::Int32` ([`IntoExpr`], so `Evaluate::new(0)`), a statement is a body ([`IntoBody`]).
-//! Each has the C++ constructor's checks, normalization and errors: the variables, types, raw
-//! expression constructors (C++ `Add(a, b)`: type checks, no folding, as `prim::Add::new` and so
-//! on), `Shuffle`, `Tuple`, `Return` and `TensorStore` are written in Rust after it; the others
-//! call it. The generated lossless allocations are `from_complete_fields`: use them for what C++
-//! builds by `CopyOnWrite` or `make_object<T>(*node)`.
+//! Each is written in Rust after the C++ constructor, with its checks, normalization, inferred
+//! type and errors; the raw expression constructors (C++ `Add(a, b)`: type checks, no folding)
+//! are `prim::Add::new` and so on. A constructor that dispatches through a registry (`Call`'s
+//! `FInferType`, `Evaluate`'s and `TensorStore`'s validation, `RegionStmt`'s contract) reads it
+//! and calls the registered hook. What C++ keeps as state stays C++'s: the `UnknownLoc()` and
+//! `MissingType()` singletons and the `PrimType` node of each dtype are fetched once per thread,
+//! and `ExecScope`, `TileLayout`, `DispatchContext` and `UniqueNameSupply` call the native
+//! constructor. The generated lossless allocations are `from_complete_fields`: use them for what
+//! C++ builds by `CopyOnWrite` or `make_object<T>(*node)`.
+//!
+//! Native functions (`native`). Printing, structural comparison, the target context, layouts and
+//! analyses that Rust calls rather than writes again, as typed functions and methods.
 
 mod arith;
 mod build;
+mod fold;
 mod math;
 mod native;
 

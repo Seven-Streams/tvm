@@ -30,7 +30,8 @@ use tvm_ffi::{
     ObjectRefCore, Result, INTERNAL_ERROR, TYPE_ERROR,
 };
 
-use super::arith::{wrap_signed, Ex, PrimOps};
+use super::arith::{Ex, PrimOps};
+use super::fold::fold_result;
 use super::native::repr;
 use super::build::{
     float_imm, float_imm_at, int32, int32_dtype, int_imm_at, prim_dtype, prim_type, IntoExpr,
@@ -498,7 +499,7 @@ fn integer_abs(x: Expr, loc: &Location) -> Result<Expr> {
     if let Some(imm) = x.as_node::<IntImmObj>() {
         let mut value = if imm.value.is_negative() { -&imm.value } else { imm.value.clone() };
         if dtype.bits >= 64 {
-            value = wrap_signed(value, dtype.bits)?;
+            value = fold_result(value, dtype);
         }
         return Ok(int_imm_at(dtype, value, &imm.loc)?.into());
     }

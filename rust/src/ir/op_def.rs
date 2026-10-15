@@ -30,7 +30,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
@@ -40,7 +42,7 @@ use tvm_ffi::{
     TYPE_ERROR, VALUE_ERROR,
 };
 
-use super::{Attrs, CallObj, Expr, Op, OpObj, RegionStmtObj, SeqCell, Type, Var};
+use super::{Attrs, CallObj, Expr, Op, OpAttrMap, OpObj, RegionStmtObj, SeqCell, Type, Var};
 use crate::ops::type_key;
 use sig::{ArgType, Checks};
 
@@ -343,6 +345,50 @@ pub(crate) fn cached_op(name: &'static str) -> Result<Op> {
     let op = Op::get(name)?;
     OPS.with(|ops| ops.borrow_mut().insert(name, op.clone()));
     Ok(op)
+}
+
+impl<T> OpAttrMap<T> {
+    /// The value `op` registers in this column, of whatever type, or `None`.
+    fn get_any(&self, op: &OpObj) -> Option<Any> {
+        // SAFETY: `column` is an `ffi.List` (checked by `Op::attr_map`) that `self` keeps alive.
+        let cell = unsafe {
+            let data = tvm_ffi::object::ObjectRefCore::data(&self.column);
+            &*(ObjectArc::as_raw(data) as *const SeqCell)
+        };
+        let index = op.index as usize;
+        if index >= cell.size as usize {
+            return None;
+        }
+        // SAFETY: `index` is within the `size` initialized entries; the borrowed entry is copied,
+        // never released.
+        let entry = unsafe { ManuallyDrop::new(Any::from_raw_ffi_any(*cell.data.add(index))) };
+        (entry.type_index() != TVMFFITypeIndex::kTVMFFINone as i32).then(|| (*entry).clone())
+    }
+}
+
+thread_local! {
+    /// The operator attribute columns read as raw values, fetched once per thread as C++ keeps
+    /// them in `static`s. A column no operator registered yet is looked up again.
+    static RAW_COLUMNS: RefCell<HashMap<&'static str, Rc<OpAttrMap<tvm_ffi::Function>>>> =
+        RefCell::new(HashMap::new());
+}
+
+impl OpObj {
+    /// The value this operator registers in the attribute column `column` (C++
+    /// `Op::GetAttrMap(key)[op]`), of whatever type, or `None`.
+    pub(crate) fn attr_value(&self, column: &'static str) -> Result<Option<Any>> {
+        let cached = RAW_COLUMNS.with(|columns| columns.borrow().get(column).cloned());
+        let map = match cached {
+            Some(map) => map,
+            None => {
+                let Some(map) = Op::attr_map::<tvm_ffi::Function>(column)? else { return Ok(None) };
+                let map = Rc::new(map);
+                RAW_COLUMNS.with(|columns| columns.borrow_mut().insert(column, map.clone()));
+                map
+            }
+        };
+        Ok(map.get_any(self))
+    }
 }
 
 /// The arguments an operator takes, for [`OpDef::signature`]: the fixed value and type arguments

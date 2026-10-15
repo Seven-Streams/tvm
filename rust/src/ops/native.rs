@@ -24,7 +24,7 @@
 use tvm_ffi::object::ObjectRef;
 use tvm_ffi::{Any, AnyView, Array, FieldGetter, Map, ObjectCore, ObjectRefCore, Result, String};
 
-use crate::ir::{Call, Expr, LambdaExpr, Stmt, Type, UniqueNameSupply, Var};
+use crate::ir::{Call, Expr, LambdaExpr, OpObj, Stmt, Type, UniqueNameSupply, Var};
 use crate::runtime::{MemoryScope, MemoryScopeObj};
 use crate::target::Target;
 use crate::tirx::{Axis, Function, Layout, TileLayout};
@@ -83,15 +83,19 @@ pub fn deep_equal(lhs: &Expr, rhs: &Expr) -> Result<bool> {
 // Expressions and names
 
 impl Call {
-    /// C++ `Call::Validate()`: the operator's validator on this call.
+    /// C++ `Call::Validate()`: the operator's validator, if it has one, on this call.
     pub fn validate(&self) -> Result<()> {
-        tvm_ffi::cached_global_func!("ir.CallValidate").call_tuple((self.clone(),))?;
-        Ok(())
+        match self.op.as_node::<OpObj>() {
+            Some(op) => super::build::validate_call(op, self),
+            None => Ok(()),
+        }
     }
 
-    /// C++ `Call::ReinferType()`: the type the operator gives this call now.
+    /// C++ `Call::ReinferType()`: the type the operator gives this call now (its
+    /// `TFixedReturnType`, else what its `FInferType` infers), the return type of a callee of a
+    /// function type, otherwise `MissingType`.
     pub fn reinfer_type(&self) -> Result<Type> {
-        tvm_ffi::cached_global_func!("ir.reinfer_type").call_tuple((self.clone(),))?.try_into()
+        super::build::reinfer_call_type(self)
     }
 }
 

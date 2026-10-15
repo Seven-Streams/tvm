@@ -17,21 +17,26 @@
  * under the License.
  */
 
-//! The operators: `Ex`, literals, the native operations and `PrimOps`.
+//! The operators: `Ex`, literals, the operations of `src/ir/prim/op.cc` and `PrimOps`.
 
+use std::cell::OnceCell;
 use std::ops::{
     Add, AddAssign, BitAnd, BitOr, BitXor, Mul, MulAssign, Neg, Not, Shl, Shr, Sub, SubAssign,
 };
 
-use tvm_ffi::{BigInt, DLDataType, DLDataTypeCode, ObjectRefCore, Result};
+use tvm_ffi::{BigInt, DLDataType, DLDataTypeCode, ObjectRefCore, Result, INTERNAL_ERROR};
 
 use super::build::{
-    big_int_imm, float_imm, int_imm, make_const, prim_dtype, scalar_dtype, unknown_loc, IntoExpr,
-    IntoPrimType,
+    big_int_imm, float_imm, int32, int_imm_at, make_const, prim_dtype, scalar_dtype, unknown_loc,
+    IntoExpr, IntoPrimType,
 };
-use super::math;
-use crate::ir::{Call, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, TensorLoad, Type, Var};
+use super::native::repr;
+use super::{fold, math};
+use crate::ir::{
+    Call, CallObj, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, TensorLoad, Type, Var,
+};
 use crate::prim;
+use crate::prim::op::{IF_THEN_ELSE, VSCALE};
 
 // ---------------------------------------------------------------------------------------------
 // `Ex`
@@ -173,58 +178,359 @@ impl Operand for f64 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The native operations
+// The operations (`src/ir/prim/op.cc`)
 
-macro_rules! native_binary {
-    ($($name:ident => $global:literal),+ $(,)?) => {
+/// The binary operations that match the operand types (`BinaryOpMatchTypes`), fold constants
+/// ([`fold`]) and otherwise build the raw node.
+macro_rules! folded_binary {
+    ($($name:ident: $cpp:literal, $fold:path => $node:ident),+ $(,)?) => {
         $(
+            #[doc = concat!("C++ `", $cpp, "(a, b, loc)`.")]
             fn $name(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
-                tvm_ffi::cached_global_func!($global).call_tuple((a, b, loc))?.try_into()
+                let (a, b) = math::match_types_at(a, b, &loc)?;
+                match $fold(&a, &b)? {
+                    Some(folded) => Ok(folded),
+                    None => Ok(prim::$node::new_full(a, b, loc)?.into()),
+                }
             }
         )+
     };
 }
 
-native_binary!(
-    op_add => "prim._OpAdd",
-    op_sub => "prim._OpSub",
-    op_mul => "prim._OpMul",
-    op_div => "prim._OpDiv",
-    op_truncdiv => "prim._OpTruncDiv",
-    op_truncmod => "prim._OpTruncMod",
-    op_floordiv => "prim._OpFloorDiv",
-    op_floormod => "prim._OpFloorMod",
-    op_indexdiv => "prim._OpIndexDiv",
-    op_indexmod => "prim._OpIndexMod",
-    op_ceildiv => "prim._OpCeilDiv",
-    op_min => "prim._OpMin",
-    op_max => "prim._OpMax",
-    op_eq => "prim._OpEQ",
-    op_ne => "prim._OpNE",
-    op_lt => "prim._OpLT",
-    op_le => "prim._OpLE",
-    op_gt => "prim._OpGT",
-    op_ge => "prim._OpGE",
-    op_and => "prim._OpAnd",
-    op_or => "prim._OpOr",
-    op_bitwise_and => "prim.bitwise_and",
-    op_bitwise_or => "prim.bitwise_or",
-    op_bitwise_xor => "prim.bitwise_xor",
-    op_left_shift => "prim.left_shift",
-    op_right_shift => "prim.right_shift",
+folded_binary!(
+    op_add: "add", fold::add => Add,
+    op_sub: "sub", fold::sub => Sub,
+    op_mul: "mul", fold::mul => Mul,
+    op_div: "div", fold::div => Div,
+    op_truncmod: "truncmod", fold::truncmod => Mod,
+    op_gt: "greater", fold_gt => GT,
+    op_ge: "greater_equal", fold_ge => GE,
+    op_lt: "less", fold_lt => LT,
+    op_le: "less_equal", fold_le => LE,
+    op_ne: "not_equal", fold_ne => NE,
 );
 
-macro_rules! native_unary {
-    ($($name:ident => $global:literal),+ $(,)?) => {
+fn fold_gt(a: &Expr, b: &Expr) -> Result<Option<Expr>> {
+    fold::compare(a, b, |x, y| x > y, |x, y| x > y)
+}
+
+fn fold_ge(a: &Expr, b: &Expr) -> Result<Option<Expr>> {
+    fold::compare(a, b, |x, y| x >= y, |x, y| x >= y)
+}
+
+fn fold_lt(a: &Expr, b: &Expr) -> Result<Option<Expr>> {
+    fold::compare(a, b, |x, y| x < y, |x, y| x < y)
+}
+
+fn fold_le(a: &Expr, b: &Expr) -> Result<Option<Expr>> {
+    fold::compare(a, b, |x, y| x <= y, |x, y| x <= y)
+}
+
+fn fold_ne(a: &Expr, b: &Expr) -> Result<Option<Expr>> {
+    fold::compare(a, b, |x, y| x != y, |x, y| x != y)
+}
+
+/// The `TVM_FFI_ICHECK` an operation makes of an operand's type: `codes` are the C++ type codes
+/// the condition spells out, `message` what it reports with the operand and its type.
+fn check_operand(
+    operand: &Expr,
+    side: &str,
+    accepted: &[u8],
+    codes: &str,
+    message: impl FnOnce() -> String,
+) -> Result<()> {
+    if accepted.contains(&prim_dtype(operand)?.code) {
+        return Ok(());
+    }
+    let condition = format!("{side}.ty().MatchesCode({codes})");
+    Err(math::check_failed(INTERNAL_ERROR, &condition, &message()))
+}
+
+const INTEGER: [u8; 2] = [math::INT, math::UINT];
+const INTEGER_CODES: &str = "DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt";
+const INTEGER_OR_BOOL: [u8; 3] = [math::INT, math::UINT, math::BOOL];
+const INTEGER_OR_BOOL_CODES: &str =
+    "DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt, DLDataTypeCode::kDLBool";
+
+/// `TVM_FFI_ICHECK(x.ty().MatchesCode(kDLInt, kDLUInt)) << x` of the integer divisions.
+fn check_integer(a: &Expr, b: &Expr) -> Result<()> {
+    check_operand(a, "a", &INTEGER, INTEGER_CODES, || repr(a))?;
+    check_operand(b, "b", &INTEGER, INTEGER_CODES, || repr(b))
+}
+
+/// The operand checks of a bitwise operation `symbol` (`what` names it): integer operands, or
+/// also booleans.
+fn check_bitwise(
+    a: &Expr,
+    b: &Expr,
+    symbol: &str,
+    what: &str,
+    (accepted, codes): (&[u8], &str),
+) -> Result<()> {
+    for (operand, side, which) in [(a, "a", "LHS"), (b, "b", "RHS")] {
+        check_operand(operand, side, accepted, codes, || {
+            format!(
+                "Expected integer argument as {which} of {symbol} operator ({what}), but received \
+                 {} of type {}",
+                repr(operand),
+                repr(&operand.ty)
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The operand checks of `&&` and `||`: boolean operands.
+fn check_logical(a: &Expr, b: &Expr, symbol: &str, what: &str) -> Result<()> {
+    for (operand, side, which) in [(a, "a", "LHS"), (b, "b", "RHS")] {
+        check_operand(operand, side, &[math::BOOL], "DLDataTypeCode::kDLBool", || {
+            format!(
+                "Expected boolean argument as {which} of {symbol} operator ({what}), but received \
+                 {} of type {}",
+                repr(operand),
+                repr(&operand.ty)
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// C++ `truncdiv(a, b, loc)`: `div` of integers.
+fn op_truncdiv(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    check_integer(&a, &b)?;
+    op_div(a, b, loc)
+}
+
+/// C++ `floordiv(a, b, loc)`.
+fn op_floordiv(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    check_integer(&a, &b)?;
+    let (a, b) = math::match_types_at(a, b, &loc)?;
+    match fold::floordiv(&a, &b)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::FloorDiv::new_full(a, b, loc)?.into()),
+    }
+}
+
+/// C++ `floormod(a, b, loc)`.
+fn op_floormod(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    check_integer(&a, &b)?;
+    let (a, b) = math::match_types_at(a, b, &loc)?;
+    match fold::floormod(&a, &b)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::FloorMod::new_full(a, b, loc)?.into()),
+    }
+}
+
+/// C++ `indexdiv(a, b, loc)`, which is `floordiv`.
+fn op_indexdiv(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    op_floordiv(a, b, loc)
+}
+
+/// C++ `indexmod(a, b, loc)`, which is `floormod`.
+fn op_indexmod(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    op_floormod(a, b, loc)
+}
+
+/// C++ `ceildiv(a, b, loc)`: `floordiv(a + b - 1, b)`.
+fn op_ceildiv(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    check_integer(&a, &b)?;
+    let (a, b) = math::match_types_at(a, b, &loc)?;
+    let sum = op_add(a, b.clone(), unknown_loc()?)?;
+    let one = make_const(prim_dtype(&sum)?, 1)?;
+    let numerator = op_sub(sum, one, unknown_loc()?)?;
+    match fold::floordiv(&numerator, &b)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::FloorDiv::new_full(numerator, b, loc)?.into()),
+    }
+}
+
+thread_local! {
+    static INFINITIES: OnceCell<(Expr, Expr)> = const { OnceCell::new() };
+}
+
+/// `SymbolicLimits::pos_inf_` and `neg_inf_`, the opaque infinities of integer analysis, which
+/// `min` and `max` recognize by identity.
+fn infinities() -> Result<(Expr, Expr)> {
+    INFINITIES.with(|cell| {
+        if let Some(infinities) = cell.get() {
+            return Ok(infinities.clone());
+        }
+        let infinities = (crate::sym::pos_inf()?, crate::sym::neg_inf()?);
+        let _ = cell.set(infinities.clone());
+        Ok(infinities)
+    })
+}
+
+/// C++ `min(a, b, loc)`: an infinity on either side decides it.
+fn op_min(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    let (pos_inf, neg_inf) = infinities()?;
+    if a.same_as(&pos_inf) || b.same_as(&neg_inf) {
+        return Ok(b);
+    }
+    if a.same_as(&neg_inf) || b.same_as(&pos_inf) {
+        return Ok(a);
+    }
+    let (a, b) = math::match_types_at(a, b, &loc)?;
+    match fold::min(&a, &b)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::Min::new_full(a, b, loc)?.into()),
+    }
+}
+
+/// C++ `max(a, b, loc)`: an infinity on either side decides it.
+fn op_max(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    let (pos_inf, neg_inf) = infinities()?;
+    if a.same_as(&pos_inf) || b.same_as(&neg_inf) {
+        return Ok(a);
+    }
+    if a.same_as(&neg_inf) || b.same_as(&pos_inf) {
+        return Ok(b);
+    }
+    let (a, b) = math::match_types_at(a, b, &loc)?;
+    match fold::max(&a, &b)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::Max::new_full(a, b, loc)?.into()),
+    }
+}
+
+/// Whether `expr` is a call to `prim.vscale`.
+fn is_vscale(expr: &Expr) -> bool {
+    expr.as_node::<CallObj>().is_some_and(|call| VSCALE.is(&call.op))
+}
+
+/// C++ `equal(a, b, loc)`: two `vscale()` calls are equal, as the C++ `PrimExpr(true)`, an int32
+/// one.
+fn op_eq(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    let (a, b) = math::match_types_at(a, b, &loc)?;
+    if let Some(folded) = fold::compare(&a, &b, |x, y| x == y, |x, y| x == y)? {
+        return Ok(folded);
+    }
+    if is_vscale(&a) && is_vscale(&b) {
+        return Ok(int32(1)?.into());
+    }
+    Ok(prim::EQ::new_full(a, b, loc)?.into())
+}
+
+/// C++ `logical_and(a, b, loc)`: boolean operands, not matched.
+fn op_and(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    check_logical(&a, &b, "&&", "logical AND")?;
+    match fold::and(&a, &b)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::And::new_full(a, b, loc)?.into()),
+    }
+}
+
+/// C++ `logical_or(a, b, loc)`: boolean operands, not matched.
+fn op_or(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    check_logical(&a, &b, "||", "logical OR")?;
+    match fold::or(&a, &b)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::Or::new_full(a, b, loc)?.into()),
+    }
+}
+
+/// The folding of a shift of index types: the amount is checked against the width, and two
+/// constants fold, with a shift by zero the operand itself.
+fn fold_shift(
+    a: &Expr,
+    b: &Expr,
+    shift: impl FnOnce(&BigInt, &BigInt) -> Result<BigInt>,
+    loc: &Location,
+) -> Result<Option<Expr>> {
+    let dtype = prim_dtype(a)?;
+    if !fold::is_index_type(dtype) || !fold::is_index_type(prim_dtype(b)?) {
+        return Ok(None);
+    }
+    let (pa, pb) = (int_value(a), int_value(b));
+    if let Some(y) = pb {
+        let in_range = !y.is_negative() && y < &BigInt::from(dtype.bits as i64);
+        if !in_range {
+            let condition = "pb->value >= 0 && pb->value < result_ty.bits()";
+            let message = format!(
+                "Shift amount must be non-negative and less than {} for type {}",
+                dtype.bits,
+                repr(&a.ty)
+            );
+            return Err(math::check_failed(INTERNAL_ERROR, condition, &message));
+        }
+    }
+    if let (Some(x), Some(y)) = (pa, pb) {
+        return Ok(Some(int_imm_at(dtype, shift(x, y)?, loc)?.into()));
+    }
+    if pb.is_some_and(BigInt::is_zero) {
+        return Ok(Some(a.clone()));
+    }
+    Ok(None)
+}
+
+/// C++ `right_shift(a, b, loc)` (`>>`), sign-extending.
+fn op_right_shift(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    check_bitwise(&a, &b, ">>", "right shift", (&INTEGER, INTEGER_CODES))?;
+    let (a, b) = math::match_types_at(a, b, &loc)?;
+    match fold_shift(&a, &b, |x, y| x.try_shr(y.clone()), &loc)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::RShift::new_full(a, b, loc)?.into()),
+    }
+}
+
+/// C++ `left_shift(a, b, loc)` (`<<`): a 64-bit result wraps, a narrower one is checked by
+/// `IntImm`.
+fn op_left_shift(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+    check_bitwise(&a, &b, "<<", "left shift", (&INTEGER, INTEGER_CODES))?;
+    let (a, b) = math::match_types_at(a, b, &loc)?;
+    let dtype = prim_dtype(&a)?;
+    let shift = |x: &BigInt, y: &BigInt| {
+        let value = x.try_shl(y.clone())?;
+        Ok(if dtype.bits >= 64 { fold::fold_result(value, dtype) } else { value })
+    };
+    match fold_shift(&a, &b, shift, &loc)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::LShift::new_full(a, b, loc)?.into()),
+    }
+}
+
+/// The bitwise operations, which fold two constants of index types.
+macro_rules! bitwise {
+    ($($name:ident: $cpp:literal, $symbol:literal, $what:literal, $op:tt => $node:ident),+ $(,)?) => {
         $(
-            fn $name(a: Expr, loc: Location) -> Result<Expr> {
-                tvm_ffi::cached_global_func!($global).call_tuple((a, loc))?.try_into()
+            #[doc = concat!("C++ `", $cpp, "(a, b, loc)` (`", $symbol, "`).")]
+            fn $name(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
+                check_bitwise(&a, &b, $symbol, $what, (&INTEGER_OR_BOOL, INTEGER_OR_BOOL_CODES))?;
+                let (a, b) = math::match_types_at(a, b, &loc)?;
+                let dtype = prim_dtype(&a)?;
+                let index = fold::is_index_type(dtype) && fold::is_index_type(prim_dtype(&b)?);
+                if let (true, Some(x), Some(y)) = (index, int_value(&a), int_value(&b)) {
+                    return Ok(int_imm_at(dtype, x $op y, &loc)?.into());
+                }
+                Ok(prim::$node::new_full(a, b, loc)?.into())
             }
         )+
     };
 }
 
-native_unary!(op_bitwise_not => "prim.bitwise_not");
+bitwise!(
+    op_bitwise_and: "bitwise_and", "&", "bitwise AND", & => BitwiseAnd,
+    op_bitwise_or: "bitwise_or", "|", "bitwise OR", | => BitwiseOr,
+    op_bitwise_xor: "bitwise_xor", "^", "bitwise XOR", ^ => BitwiseXor,
+);
+
+/// C++ `bitwise_neg(a, loc)` (`~`): an integer or boolean operand, never folded.
+fn op_bitwise_not(a: Expr, loc: Location) -> Result<Expr> {
+    check_operand(&a, "a", &INTEGER_OR_BOOL, INTEGER_OR_BOOL_CODES, || {
+        format!(
+            "Expected integer or boolean argument for ~ operator (bitwise NOT), but received {} of \
+             type {}",
+            repr(&a),
+            repr(&a.ty)
+        )
+    })?;
+    Ok(prim::BitwiseNot::new_full(a, loc)?.into())
+}
+
+/// The value of an integer constant.
+fn int_value(expr: &Expr) -> Option<&BigInt> {
+    expr.as_node::<IntImmObj>().map(|imm| &imm.value)
+}
 
 type BinaryOp = fn(Expr, Expr, Location) -> Result<Expr>;
 type UnaryOp = fn(Expr, Location) -> Result<Expr>;
@@ -261,14 +567,14 @@ fn unary(value: Ex, op: UnaryOp) -> Ex {
     value.map(|a| op(a, unknown_loc()?))
 }
 
-/// C++ `neg` (unary `-`), which has no global: a constant is negated in place, anything else
-/// becomes `MakeConst(a.ty(), 0) - a`.
+/// C++ `neg` (unary `-`): a constant is negated in place (a signed 64-bit one wraps), anything
+/// else becomes `MakeConst(a.ty(), 0) - a`.
 fn neg(a: Expr) -> Result<Expr> {
     let dtype = prim_dtype(&a)?;
     if let Some(imm) = a.as_node::<IntImmObj>() {
         let mut value = -&imm.value;
-        if dtype.code == DLDataTypeCode::kDLInt as u8 && dtype.bits >= 64 {
-            value = wrap_signed(value, dtype.bits)?;
+        if dtype.code == math::INT && dtype.bits >= 64 {
+            value = fold::fold_result(value, dtype);
         }
         return Ok(big_int_imm(dtype, value)?.into());
     }
@@ -278,28 +584,18 @@ fn neg(a: Expr) -> Result<Expr> {
     op_sub(make_const(dtype, 0)?, a, unknown_loc()?)
 }
 
-/// `GetFoldResult` for a signed type of `bits >= 64`: the value modulo `2^bits`, as signed.
-pub(super) fn wrap_signed(value: BigInt, bits: u8) -> Result<BigInt> {
-    if value.to_i64().is_some() {
-        return Ok(value);
-    }
-    let Some(value) = value.to_i128().filter(|_| bits < 128) else {
-        return Err(tvm_ffi::Error::new(
-            tvm_ffi::INTERNAL_ERROR,
-            "negating a constant wider than 127 bits is not supported",
-            "",
-        ));
-    };
-    let modulus = 1i128 << bits;
-    let wrapped = value.rem_euclid(modulus);
-    Ok(BigInt::from(if wrapped >= modulus >> 1 { wrapped - modulus } else { wrapped }))
-}
-
-/// C++ `logical_not` (`!a`), which has no global: folds a constant, else the raw `Not`.
+/// C++ `logical_not` (`!a`): a boolean operand, a constant folded, else the raw `Not`.
 fn logical_not(a: Expr) -> Result<Expr> {
-    match a.as_node::<IntImmObj>() {
-        Some(imm) => Ok(int_imm(prim_dtype(&a)?, imm.value.is_zero() as i128)?.into()),
-        None => Ok(crate::prim::Not::new(a)?.into()),
+    check_operand(&a, "a", &[math::BOOL], "DLDataTypeCode::kDLBool", || {
+        format!(
+            "Expected boolean argument for ! operator (logical NOT), but received {} of type {}",
+            repr(&a),
+            repr(&a.ty)
+        )
+    })?;
+    match fold::not(&a)? {
+        Some(folded) => Ok(folded),
+        None => Ok(prim::Not::new(a)?.into()),
     }
 }
 
@@ -626,17 +922,36 @@ impl PrimOps for Var {
     }
 }
 
-/// C++ `if_then_else(condition, t, f)`, folded when the condition is constant.
+/// C++ `if_then_else(condition, t, f)`: a boolean condition and matched values, folded when the
+/// condition is constant, else a `tirx.if_then_else` call typed as the values.
 pub fn if_then_else(condition: impl Into<Ex>, t: impl Into<Ex>, f: impl Into<Ex>) -> Ex {
     let (c, t, f) = (condition.into(), t.into(), f.into());
     match (c.0, t.0, f.0) {
-        (Ok(c), Ok(t), Ok(f)) => Ex(unknown_loc().and_then(|loc| {
-            tvm_ffi::cached_global_func!("prim._OpIfThenElse")
-                .call_tuple((c, t, f, loc))?
-                .try_into()
-        })),
+        (Ok(c), Ok(t), Ok(f)) => Ex(unknown_loc().and_then(|loc| if_then_else_at(c, t, f, loc))),
         (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Ex(Err(error)),
     }
+}
+
+fn if_then_else_at(condition: Expr, t: Expr, f: Expr, loc: Location) -> Result<Expr> {
+    if prim_dtype(&condition)?.code != math::BOOL {
+        let check = "cond.ty().MatchesCode(DLDataTypeCode::kDLBool)";
+        let message = "if_then_else only accept the condition to be boolean type.";
+        return Err(math::check_failed(INTERNAL_ERROR, check, message));
+    }
+    let (t, f) = math::match_types_at(t, f, &loc)?;
+    if let Some(value) = int_value(&condition) {
+        return Ok(if value.is_zero() { f } else { t });
+    }
+    let ty = t.ty.clone();
+    let call = Call::new_full(
+        Some(ty),
+        IF_THEN_ELSE.get()?.into(),
+        [condition, t, f].into_iter().collect(),
+        None,
+        tvm_ffi::Array::new(vec![]),
+        loc,
+    )?;
+    Ok(call.into())
 }
 
 /// The raw `Select(condition, t, f)` (C++ `prim::Select`), from operands under construction.
