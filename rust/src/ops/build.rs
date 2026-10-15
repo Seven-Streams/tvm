@@ -32,7 +32,7 @@ use crate::ir::{
     Location, Op, PrimType, PrimTypeObj, Range, RegionStmt, SeqStmt, SeqStmtObj, Stmt, StringImm,
     TensorLoad, Type, UnknownLoc, Var,
 };
-use crate::prim::{Add, Broadcast, Cast, Let, Mul, Not, Select, Sub};
+use crate::prim::{Add, Broadcast, Cast, Let, Mul, Not, Ramp, Select, Sub};
 use crate::tirx::Function;
 
 // ---------------------------------------------------------------------------------------------
@@ -86,38 +86,28 @@ pub fn int_imm(dtype: DLDataType, value: i128) -> Result<IntImm> {
 }
 
 pub(crate) fn big_int_imm(dtype: DLDataType, value: BigInt) -> Result<IntImm> {
-    tvm_ffi::cached_global_func!("ir.IntImm").call_tuple((dtype, value, unknown_loc()?))?.try_into()
+    int_imm_at(dtype, value, &unknown_loc()?)
+}
+
+/// `IntImm(dtype, value, loc)` through the native constructor.
+pub(crate) fn int_imm_at(dtype: DLDataType, value: BigInt, loc: &Location) -> Result<IntImm> {
+    tvm_ffi::cached_global_func!("ir.IntImm").call_tuple((dtype, value, loc.clone()))?.try_into()
 }
 
 /// `FloatImm(dtype, value)` through the native constructor.
 pub fn float_imm(dtype: DLDataType, value: f64) -> Result<FloatImm> {
-    tvm_ffi::cached_global_func!("ir.FloatImm")
-        .call_tuple((dtype, value, unknown_loc()?))?
-        .try_into()
+    float_imm_at(dtype, value, &unknown_loc()?)
+}
+
+/// `FloatImm(dtype, value, loc)` through the native constructor.
+pub(crate) fn float_imm_at(dtype: DLDataType, value: f64, loc: &Location) -> Result<FloatImm> {
+    tvm_ffi::cached_global_func!("ir.FloatImm").call_tuple((dtype, value, loc.clone()))?.try_into()
 }
 
 /// `prim::MakeConst(dtype, value)`, which has no global: an `IntImm` or `FloatImm` by type code,
-/// broadcast for a fixed-length vector type. An integer literal next to an expression is typed so.
+/// broadcast for a vector type. An integer literal next to an expression is typed so.
 pub fn make_const(dtype: DLDataType, value: i64) -> Result<Expr> {
-    let scalar = DLDataType { lanes: 1, ..dtype };
-    let element: Expr = match dtype.code {
-        // kDLInt, kDLUInt, kDLBool
-        0 | 1 | 6 => int_imm(scalar, value as i128)?.into(),
-        // kDLFloat, kDLBfloat, and the float8/6/4 codes
-        2 | 4 | 7..=17 => float_imm(scalar, value as f64)?.into(),
-        _ => {
-            return Err(tvm_ffi::Error::new(
-                tvm_ffi::INTERNAL_ERROR,
-                "cannot make const for this type",
-                "",
-            ))
-        }
-    };
-    if dtype.lanes == 1 {
-        return Ok(element);
-    }
-    let lanes: Expr = int32(dtype.lanes as i64)?.into();
-    Ok(Broadcast::new(element, lanes)?.into())
+    super::math::make_const(dtype, super::math::Value::Int(BigInt::from(value)), &unknown_loc()?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -391,6 +381,23 @@ impl Broadcast {
     pub fn new_full(value: impl IntoExpr, lanes: impl IntoExpr, loc: Location) -> Result<Self> {
         let (value, lanes) = (value.into_expr()?, lanes.into_expr()?);
         tvm_ffi::cached_global_func!("prim.Broadcast").call_tuple((value, lanes, loc))?.try_into()
+    }
+}
+
+impl Ramp {
+    /// C++ `Ramp(base, stride, lanes)`: the raw constructor.
+    pub fn new(base: impl IntoExpr, stride: impl IntoExpr, lanes: impl IntoExpr) -> Result<Self> {
+        Self::new_full(base, stride, lanes, unknown_loc()?)
+    }
+
+    pub fn new_full(
+        base: impl IntoExpr,
+        stride: impl IntoExpr,
+        lanes: impl IntoExpr,
+        loc: Location,
+    ) -> Result<Self> {
+        let (base, stride, lanes) = (base.into_expr()?, stride.into_expr()?, lanes.into_expr()?);
+        tvm_ffi::cached_global_func!("prim.Ramp").call_tuple((base, stride, lanes, loc))?.try_into()
     }
 }
 

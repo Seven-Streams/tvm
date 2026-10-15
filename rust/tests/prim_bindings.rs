@@ -208,7 +208,13 @@ fn other_nodes_round_trip() {
         .try_into()
         .unwrap();
     assert!(structural_equal(&ramp.base_, &o.x));
-    let rust = Ramp::new(loc(), ramp.ty.clone(), o.x.clone(), int_imm(&o, 2), int_imm(&o, 4));
+    let rust = Ramp::from_complete_fields(
+        loc(),
+        ramp.ty.clone(),
+        o.x.clone(),
+        int_imm(&o, 2),
+        int_imm(&o, 4),
+    );
     assert!(structural_equal(&rust, &ramp));
 
     let broadcast: Broadcast = global("prim.Broadcast")

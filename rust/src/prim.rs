@@ -31,6 +31,7 @@
 // tvm-ffi-stubgen(custom-new): prim.Let
 // tvm-ffi-stubgen(custom-new): prim.Mul
 // tvm-ffi-stubgen(custom-new): prim.Not
+// tvm-ffi-stubgen(custom-new): prim.Ramp
 // tvm-ffi-stubgen(custom-new): prim.Select
 // tvm-ffi-stubgen(custom-new): prim.Sub
 
@@ -1526,7 +1527,13 @@ impl RampObj {
 
 impl Ramp {
     /// Lossless complete-field allocation.
-    pub fn new(loc: Location, ty: Type, base_: Expr, stride: Expr, lanes: Expr) -> Self {
+    pub fn from_complete_fields(
+        loc: Location,
+        ty: Type,
+        base_: Expr,
+        stride: Expr,
+        lanes: Expr,
+    ) -> Self {
         let obj = RampObj::new(loc, ty, base_, stride, lanes);
         Self { base: ObjectArc::new(obj) }
     }

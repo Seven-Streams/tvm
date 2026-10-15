@@ -27,7 +27,11 @@
 //! C++, `/` and `%` are not defined: name the division (`truncdiv`, `floordiv`, `div`, ...).
 //! Comparisons and `&&` / `||` are [`PrimOps`] methods named after the C++ functions, because
 //! Rust's comparison traits return `bool`; so is `cast`, the folding C++ `cast()` (`Cast::new` is
-//! the raw node). Operators build an [`Ex`], which keeps the first error
+//! the raw node).
+//!
+//! Math (`math`). `cast`, the math functions (`floor`, `abs`, `isinf`, `pow`, `exp`, ...),
+//! `reinterpret`, and the type matching of binary operations ([`match_types`]) are written in
+//! Rust after their C++ definitions, with the same folding, checks and errors. Operators build an [`Ex`], which keeps the first error
 //! instead of panicking; `.expr()` turns it back into a `Result`:
 //!
 //! ```ignore
@@ -44,6 +48,8 @@
 
 mod arith;
 mod build;
+mod math;
 
 pub use arith::*;
 pub use build::*;
+pub use math::{fast_erf_float_expr, infinity, match_types};

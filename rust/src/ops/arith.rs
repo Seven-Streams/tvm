@@ -26,12 +26,11 @@ use std::ops::{
 use tvm_ffi::{BigInt, DLDataType, DLDataTypeCode, ObjectRefCore, Result};
 
 use super::build::{
-    big_int_imm, float_imm, int_imm, make_const, prim_dtype, scalar_dtype, unknown_loc,
+    big_int_imm, float_imm, int_imm, make_const, prim_dtype, scalar_dtype, unknown_loc, IntoExpr,
     IntoPrimType,
 };
-use crate::ir::{
-    Call, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, PrimType, TensorLoad, Var,
-};
+use super::math;
+use crate::ir::{Call, Expr, FloatImm, FloatImmObj, IntImm, IntImmObj, Location, TensorLoad, Type, Var};
 use crate::prim;
 
 // ---------------------------------------------------------------------------------------------
@@ -198,7 +197,6 @@ native_binary!(
     op_indexdiv => "prim._OpIndexDiv",
     op_indexmod => "prim._OpIndexMod",
     op_ceildiv => "prim._OpCeilDiv",
-    op_pow => "prim._OpPow",
     op_min => "prim._OpMin",
     op_max => "prim._OpMax",
     op_eq => "prim._OpEQ",
@@ -226,12 +224,7 @@ macro_rules! native_unary {
     };
 }
 
-native_unary!(
-    op_abs => "prim.abs",
-    op_floor => "prim.floor",
-    op_likely => "prim.likely",
-    op_bitwise_not => "prim.bitwise_not",
-);
+native_unary!(op_bitwise_not => "prim.bitwise_not");
 
 type BinaryOp = fn(Expr, Expr, Location) -> Result<Expr>;
 type UnaryOp = fn(Expr, Location) -> Result<Expr>;
@@ -252,9 +245,16 @@ fn binary_literal(lhs: impl Operand, rhs: Ex, op: BinaryOp) -> Ex {
     binary(lhs, rhs, op)
 }
 
-/// C++ `cast(value, t)`.
-fn op_cast(a: Expr, ty: PrimType, loc: Location) -> Result<Expr> {
-    tvm_ffi::cached_global_func!("prim._cast").call_tuple((a, ty, loc))?.try_into()
+/// A function of [`math`] on one expression.
+fn math_unary(value: Ex, f: fn(Expr, &Location) -> Result<Expr>) -> Ex {
+    value.map(|a| f(a, &unknown_loc()?))
+}
+
+/// A function of [`math`] on two expressions; a literal `rhs` converts as C++ converts it
+/// implicitly.
+fn math_binary(value: Ex, rhs: impl IntoExpr, f: fn(Expr, Expr, &Location) -> Result<Expr>) -> Ex {
+    let rhs = rhs.into_expr();
+    value.map(|a| f(a, rhs?, &unknown_loc()?))
 }
 
 fn unary(value: Ex, op: UnaryOp) -> Ex {
@@ -279,7 +279,7 @@ fn neg(a: Expr) -> Result<Expr> {
 }
 
 /// `GetFoldResult` for a signed type of `bits >= 64`: the value modulo `2^bits`, as signed.
-fn wrap_signed(value: BigInt, bits: u8) -> Result<BigInt> {
+pub(super) fn wrap_signed(value: BigInt, bits: u8) -> Result<BigInt> {
     if value.to_i64().is_some() {
         return Ok(value);
     }
@@ -397,6 +397,31 @@ unary_operators!(Ex, &Ex, Expr, &Expr, Var, &Var);
 // ---------------------------------------------------------------------------------------------
 // Named operations
 
+/// [`PrimOps`] methods for unary intrinsics; `true` marks those that take only floats.
+macro_rules! intrinsics {
+    ($($name:ident => $op:literal, $float_only:literal;)+) => {
+        $(
+            #[doc = concat!("C++ `", stringify!($name), "(a)` (`", $op, "`).")]
+            fn $name(&self) -> Ex {
+                self.to_ex().map(|a| math::intrinsic($op, a, $float_only, &unknown_loc()?))
+            }
+        )+
+    };
+}
+
+/// [`PrimOps`] methods for binary intrinsics, typed as the first argument.
+macro_rules! binary_intrinsics {
+    ($($name:ident => $op:literal;)+) => {
+        $(
+            #[doc = concat!("C++ `", stringify!($name), "(a, b)` (`", $op, "`).")]
+            fn $name(&self, rhs: impl IntoExpr) -> Ex {
+                let rhs = rhs.into_expr();
+                self.to_ex().map(|a| math::binary_intrinsic($op, a, rhs?, &unknown_loc()?))
+            }
+        )+
+    };
+}
+
 /// The C++ `PrimExpr` operations that are functions rather than operators. Each takes an
 /// expression or a literal on the right, typed as for the operators, and leaves `self` usable.
 pub trait PrimOps {
@@ -460,23 +485,11 @@ pub trait PrimOps {
     fn ceildiv(&self, rhs: impl Operand) -> Ex {
         binary(self.to_ex(), rhs, op_ceildiv)
     }
-    fn pow(&self, rhs: impl Operand) -> Ex {
-        binary(self.to_ex(), rhs, op_pow)
-    }
     fn min(&self, rhs: impl Operand) -> Ex {
         binary(self.to_ex(), rhs, op_min)
     }
     fn max(&self, rhs: impl Operand) -> Ex {
         binary(self.to_ex(), rhs, op_max)
-    }
-    fn abs(&self) -> Ex {
-        unary(self.to_ex(), op_abs)
-    }
-    fn floor(&self) -> Ex {
-        unary(self.to_ex(), op_floor)
-    }
-    fn likely(&self) -> Ex {
-        unary(self.to_ex(), op_likely)
     }
     /// C++ `~a`.
     fn bitwise_not(&self) -> Ex {
@@ -488,7 +501,110 @@ pub trait PrimOps {
     /// [`Cast::new`](crate::prim::Cast::new) builds in every case.
     fn cast(&self, ty: impl IntoPrimType) -> Ex {
         let ty = ty.into_prim_type();
-        self.to_ex().map(|a| op_cast(a, ty?, unknown_loc()?))
+        self.to_ex().map(|a| math::cast(a, ty?, &unknown_loc()?))
+    }
+    /// C++ `tirx::reinterpret(t, a)`: the bits of `a` as type `t`, a `PrimType` of the same size
+    /// or a pointer.
+    fn reinterpret(&self, ty: impl Into<Type>) -> Ex {
+        let ty = ty.into();
+        self.to_ex().map(|a| math::reinterpret(ty, a, &unknown_loc()?))
+    }
+
+    // Math functions (`src/ir/prim/math.cc`), written in Rust in [`math`].
+
+    /// C++ `floor(a)`: an integer is itself and a float constant is folded.
+    fn floor(&self) -> Ex {
+        math_unary(self.to_ex(), math::floor)
+    }
+    /// C++ `ceil(a)`, folded like `floor`.
+    fn ceil(&self) -> Ex {
+        math_unary(self.to_ex(), math::ceil)
+    }
+    /// C++ `round(a)`, folded like `floor`, a tie to even.
+    fn round(&self) -> Ex {
+        math_unary(self.to_ex(), math::round)
+    }
+    /// C++ `nearbyint(a)`, folded like `round`.
+    fn nearbyint(&self) -> Ex {
+        math_unary(self.to_ex(), math::nearbyint)
+    }
+    /// C++ `trunc(a)`, folded like `floor`.
+    fn trunc(&self) -> Ex {
+        math_unary(self.to_ex(), math::trunc)
+    }
+    /// C++ `abs(a)`: `select(a >= 0, a, -a)` for a signed integer, a call for a float, and an
+    /// unsigned integer itself; a constant is folded.
+    fn abs(&self) -> Ex {
+        math_unary(self.to_ex(), math::abs)
+    }
+    /// C++ `isnan(a)`.
+    fn isnan(&self) -> Ex {
+        math_unary(self.to_ex(), math::isnan)
+    }
+    /// C++ `isinf(a)`: false for an integer, `abs(a) == inf && !isnan(a)` for a float.
+    fn isinf(&self) -> Ex {
+        math_unary(self.to_ex(), math::isinf)
+    }
+    /// C++ `isfinite(a)`: `!isinf(a) && !isnan(a)`.
+    fn isfinite(&self) -> Ex {
+        math_unary(self.to_ex(), math::isfinite)
+    }
+    /// C++ `likely(a)`: an integer constant is itself.
+    fn likely(&self) -> Ex {
+        math_unary(self.to_ex(), math::likely)
+    }
+    /// C++ `assume(a)`.
+    fn assume(&self) -> Ex {
+        math_unary(self.to_ex(), math::assume)
+    }
+    /// C++ `pow(a, b)`: both sides matched, a float result. A literal `b` converts as in C++
+    /// (`PrimExpr(int)`).
+    fn pow(&self, rhs: impl IntoExpr) -> Ex {
+        math_binary(self.to_ex(), rhs, math::pow)
+    }
+    /// C++ `fmod(a, b)`, matched like `pow`.
+    fn fmod(&self, rhs: impl IntoExpr) -> Ex {
+        math_binary(self.to_ex(), rhs, math::fmod)
+    }
+    /// C++ `tirx::logaddexp(a, b)`: `log(exp(a) + exp(b))` of two matched floats.
+    fn logaddexp(&self, rhs: impl IntoExpr) -> Ex {
+        math_binary(self.to_ex(), rhs, math::logaddexp)
+    }
+
+    // The intrinsics (`TVM_DECLARE_INTRIN_UNARY` and friends): a call typed as the argument, a
+    // bfloat16 argument computed in float32.
+    intrinsics! {
+        exp => "prim.exp", false;
+        exp2 => "prim.exp2", false;
+        exp10 => "prim.exp10", false;
+        erf => "prim.erf", false;
+        sigmoid => "prim.sigmoid", false;
+        sqrt => "prim.sqrt", false;
+        rsqrt => "prim.rsqrt", false;
+        log => "prim.log", false;
+        log2 => "prim.log2", false;
+        log10 => "prim.log10", false;
+        log1p => "prim.log1p", false;
+        popcount => "prim.popcount", false;
+        tanh => "prim.tanh", true;
+        tan => "prim.tan", true;
+        cos => "prim.cos", true;
+        cosh => "prim.cosh", true;
+        sin => "prim.sin", true;
+        sinh => "prim.sinh", true;
+        asin => "prim.asin", true;
+        acos => "prim.acos", true;
+        atan => "prim.atan", true;
+        acosh => "prim.acosh", true;
+        asinh => "prim.asinh", true;
+        atanh => "prim.atanh", true;
+    }
+    binary_intrinsics! {
+        atan2 => "prim.atan2";
+        nextafter => "prim.nextafter";
+        copysign => "prim.copysign";
+        hypot => "prim.hypot";
+        ldexp => "prim.ldexp";
     }
 }
 
