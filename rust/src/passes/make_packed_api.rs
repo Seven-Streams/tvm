@@ -39,7 +39,7 @@ use crate::ir::{
     Bind, Call, DictAttrs, Evaluate, Expr, For, GlobalVarObj, If, IntImm, PtrType, PtrTypeObj,
     RegionStmt, Return, SeqStmt, Stmt, StringImm, Type, Var,
 };
-use crate::ops::{int_imm, prim_dtype, repr, undefined_vars, PrimOps};
+use crate::ops::{int_imm, repr, undefined_vars, PrimOps};
 use crate::prim::Cast;
 use crate::target::Target;
 use crate::tirx::op::{
@@ -120,7 +120,7 @@ impl ReturnRewriter {
     fn write_to_out(&self, value: Expr) -> Result<SeqStmt> {
         let (type_index, value) = convert_for_ffi(value)?;
         let store = |field: i32, value: Expr| -> Result<Stmt> {
-            let args = vec![self.result.clone().into(), i32_imm(0)?, i32_imm(field as i64)?, value];
+            let args = vec![Expr::from(&self.result), i32_imm(0)?, i32_imm(field as i64)?, value];
             let call = Call::new(scalar(INT, 32)?, ABI_FIELD_SET.get()?, args)?;
             Ok(Evaluate::new(call)?.into())
         };
@@ -138,7 +138,7 @@ fn convert_for_ffi(value: Expr) -> Result<(i64, Expr)> {
     if value.ty.as_node::<PtrTypeObj>().is_some() {
         return Ok((TypeIndex::kTVMFFIOpaquePtr as i64, value));
     }
-    let dtype = prim_dtype(&value)?;
+    let dtype = value.prim_dtype()?;
     let widened =
         |code: u8, bits: u8| -> Result<Expr> { Ok(Cast::new(&value, scalar(code, bits)?)?.into()) };
     Ok(match dtype.code {
@@ -172,7 +172,7 @@ impl SubroutineCallRewriter<'_> {
                 let null_handle = zero.reinterpret(PtrType::void()?).expr()?;
                 args.push(null_handle);
                 self.made_change = true;
-                return Ok(Call::new(call.ty.clone(), CALL_CPACKED.get()?, args)?.into());
+                return Ok(Call::new(&call.ty, CALL_CPACKED.get()?, args)?.into());
             }
         }
         Ok(call.into())
@@ -228,18 +228,18 @@ fn make_packed_function(func: Function) -> Result<Function> {
     let int32: Type = scalar(INT, 32)?.into();
     let self_handle = Var::new("self_handle", PtrType::void()?)?;
     let packed_args = Var::new("args", PtrType::void()?)?;
-    let num_packed_args = Var::new("num_args", int32.clone())?;
+    let num_packed_args = Var::new("num_args", &int32)?;
     let result = Var::new("result", PtrType::void()?)?;
-    let device_id = Var::new("dev_id", int32.clone())?;
+    let device_id = Var::new("dev_id", &int32)?;
     let device_type: Expr = int_imm(scalar(INT, 32)?.dtype, target_device_type as i128)?.into();
 
     let mut binder = AbiBinder::new(
         &name_hint,
         &func.params,
-        packed_args.clone(),
+        &packed_args,
         &num_packed_args,
-        device_type.clone(),
-        device_id.clone().into(),
+        &device_type,
+        &device_id,
     )?;
     binder.decode_all_params()?;
     let mut binding = binder.finalize()?;
@@ -265,15 +265,15 @@ fn make_packed_function(func: Function) -> Result<Function> {
     )?
     .into();
     if need_set_device && target_device_type != DL_CPU {
-        let status = Var::new("set_device_status", int32.clone())?;
+        let status = Var::new("set_device_status", &int32)?;
         let set_device_args = vec![
             StringImm::new("TVMBackendSetDevice")?.into(),
             device_type.clone(),
-            device_id.clone().into(),
+            Expr::from(&device_id),
         ];
-        let set_device = Call::new(int32.clone(), CALL_EXTERN.get()?, set_device_args)?;
+        let set_device = Call::new(&int32, CALL_EXTERN.get()?, set_device_args)?;
         let set_device: Stmt = Bind::new(status.clone(), set_device)?.into();
-        let raise = Call::new(int32.clone(), THROW_LAST_ERROR.get()?, vec![])?;
+        let raise = Call::new(&int32, THROW_LAST_ERROR.get()?, vec![])?;
         let raise = SeqStmt::new(vec![Evaluate::new(raise)?.into()])?;
         let check_status: Stmt = If::new(status.not_equal(i32_imm(0)?), raise, None)?.into();
         body = SeqStmt::new(vec![set_device, check_status, body])?.into();
@@ -298,7 +298,7 @@ fn make_packed_function(func: Function) -> Result<Function> {
     let body = SeqStmt::from_stmt(body)?;
     let params = Array::new(vec![self_handle, packed_args, num_packed_args, result]);
 
-    let undefined = undefined_vars(&body.clone().into(), &params)?;
+    let undefined = undefined_vars(&Stmt::from(&body), &params)?;
     check_cmp!(
         undefined.len(),
         ==,

@@ -63,6 +63,7 @@ mod build;
 mod fold;
 mod math;
 mod native;
+pub mod pattern;
 
 pub use arith::*;
 pub use build::*;

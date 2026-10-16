@@ -29,20 +29,21 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    bail, dispatch, structural_mutate, structural_walk, Any, AnyView, Array, BigInt, DefRegionKind,
-    Mutator, ObjectCore, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String, WalkOrder,
-    WalkResult, INTERNAL_ERROR, TYPE_ERROR,
+    bail, dispatch, structural_mutate, structural_walk, Any, AnyCompatible, AnyView, Array,
+    DefRegionKind, Mutator, ObjectCore, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
+    String, WalkOrder, WalkResult, INTERNAL_ERROR, TYPE_ERROR,
 };
 
 use super::side_effect::{side_effect, PURE};
 use super::substitute_dtype::{is_tensor_var, substitute_with_dtype_legalization};
-use super::util::{MutatorExt, function_pass, get_attr, int_imm, prim_dtype, prim_type};
+use super::util::{MutatorExt, function_pass, get_attr, int_imm, prim_type};
 use crate::ir::{
     Bind, Call, CallObj, Expr, For, IntImmObj, PrimType, PrimTypeObj, PtrType, PtrTypeObj, Range,
     RegionStmt, SeqStmt, Stmt, StringImmObj, TensorLoad, TensorStore, Var, VarObj,
 };
+use crate::ops::pattern::{ramp, PVar, Pattern};
 use crate::ops::{repr, PrimOps};
-use crate::prim::{Ramp, RampObj};
+use crate::prim::Ramp;
 use crate::runtime::MemoryScope;
 use crate::sym::{detect_linear_equation, Analyzer};
 use crate::target::Target;
@@ -75,32 +76,25 @@ fn as_tensor_var(expr: &Expr) -> Result<ObjectIdentity> {
 }
 
 /// `as_or_throw<PrimVar>()`: a `Var`, not a subclass, of a primitive type.
-fn as_prim_var(expr: &Expr) -> Result<Var> {
-    let is_prim_var = AnyView::from(expr).type_index() == VarObj::type_index()
+fn as_prim_var(expr: impl Into<Expr>) -> Result<Var> {
+    let expr: Expr = expr.into();
+    let is_prim_var = AnyView::from(&expr).type_index() == VarObj::type_index()
         && expr.ty.as_node::<PrimTypeObj>().is_some();
     match is_prim_var {
-        true => Ok(expr.clone().try_cast()?),
+        true => Ok(expr.try_cast()?),
         false => bail!(TYPE_ERROR, "expected a PrimVar"),
     }
 }
 
 /// The lanes of a fixed-length type (`PrimType::lanes()`).
 fn lanes(expr: &Expr) -> Result<i64> {
-    let lanes = prim_dtype(expr)?.lanes as i16;
+    let lanes = expr.prim_dtype()?.lanes as i16;
     match lanes < 0 {
         true => {
             bail!(INTERNAL_ERROR, "Can't fetch the lanes of a scalable vector at a compile time.")
         }
         false => Ok(lanes as i64),
     }
-}
-
-/// A `ramp(base, 1, lanes)` match: the base of a unit-stride ramp of `lanes` lanes.
-fn unit_ramp_base(index: &Expr, lanes: i64) -> Option<Expr> {
-    let ramp = index.as_node::<RampObj>()?;
-    let is =
-        |e: &Expr, v: i64| e.as_node::<IntImmObj>().is_some_and(|imm| imm.value == BigInt::from(v));
-    (is(&ramp.stride, 1) && is(&ramp.lanes, lanes)).then(|| ramp.base_.clone())
 }
 
 /// The hardware axis a lexical `launch_thread` defines.
@@ -137,7 +131,7 @@ fn normalize_warp_index(
         if !is_other_tx {
             return Ok(None);
         }
-        let warp_index = as_prim_var(&warp_index.clone().into())?;
+        let warp_index = as_prim_var(warp_index)?;
         let ty: PrimType = var.ty.clone().try_cast()?;
         Ok(Some(warp_index.cast(ty).expr()?))
     })
@@ -145,7 +139,7 @@ fn normalize_warp_index(
 
 /// The tag and extent of a `launch_thread` region.
 fn launch_binding(op: &RegionStmt) -> Result<(Var, ThreadBinding)> {
-    let var = as_prim_var(&op.body_params.get(0)?.into())?;
+    let var = as_prim_var(op.body_params.get(0)?)?;
     let tag = op.args.get(0)?;
     let tag = match tag.as_node::<StringImmObj>() {
         Some(tag) => tag.value.clone(),
@@ -274,7 +268,7 @@ impl WarpStoreCoeffFinder<'_> {
         let warp_index =
             self.warp_index("Warp memory store must be inside a threadIdx.x launch")?;
         let normalized = normalize_warp_index(index, &self.active, &warp_index, self.aliases)?;
-        let vars = Array::new(vec![as_prim_var(&warp_index.clone().into())?]);
+        let vars = Array::new(vec![as_prim_var(&warp_index)?]);
         let m = detect_linear_equation(&normalized, &vars)?;
         check_cmp!(
             m.len(),
@@ -369,17 +363,16 @@ impl WarpStoreCoeffFinder<'_> {
         let mut index = op.indices.get(0)?;
         let value_lanes = lanes(&op.value)?;
         if value_lanes != 1 {
-            let base = unit_ramp_base(&index, value_lanes);
+            let base = PVar::expr();
             check!(
-                base.is_some(),
+                ramp(&base, 1, value_lanes).matches(&index),
                 INTERNAL_ERROR,
                 "sym::ramp(base, 1, value_ty.lanes()).Match(index)",
                 "LowerWarpMemory failed due to store index={}, can only handle continuous store",
                 repr(&index)
             );
-            let base = base.expect("checked above");
-            self.update_pattern(&base)?;
-            index = base;
+            self.update_pattern(&base.get())?;
+            index = base.get();
         }
         self.update_pattern(&index)?;
         Ok(WalkResult::Skip)
@@ -480,7 +473,7 @@ impl<'a> WarpAccessRewriter<'a> {
 
         let var = &alloc.var;
         let var_ty = var.ty.as_node::<TensorTypeObj>().expect("a tensor variable");
-        let elem_offset: crate::ir::Expr = int_imm(prim_dtype(&var_ty.elem_offset)?, 0)?.into();
+        let elem_offset: crate::ir::Expr = int_imm(var_ty.elem_offset.prim_dtype()?, 0)?.into();
         let local_ty = TensorType::from_complete_fields(
             var_ty.loc.clone(),
             var_ty.dtype.clone(),
@@ -492,7 +485,7 @@ impl<'a> WarpAccessRewriter<'a> {
             var_ty.offset_factor,
             var_ty.layout.clone(),
         );
-        let new_tensor = Var::new_full(var.name.clone(), local_ty, var.loc.clone())?;
+        let new_tensor = Var::new_full(var.name.clone(), local_ty, &var.loc)?;
         self.new_tensor = Some(new_tensor.clone());
 
         let rewritten_body: Stmt = structural_mutate(body, &mut self)?.try_into()?;
@@ -507,9 +500,9 @@ impl<'a> WarpAccessRewriter<'a> {
             Array::new(args),
             call.attrs.clone(),
             Array::new(vec![new_ty]),
-            call.loc.clone(),
+            &call.loc,
         )?;
-        let bind = Bind::new_full(new_tensor, new_call, alloc.loc.clone())?;
+        let bind = Bind::new_full(new_tensor, new_call, &alloc.loc)?;
         Ok(SeqStmt::new(vec![bind.into(), rewritten_body])?.into())
     }
 
@@ -535,18 +528,17 @@ impl<'a> WarpAccessRewriter<'a> {
     fn split_index_by_group(&self, original: &Expr) -> Result<(Expr, Expr)> {
         let warp_index = self.warp_index()?;
         let index = normalize_warp_index(original, &self.active, &warp_index, self.aliases)?;
-        let index_dtype = prim_dtype(&index)?;
+        let index_dtype = index.prim_dtype()?;
         let index_lanes = lanes(&index)?;
         if index_lanes != 1 {
-            let base = unit_ramp_base(&index, index_lanes);
+            let base = PVar::expr();
             check!(
-                base.is_some(),
+                ramp(&base, 1, index_lanes).matches(&index),
                 INTERNAL_ERROR,
                 "sym::ramp(base, 1, index_ty.lanes()).Match(index)"
             );
-            let base = base.expect("checked above");
-            let (local_index, group) = self.split_index_by_group(&base)?;
-            let one = int_imm(prim_dtype(&local_index)?, 1)?;
+            let (local_index, group) = self.split_index_by_group(&base.get())?;
+            let one = int_imm(local_index.prim_dtype()?, 1)?;
             let local_index = Ramp::new(local_index, one, index_lanes as i32)?.into();
             return Ok((local_index, group));
         }
@@ -583,7 +575,7 @@ impl<'a> WarpAccessRewriter<'a> {
             Array::new(args),
             op.attrs.clone(),
             Array::new(vec![]),
-            op.loc.clone(),
+            &op.loc,
         )?;
         Ok(call.into())
     }
@@ -620,7 +612,7 @@ impl WarpAccessRewriter<'_> {
             op.attrs.clone(),
             body,
             op.result_vars.clone(),
-            op.loc.clone(),
+            &op.loc,
         )?;
         Ok(region.into())
     }
@@ -658,11 +650,12 @@ impl WarpAccessRewriter<'_> {
     fn mutate_store(&mut self, op: TensorStore, m: &mut Mutator) -> Result<Any> {
         let value: Expr = m.mutate_as(self, &op.value)?;
         let indices: Array<Expr> = m.mutate_as(self, &op.indices)?;
-        let mut store = op.clone();
-        if !value.same_as(&op.value) || !indices.same_as(&op.indices) {
-            store =
-                TensorStore::from_complete_fields(op.loc.clone(), op.dest.clone(), indices, value);
-        }
+        let mut store = match value.same_as(&op.value) && indices.same_as(&op.indices) {
+            true => op,
+            false => {
+                TensorStore::from_complete_fields(op.loc.clone(), op.dest.clone(), indices, value)
+            }
+        };
         if as_tensor_var(&store.dest).is_ok_and(|id| self.is_tensor(&id)) {
             check_cmp!(
                 store.indices.len(),
@@ -722,8 +715,8 @@ impl WarpAccessRewriter<'_> {
             repr(&local_index)
         );
         let local: Expr =
-            TensorLoad::new_full(self.new_tensor(), vec![local_index], load.loc.clone())?.into();
-        if self.analyzer.can_prove_equal(&group, &warp_index.clone().into())? {
+            TensorLoad::new_full(self.new_tensor(), vec![local_index], &load.loc)?.into();
+        if self.analyzer.can_prove_equal(&group, &warp_index.into())? {
             return Ok(local.into());
         }
         let uint32 = prim_type(tvm_ffi::DLDataType { code: 1, bits: 32, lanes: 1 })?;
@@ -735,7 +728,7 @@ impl WarpAccessRewriter<'_> {
             super::util::int32(self.width)?.into(),
             super::util::int32(self.warp_size)?.into(),
         ];
-        Ok(Call::new(local.ty.clone(), GPU_WARP_SHUFFLE.get()?, args)?.into())
+        Ok(Call::new(&local.ty, GPU_WARP_SHUFFLE.get()?, args)?.into())
     }
 }
 
@@ -786,9 +779,9 @@ impl BindVarBoundInfo<'_> {
 
     fn walk_region(&mut self, op: RegionStmt) -> Result<WalkResult> {
         if LAUNCH_THREAD.is(&op.op) {
-            let var = as_prim_var(&op.body_params.get(0)?.into())?;
+            let var = as_prim_var(op.body_params.get(0)?)?;
             let extent = op.args.get(1)?;
-            let zero = int_imm(prim_dtype(&extent)?, 0)?;
+            let zero = int_imm(extent.prim_dtype()?, 0)?;
             self.analyzer.bind_range(&var, &Range::from_min_extent(zero, extent)?)?;
         }
         Ok(WalkResult::Advance)
@@ -850,7 +843,7 @@ impl WarpMemoryRewriter {
             op.attrs.clone(),
             body,
             op.result_vars.clone(),
-            op.loc.clone(),
+            &op.loc,
         )?;
         Ok(region.into())
     }
@@ -894,7 +887,7 @@ impl WarpMemoryRewriter {
         if !changed {
             return Ok(op.into());
         }
-        Ok(SeqStmt::new_full(new_seq, op.loc.clone())?.into())
+        Ok(SeqStmt::new_full(new_seq, &op.loc)?.into())
     }
 
     /// Expressions are not visited.
@@ -928,7 +921,7 @@ impl UpdatePointerStorageScope {
                     ty.offset_factor,
                     ty.layout.clone(),
                 );
-                Var::new_full(var.name.clone(), ty, var.loc.clone())?
+                Var::new_full(var.name.clone(), ty, &var.loc)?
             } else {
                 let ptr = var.ty.as_node::<PtrTypeObj>();
                 check!(
@@ -938,8 +931,8 @@ impl UpdatePointerStorageScope {
                     "The provided variable is not of pointer type"
                 );
                 let ptr = ptr.expect("checked above");
-                let ty = PtrType::new(ptr.element_type.clone(), scope.clone())?;
-                Var::new_full(var.name.clone(), ty, var.loc.clone())?
+                let ty = PtrType::new(&ptr.element_type, scope.clone())?;
+                Var::new_full(var.name.clone(), ty, &var.loc)?
             };
             remap.insert(ObjectIdentity::of(var), replacement);
         }
@@ -969,7 +962,7 @@ fn reinfer_call_type(call: Expr) -> Result<Expr> {
 impl UpdatePointerStorageScope {
     fn mutate_var(&mut self, var: Var, m: &mut Mutator) -> Result<Any> {
         match self.remap.get(&ObjectIdentity::of(&var)) {
-            Some(replacement) => Ok(replacement.clone().into()),
+            Some(replacement) => Ok(replacement.to_any()),
             None => m.default_mutate(self, &var),
         }
     }
@@ -995,7 +988,8 @@ impl UpdatePointerStorageScope {
     }
 
     fn mutate_call(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
-        let original: Expr = op.clone().into();
+        let is_data_ptr = TENSOR_DATA_PTR.is(&op.op);
+        let original: Expr = op.into();
         let result: Expr = m.default_mutate_as(self, &original)?;
         if let Some(scope) = self.tensor_scopes.get(&ObjectIdentity::of(&original)).cloned() {
             let call = result.as_node::<CallObj>().expect("a call mutates to a call");
@@ -1029,7 +1023,7 @@ impl UpdatePointerStorageScope {
             }
             return Ok(result.into());
         }
-        if !TENSOR_DATA_PTR.is(&op.op) {
+        if !is_data_ptr {
             return Ok(result.into());
         }
         Ok(reinfer_call_type(result)?.into())

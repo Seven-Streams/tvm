@@ -40,8 +40,7 @@ use crate::ir::{
     PrimTypeObj, PtrType, PtrTypeObj, SeqStmt, Stmt, StringImm, Type, Var, VarObj,
 };
 use crate::ops::{
-    if_then_else, int32, int_imm, make_const, prim_dtype, prim_type, repr, structural_equal, Ex,
-    PrimOps,
+    if_then_else, int32, int_imm, make_const, prim_type, repr, structural_equal, Ex, PrimOps,
 };
 use crate::prim::op::IF_THEN_ELSE;
 use crate::prim::{
@@ -234,7 +233,7 @@ fn tensor_type(var: &Var) -> Option<TensorType> {
 fn index_type(ty: &TensorTypeObj) -> Result<PrimType> {
     match ty.shape.len() {
         0 => scalar(INT, 64),
-        _ => Ok(ty.shape.get(0)?.ty.clone().try_cast()?),
+        _ => ty.shape.get(0)?.prim_ty(),
     }
 }
 
@@ -244,11 +243,13 @@ impl AbiBinder {
     pub(crate) fn new(
         func_name: &str,
         params: &Array<Var>,
-        packed_args: Var,
+        packed_args: impl Into<Var>,
         num_packed_args: &Var,
-        device_type: Expr,
-        device_id: Expr,
+        device_type: impl Into<Expr>,
+        device_id: impl Into<Expr>,
     ) -> Result<Self> {
+        let (packed_args, device_type, device_id) =
+            (packed_args.into(), device_type.into(), device_id.into());
         let mut param_names = HashMap::new();
         let mut entries = Vec::new();
         for (i, param) in params.iter().enumerate() {
@@ -299,7 +300,7 @@ impl AbiBinder {
         let parts = binder.message(&["Expected ", &num_args.to_string(), " arguments"], &["`"])?;
         binder.emit_assert(count, "TypeError", parts)?;
         if num_args > 0 {
-            let null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![binder.packed_args.clone().into()])?;
+            let null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![Expr::from(&binder.packed_args)])?;
             let parts = binder.message(&["args pointer is NULL"], &["`"])?;
             binder.emit_assert((!Ex::from(null)).expr()?, "TypeError", parts)?;
         }
@@ -379,7 +380,7 @@ impl AbiBinder {
         path: &Path,
         with_lets: bool,
     ) -> Result<bool> {
-        check!(prim_dtype(arg)? == prim_dtype(value)?, INTERNAL_ERROR, "arg.ty() == value.ty()");
+        check!(arg.prim_dtype()? == value.prim_dtype()?, INTERNAL_ERROR, "arg.ty() == value.ty()");
         if arg.as_node::<VarObj>().is_none() {
             let condition = self.simplify(arg.equal(value))?;
             if is_const_int(&condition, 0) {
@@ -406,7 +407,7 @@ impl AbiBinder {
             let bound = if with_lets { arg.clone() } else { value.clone() };
             self.var_defs.insert(key, VarDef { value: bound, first_def_path: path.clone() });
             if with_lets {
-                self.init_nest.push(Bind::new(var, value.clone())?.into());
+                self.init_nest.push(Bind::new(var, value)?.into());
             }
             return Ok(true);
         };
@@ -466,7 +467,7 @@ impl AbiBinder {
         };
         let (previous, first_path) = (def.value.clone(), def.first_def_path.clone());
         let uint64 = scalar(UINT, 64)?;
-        let previous = call(uint64.clone(), &REINTERPRET, vec![previous])?;
+        let previous = call(&uint64, &REINTERPRET, vec![previous])?;
         let current = call(uint64, &REINTERPRET, vec![value])?;
         let condition = self.simplify(previous.equal(&current))?;
         if is_const_int(&condition, 0) {
@@ -560,13 +561,13 @@ impl AbiBinder {
     /// `LoadTVMFFIAnyUnionValue`: the union value of argument `index` as `ty`.
     fn load_union_value(&self, index: i64, ty: &Type) -> Result<Expr> {
         let args = vec![
-            self.packed_args.clone().into(),
+            Expr::from(&self.packed_args),
             i32_imm(index)?,
             i32_imm(FFI_ANY_UNION_VALUE as i64)?,
         ];
         if let Ok(prim) = ty.clone().try_cast::<PrimType>() {
             let api = api_type(&prim)?;
-            let value = call(api.clone(), &ABI_FIELD_GET, args)?;
+            let value = call(&api, &ABI_FIELD_GET, args)?;
             if api.dtype != prim.dtype {
                 return Ok(crate::prim::Cast::new(value, prim)?.into());
             }
@@ -579,11 +580,11 @@ impl AbiBinder {
             "Packed union values must have primitive or pointer type, but got {}",
             repr(ty)
         );
-        call(ty.clone(), &ABI_FIELD_GET, args)
+        call(ty, &ABI_FIELD_GET, args)
     }
 
     fn load_prim(&self, index: i64, ty: &PrimType) -> Result<Expr> {
-        self.load_union_value(index, &ty.clone().into())
+        self.load_union_value(index, &Type::from(ty))
     }
 
     /// `DecodeParamOpaqueHandle`: a tensor or a pointer, skipping the object header of a tensor.
@@ -645,14 +646,15 @@ impl AbiBinder {
     fn decode_param(&mut self, index: i64) -> Result<()> {
         let param = self.params[index as usize].clone();
         let name = param.name.as_str().to_string();
-        let type_index: Expr = Var::new(format!("{name}.type_index"), scalar(INT, 32)?)?.into();
+        let type_index_var = Var::new(format!("{name}.type_index"), scalar(INT, 32)?)?;
+        let type_index = Expr::from(&type_index_var);
         let args = vec![
-            self.packed_args.clone().into(),
+            Expr::from(&self.packed_args),
             i32_imm(index)?,
             i32_imm(FFI_ANY_TYPE_INDEX as i64)?,
         ];
         let load = call(scalar(INT, 32)?, &ABI_FIELD_GET, args)?;
-        self.init_nest.push(Bind::new(type_index.clone().try_cast()?, load)?.into());
+        self.init_nest.push(Bind::new(type_index_var, load)?.into());
         let path = vec![Step::Item(index)];
         if param.ty.as_node::<TensorTypeObj>().is_some() {
             let handle = Var::new(format!("{name}.handle"), PtrType::void()?)?;
@@ -663,7 +665,7 @@ impl AbiBinder {
         }
         if param.ty.as_node::<PtrTypeObj>().is_some() {
             let value = self.decode_opaque_handle(index, &type_index)?;
-            let pointer = call(param.ty.clone(), &REINTERPRET, vec![value])?;
+            let pointer = call(&param.ty, &REINTERPRET, vec![value])?;
             self.bind_pointer(&param, pointer, &path, true)?;
             return Ok(());
         }
@@ -695,7 +697,7 @@ impl AbiBinder {
             let path = vec![Step::Item(index as i64), Step::Name(name.clone())];
             let arg_name = format!("{}.{name}", self.func_name);
             let data = self.decode_dl_tensor(&param, &tensor, &handle, &arg_name, &path)?;
-            let ty: Type = tensor.clone().into();
+            let ty = Type::from(&tensor);
             let declared = Call::new_full(
                 Some(ty.clone()),
                 DECL_TENSOR.get()?.into(),
@@ -709,7 +711,7 @@ impl AbiBinder {
             for extent in tensor.shape.iter() {
                 size *= extent;
             }
-            let alignment_args = vec![param.clone().into(), i32_imm(tensor.data_alignment as i64)?];
+            let alignment_args = vec![Expr::from(&param), i32_imm(tensor.data_alignment as i64)?];
             let alignment: Stmt =
                 Evaluate::new(call(void()?, &ASSUME_ALIGNED, alignment_args)?)?.into();
             let aligned_storage =
@@ -737,8 +739,8 @@ impl AbiBinder {
     /// `DLTensorGetFieldPtr`: bind the shape or strides pointer of a DLTensor.
     fn field_ptr(&mut self, handle: &Var, field: i32, name: &str) -> Result<Var> {
         let pointer_type = PtrType::new(scalar(INT, 64)?, MemoryScope::global()?)?;
-        let ptr = Var::new(name, pointer_type.clone())?;
-        let args = vec![handle.clone().into(), i32_imm(0)?, i32_imm(field as i64)?];
+        let ptr = Var::new(name, &pointer_type)?;
+        let args = vec![Expr::from(handle), i32_imm(0)?, i32_imm(field as i64)?];
         let load = call(pointer_type, &ABI_FIELD_GET, args)?;
         self.init_nest.push(Bind::new(ptr.clone(), load)?.into());
         Ok(ptr)
@@ -746,7 +748,7 @@ impl AbiBinder {
 
     /// `LoadInt64ArrayElem`: `ptr[index]` of a shape or strides array.
     fn load_element(&self, ptr: &Var, index: i64) -> Result<Expr> {
-        let args = vec![ptr.clone().into(), i32_imm(index)?, i32_imm(INT64_ARRAY_ELEM as i64)?];
+        let args = vec![Expr::from(ptr), i32_imm(index)?, i32_imm(INT64_ARRAY_ELEM as i64)?];
         call(scalar(INT, 64)?, &ABI_FIELD_GET, args)
     }
 
@@ -799,7 +801,7 @@ impl AbiBinder {
     ) -> Result<()> {
         let mut stride_from_shape = Ex::from(int32(1));
         for k in (0..tensor.strides.len()).rev() {
-            let extent_ty: PrimType = tensor.shape.get(k)?.ty.clone().try_cast()?;
+            let extent_ty: PrimType = tensor.shape.get(k)?.prim_ty()?;
             let explicit = self.load_element(strides, k as i64)?.cast(&extent_ty);
             let stride_path = extend(&extend(path, Step::Attr("strides")), Step::Item(k as i64));
             let value = if_then_else(strides_is_null, &stride_from_shape, explicit).expr()?;
@@ -824,16 +826,16 @@ impl AbiBinder {
         let index = Self::param_index(path);
         let index_str = index.to_string();
         let field = |kind: i32| -> Result<Vec<Expr>> {
-            Ok(vec![handle.clone().into(), i32_imm(0)?, i32_imm(kind as i64)?])
+            Ok(vec![Expr::from(handle), i32_imm(0)?, i32_imm(kind as i64)?])
         };
 
         // Null pointer.
-        let null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![handle.clone().into()])?;
+        let null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![Expr::from(handle)])?;
         self.emit_type_index_check(index, (!Ex::from(null)).expr()?, "Tensor")?;
 
         // ndim.
         let int32_ty = scalar(INT, 32)?;
-        let ndim = call(int32_ty.clone(), &ABI_FIELD_GET, field(DL_TENSOR_NDIM)?)?;
+        let ndim = call(&int32_ty, &ABI_FIELD_GET, field(DL_TENSOR_NDIM)?)?;
         let rank = tensor.shape.len() as i64;
         let expected_ndim = Ex::from(int_imm(int32_ty.dtype, rank as i128)).equal(&ndim).expr()?;
         let parts = self.message(
@@ -845,11 +847,11 @@ impl AbiBinder {
         // dtype.
         let element = tensor.dtype.dtype;
         let (uint8, uint16) = (scalar(UINT, 8)?, scalar(UINT, 16)?);
-        let code = call(uint8.clone(), &ABI_FIELD_GET, field(DL_TENSOR_TYPE_CODE)?)?
+        let code = call(&uint8, &ABI_FIELD_GET, field(DL_TENSOR_TYPE_CODE)?)?
             .equal(int_imm(uint8.dtype, element.code as i128)?);
-        let bits = call(uint8.clone(), &ABI_FIELD_GET, field(DL_TENSOR_TYPE_BITS)?)?
+        let bits = call(&uint8, &ABI_FIELD_GET, field(DL_TENSOR_TYPE_BITS)?)?
             .equal(int_imm(uint8.dtype, element.bits as i128)?);
-        let lanes = call(uint16.clone(), &ABI_FIELD_GET, field(DL_TENSOR_TYPE_LANES)?)?
+        let lanes = call(&uint16, &ABI_FIELD_GET, field(DL_TENSOR_TYPE_LANES)?)?
             .equal(int_imm(uint16.dtype, lanes_of(element)? as i128)?);
         let matches = code.logical_and(bits).logical_and(lanes).expr()?;
         let sub_byte =
@@ -867,7 +869,7 @@ impl AbiBinder {
         if !sub_byte {
             for k in 0..tensor.shape.len() {
                 let extent = tensor.shape.get(k)?;
-                let extent_ty: PrimType = extent.ty.clone().try_cast()?;
+                let extent_ty: PrimType = extent.prim_ty()?;
                 let value = self.load_element(&shape_ptr, k as i64)?.cast(&extent_ty).expr()?;
                 let shape_path = extend(&extend(path, Step::Attr("shape")), Step::Item(k as i64));
                 self.bind_scalar(&extent, &value, &shape_path, true)?;
@@ -877,7 +879,7 @@ impl AbiBinder {
         // strides.
         let strides_ptr =
             self.field_ptr(handle, DL_TENSOR_STRIDES, &format!("{arg_name}_strides"))?;
-        let strides_is_null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![strides_ptr.clone().into()])?;
+        let strides_is_null = call(scalar(BOOL, 8)?, &ISNULLPTR, vec![Expr::from(&strides_ptr)])?;
         if tensor.strides.is_empty() {
             self.bind_compact_strides(tensor, &buf_name, &strides_ptr, &strides_is_null, path)?;
         } else {
@@ -892,19 +894,19 @@ impl AbiBinder {
             let expected: Expr =
                 crate::ops::big_int_imm(uint64.dtype, &offset.value * &BigInt::from(data_bytes))?
                     .into();
-            let actual = call(uint64.clone(), &ABI_FIELD_GET, field(DL_TENSOR_BYTE_OFFSET)?)?;
+            let actual = call(&uint64, &ABI_FIELD_GET, field(DL_TENSOR_BYTE_OFFSET)?)?;
             self.bind_scalar(&expected, &actual, &byte_offset_path, true)?;
         } else {
             let size = make_const(uint64.dtype, data_bytes)?;
-            let divisible = call(uint64.clone(), &ABI_FIELD_GET, field(DL_TENSOR_BYTE_OFFSET)?)?
+            let divisible = call(&uint64, &ABI_FIELD_GET, field(DL_TENSOR_BYTE_OFFSET)?)?
                 .truncmod(&size)
                 .equal(make_const(uint64.dtype, 0)?)
                 .expr()?;
             let parts =
                 Array::new(vec![text("Tensor byte offset must be divisible by its element size")?]);
             self.emit_assert(divisible, "ValueError", parts)?;
-            let offset_ty: PrimType = tensor.elem_offset.ty.clone().try_cast()?;
-            let value = call(uint64.clone(), &ABI_FIELD_GET, field(DL_TENSOR_BYTE_OFFSET)?)?
+            let offset_ty: PrimType = tensor.elem_offset.prim_ty()?;
+            let value = call(&uint64, &ABI_FIELD_GET, field(DL_TENSOR_BYTE_OFFSET)?)?
                 .div(&size)
                 .cast(&offset_ty)
                 .expr()?;
@@ -931,8 +933,7 @@ impl AbiBinder {
         }
 
         // device.
-        let actual_device_type =
-            call(int32_ty.clone(), &ABI_FIELD_GET, field(DL_TENSOR_DEVICE_TYPE)?)?;
+        let actual_device_type = call(&int32_ty, &ABI_FIELD_GET, field(DL_TENSOR_DEVICE_TYPE)?)?;
         if let Some(device) = self.device_type.as_node::<IntImmObj>() {
             let device = device.value.to_i64().unwrap_or(0);
             let condition = self.simplify(Ex::from(i32_imm(device)?).equal(&actual_device_type))?;
@@ -980,7 +981,7 @@ impl AbiBinder {
         if tensor.data_alignment > 1 {
             let direct_address = self.direct_address()?;
             let as_handle = call(PtrType::void()?, &REINTERPRET, vec![typed_data.clone()])?;
-            let as_int = call(uint64.clone(), &REINTERPRET, vec![as_handle])?;
+            let as_int = call(&uint64, &REINTERPRET, vec![as_handle])?;
             let alignment = int_imm(uint64.dtype, tensor.data_alignment as i128)?;
             let aligned = as_int.truncmod(alignment).equal(int_imm(uint64.dtype, 0)?);
             let condition = Ex::from(&empty_alloc)

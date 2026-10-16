@@ -36,8 +36,8 @@ use super::convert_ssa::convert_ssa_module;
 use super::util::{MutatorExt, dict_with, get_attr, module_pass, with_attr};
 use crate::ir::{
     AssertStmt, Attrs, BaseFunc, Bind, Call, CallObj, DictAttrs, Evaluate, Expr, GlobalVar,
-    IRModule, IntImmObj, PrimType, PrimTypeObj, PtrTypeObj, RegionStmt, Return, SeqStmt, Stmt,
-    StringImm, TupleType, TupleTypeObj, Type, Var,
+    GlobalVarObj, IRModule, IntImmObj, PrimType, PrimTypeObj, PtrTypeObj, RegionStmt, Return,
+    SeqStmt, Stmt, StringImm, TupleType, TupleTypeObj, Type, Var,
 };
 use crate::ops::{int32, int32_dtype, int_imm, prim_type, undefined_vars, unknown_loc, Ex, PrimOps};
 use crate::runtime::MemoryScope;
@@ -159,7 +159,7 @@ impl DeviceRegionAnnotater {
                 attrs,
                 op.body.clone(),
                 op.result_vars.clone(),
-                op.loc.clone(),
+                &op.loc,
             )?;
             return Ok(region.into());
         }
@@ -285,7 +285,7 @@ impl HostDeviceSplitter<'_> {
         region: &RegionStmt,
     ) -> Result<Stmt> {
         let undefined: Vec<Var> =
-            undefined_vars(&body.clone().into(), &Array::new(vec![]))?.iter().collect();
+            undefined_vars(&Stmt::from(&body), &Array::new(vec![]))?.iter().collect();
         let tensors: Vec<Var> = undefined
             .iter()
             .filter(|var| var.ty.as_node::<TensorTypeObj>().is_some())
@@ -300,10 +300,9 @@ impl HostDeviceSplitter<'_> {
         let mut data_params: HashMap<ObjectIdentity, Var> = HashMap::new();
         let mut rewriter = KernelBodyRewriter { tensors: HashMap::new() };
         for param in &params {
-            match param.ty.clone().try_cast::<TensorType>() {
-                Ok(ty) => {
-                    let kernel_tensor =
-                        Var::new_full(param.name.clone(), ty.clone(), param.loc.clone())?;
+            match param.ty.as_node::<TensorTypeObj>() {
+                Some(ty) => {
+                    let kernel_tensor = Var::new_full(param.name.clone(), &param.ty, &param.loc)?;
                     let data_ptr = ty.data_ptr_type()?;
                     let data_param = Var::new(format!("{}_ptr", param.name.as_str()), data_ptr)?;
                     let data = param.tensor_data()?;
@@ -312,9 +311,9 @@ impl HostDeviceSplitter<'_> {
                     data_params.insert(ObjectIdentity::of(param), data_param);
                     rewriter.tensors.insert(ObjectIdentity::of(param), kernel_tensor);
                 }
-                Err(_) => {
+                None => {
                     kernel_params.push(param.clone());
-                    call_args.push(param.clone().into());
+                    call_args.push(Expr::from(param));
                 }
             }
         }
@@ -326,7 +325,7 @@ impl HostDeviceSplitter<'_> {
         let int32_ty: Type = prim_type(int32_dtype())?.into();
         let success: Expr = int32(0)?.into();
         let kernel_ret_type = if can_propagate_errors {
-            body = SeqStmt::new(vec![body, Return::new(success.clone())?.into()])?.into();
+            body = SeqStmt::new(vec![body, Return::new(&success)?.into()])?.into();
             int32_ty.clone()
         } else {
             void_type()?
@@ -363,25 +362,25 @@ impl HostDeviceSplitter<'_> {
             void_attrs,
             unknown_loc()?,
         )?;
-        device_func = with_attr(&device_func, TARGET, device_target.clone());
+        device_func = with_attr(&device_func, TARGET, device_target);
         device_func = with_attr(&device_func, NO_ALIAS, true);
         device_func = with_attr(&device_func, IS_GLOBAL_FUNC, true);
-        let cur_attrs = self.cur_func.attrs.clone();
+        let cur_attrs = &self.cur_func.attrs;
         if let Some(config) = get_attr(&region.attrs, BACKEND_CONFIG)? {
             device_func = with_attr(&device_func, BACKEND_CONFIG, config);
-        } else if let Some(config) = typed_attr::<String>(&cur_attrs, BACKEND_CONFIG)? {
+        } else if let Some(config) = typed_attr::<String>(cur_attrs, BACKEND_CONFIG)? {
             device_func = with_attr(&device_func, BACKEND_CONFIG, config);
         }
-        if let Some(namespace) = typed_attr::<String>(&cur_attrs, SCRIPT_NAMESPACE)? {
+        if let Some(namespace) = typed_attr::<String>(cur_attrs, SCRIPT_NAMESPACE)? {
             device_func = with_attr(&device_func, SCRIPT_NAMESPACE, namespace);
         }
-        if has_attr(&cur_attrs, S_TIR)? {
+        if has_attr(cur_attrs, S_TIR)? {
             device_func = with_attr(&device_func, S_TIR, true);
         }
-        if let Some(params) = typed_attr::<Array<String>>(&cur_attrs, KERNEL_LAUNCH_PARAMS)? {
+        if let Some(params) = typed_attr::<Array<String>>(cur_attrs, KERNEL_LAUNCH_PARAMS)? {
             device_func = with_attr(&device_func, KERNEL_LAUNCH_PARAMS, params);
         }
-        if let Some(inputs) = typed_attr::<i64>(&cur_attrs, NUM_INPUTS)? {
+        if let Some(inputs) = typed_attr::<i64>(cur_attrs, NUM_INPUTS)? {
             device_func = with_attr(&device_func, NUM_INPUTS, inputs);
         }
 
@@ -393,7 +392,7 @@ impl HostDeviceSplitter<'_> {
         }
         self.device_funcs.push((symbol.clone(), device_func));
         if can_propagate_errors {
-            let code = Var::new("kernel_error_code", int32_ty.clone())?;
+            let code = Var::new("kernel_error_code", &int32_ty)?;
             let kernel_call = call(int32_ty, symbol, call_args, None)?;
             let succeeded = code.equal(&success).expr()?;
             let assert_success: Stmt = AssertStmt::new(
@@ -637,7 +636,7 @@ fn collect_kernel_info(
     }
     // Dynamic shared memory is the last legacy launch operand.
     let mut dyn_shmem_size = None;
-    if let Some(inferred) = collector.inferred_shmem_size.clone() {
+    if let Some(inferred) = collector.inferred_shmem_size.take() {
         check!(
             allow_placeholder || !is_const_int(&inferred, 0),
             INTERNAL_ERROR,
@@ -652,7 +651,7 @@ fn collect_kernel_info(
         collector.info.launch_params.push(String::from(USE_DYN_SHARED_MEMORY));
     }
     collector.info.global_symbol = global_symbol;
-    for param in collector.info.launch_params.clone() {
+    for param in &collector.info.launch_params {
         if [USE_PDL, USE_COOPERATIVE_LAUNCH, USE_REQUIRED_BLOCK_DIMENSION].contains(&param.as_str())
         {
             continue;
@@ -683,7 +682,7 @@ fn make_cuda_kernel_launch(
         get_attr(&region.attrs, KERNEL_ATTRS)?.ok_or_else(|| missing(KERNEL_ATTRS))?.try_into()?;
     let info = collect_kernel_info(symbol, func, true)?;
     let mut host_stmts: Vec<Stmt> = Vec::new();
-    let mut required_bytes = info.dynamic_smem_requirement.clone();
+    let mut required_bytes = info.dynamic_smem_requirement;
     let has_pool = has_attr(&region.attrs, SMEM_REQUIRED)?;
     if let Some(pool_bytes) = get_attr(&region.attrs, SMEM_REQUIRED)? {
         let int64 = tvm_ffi::DLDataType { code: 0, bits: 64, lanes: 1 };
@@ -798,8 +797,8 @@ struct CalledFunctions {
 #[dispatch(walk)]
 impl CalledFunctions {
     fn walk_call(&mut self, call: Call) -> WalkResult {
-        if let Ok(gvar) = call.op.clone().try_cast::<GlobalVar>() {
-            self.called.insert(ObjectIdentity::of(&gvar));
+        if call.op.as_node::<GlobalVarObj>().is_some() {
+            self.called.insert(ObjectIdentity::of(&call.op));
         }
         WalkResult::Advance
     }
@@ -820,29 +819,29 @@ struct DeviceKernelMutator {
 impl DeviceKernelMutator {
     fn mutate_call(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
         let node: Call = m.default_mutate_as(self, &op)?;
-        let Ok(gvar) = op.op.clone().try_cast::<GlobalVar>() else { return Ok(node.into()) };
-        let name = gvar.name_hint.as_str();
-        let Some(info) = self.device_info.get(&ObjectIdentity::of(&gvar)).cloned() else {
+        let Some(gvar) = op.op.as_node::<GlobalVarObj>() else { return Ok(node.into()) };
+        let (id, name) = (ObjectIdentity::of(&op.op), gvar.name_hint.as_str());
+        let Some(info) = self.device_info.get(&id) else {
             bail!(
                 INTERNAL_ERROR,
                 "Check failed: (it != device_info_map_.end()) is false: CallNode attempted \
                  subroutine call to {name}, but {name} did not appear within the IRModule"
             );
         };
-        let callee_target = info.target.clone();
+        let callee_target = &info.target;
         let callee_is_kernel = !info.launch_params.is_empty();
         let caller_is_host = self.caller_host_target.is_some();
         let caller_target = match &self.caller_host_target {
-            Some(host) => host.clone(),
-            None => self.current_target.clone().expect("set for the function being rewritten"),
+            Some(host) => host,
+            None => self.current_target.as_ref().expect("set for the function being rewritten"),
         };
         // A host caller always launches a real device kernel.
         let force_kernel_launch = callee_is_kernel && caller_is_host;
         // CUDA helpers stay direct calls; they are specialized per kernel after splitting.
         if !caller_is_host
             && !callee_is_kernel
-            && kind_name(&caller_target)?.as_str() == "cuda"
-            && kind_name(&callee_target)?.as_str() == "cuda"
+            && kind_name(caller_target)?.as_str() == "cuda"
+            && kind_name(callee_target)?.as_str() == "cuda"
         {
             return Ok(node.into());
         }
@@ -851,7 +850,7 @@ impl DeviceKernelMutator {
                 return Ok(node.into());
             }
             if caller_target.device_type()? == callee_target.device_type()? {
-                self.extern_calls.insert(ObjectIdentity::of(&gvar));
+                self.extern_calls.insert(id);
                 let mut args: Vec<Expr> = vec![StringImm::new(name)?.into()];
                 args.extend(node.args.iter());
                 let ret_ty: Type = match is_void_type(&node.ty) {
@@ -882,7 +881,7 @@ impl DeviceKernelMutator {
                 param_map.insert(ObjectIdentity::of(&param), arg.clone());
             }
         }
-        self.kernel_launches.insert(ObjectIdentity::of(&gvar));
+        self.kernel_launches.insert(id);
         let mut call_args: Vec<Expr> = vec![StringImm::new(info.global_symbol.as_str())?.into()];
         call_args.extend(args);
         for launch_arg in &info.launch_args {
@@ -890,7 +889,7 @@ impl DeviceKernelMutator {
         }
         let node_ty: PrimType = match is_void_type(&node.ty) {
             true => prim_void()?,
-            false => node.ty.clone().try_cast()?,
+            false => node.prim_ty()?,
         };
         let is_void = node_ty.dtype == prim_void()?.dtype;
         let ret_ty: Type = match is_void {
@@ -912,14 +911,15 @@ impl DeviceKernelMutator {
         let full_target = function_target(&func)?;
         self.current_target = Some(without_host(&full_target)?);
         self.caller_host_target = host_of(&full_target)?;
-        let result = match func.body.clone() {
+        let body = func.body.clone();
+        let result = match &body {
             Some(body) => structural_mutate(body.clone(), &mut *self)
                 .and_then(SeqStmt::try_from)
-                .map(|new_body| match new_body.same_as(&body) {
-                    true => func.clone(),
+                .map(|new_body| match new_body.same_as(body) {
+                    true => func,
                     false => func.with_body(Some(new_body)),
                 }),
-            None => Ok(func.clone()),
+            None => Ok(func),
         };
         self.current_target = None;
         self.caller_host_target = None;
@@ -1046,10 +1046,11 @@ fn lower_device_kernel_launches(module: IRModule) -> Result<IRModule> {
             }
         }
     }
-    for (gvar, func) in &updates {
-        table.update(gvar, func.clone());
+    let changed = !updates.is_empty();
+    for (gvar, func) in updates {
+        table.update(&gvar, func);
     }
-    let module = if updates.is_empty() { module } else { table.into_module(&module) };
+    let module = if changed { table.into_module(&module) } else { module };
 
     let mut table = ModuleFunctions::of(&module);
     let mut updates = Vec::new();
@@ -1061,10 +1062,11 @@ fn lower_device_kernel_launches(module: IRModule) -> Result<IRModule> {
             }
         }
     }
-    for (gvar, func) in &updates {
-        table.update(gvar, func.clone());
+    let changed = !updates.is_empty();
+    for (gvar, func) in updates {
+        table.update(&gvar, func);
     }
-    Ok(if updates.is_empty() { module } else { table.into_module(&module) })
+    Ok(if changed { table.into_module(&module) } else { module })
 }
 
 pub fn split_host_device() -> Result<Pass> {

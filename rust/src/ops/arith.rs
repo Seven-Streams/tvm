@@ -27,8 +27,8 @@ use std::ops::{
 use tvm_ffi::{BigInt, DLDataType, DLDataTypeCode, ObjectRefCore, Result, INTERNAL_ERROR};
 
 use super::build::{
-    big_int_imm, float_imm, int32, int_imm_at, make_const, prim_dtype, scalar_dtype, unknown_loc,
-    IntoExpr, IntoPrimType,
+    big_int_imm, float_imm, int32, int_imm_at, make_const, scalar_dtype, unknown_loc, IntoExpr,
+    IntoPrimType,
 };
 use super::native::repr;
 use super::{fold, math};
@@ -56,7 +56,7 @@ impl Ex {
     /// The dtype a literal next to this expression takes (`MakeConst(this.ty(), v)`).
     fn dtype(&self) -> Result<DLDataType> {
         match &self.0 {
-            Ok(expr) => prim_dtype(expr),
+            Ok(expr) => expr.prim_dtype(),
             Err(error) => Err(error.clone()),
         }
     }
@@ -239,7 +239,7 @@ fn check_operand(
     codes: &str,
     message: impl FnOnce() -> String,
 ) -> Result<()> {
-    if accepted.contains(&prim_dtype(operand)?.code) {
+    if accepted.contains(&operand.prim_dtype()?.code) {
         return Ok(());
     }
     let condition = format!("{side}.ty().MatchesCode({codes})");
@@ -336,7 +336,7 @@ fn op_ceildiv(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
     check_integer(&a, &b)?;
     let (a, b) = math::match_types_at(a, b, &loc)?;
     let sum = op_add(a, b.clone(), unknown_loc()?)?;
-    let one = make_const(prim_dtype(&sum)?, 1)?;
+    let one = make_const(sum.prim_dtype()?, 1)?;
     let numerator = op_sub(sum, one, unknown_loc()?)?;
     match fold::floordiv(&numerator, &b)? {
         Some(folded) => Ok(folded),
@@ -437,8 +437,8 @@ fn fold_shift(
     shift: impl FnOnce(&BigInt, &BigInt) -> Result<BigInt>,
     loc: &Location,
 ) -> Result<Option<Expr>> {
-    let dtype = prim_dtype(a)?;
-    if !fold::is_index_type(dtype) || !fold::is_index_type(prim_dtype(b)?) {
+    let dtype = a.prim_dtype()?;
+    if !fold::is_index_type(dtype) || !fold::is_index_type(b.prim_dtype()?) {
         return Ok(None);
     }
     let (pa, pb) = (int_value(a), int_value(b));
@@ -478,7 +478,7 @@ fn op_right_shift(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
 fn op_left_shift(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
     check_bitwise(&a, &b, "<<", "left shift", (&INTEGER, INTEGER_CODES))?;
     let (a, b) = math::match_types_at(a, b, &loc)?;
-    let dtype = prim_dtype(&a)?;
+    let dtype = a.prim_dtype()?;
     let shift = |x: &BigInt, y: &BigInt| {
         let value = x.try_shl(y.clone())?;
         Ok(if dtype.bits >= 64 { fold::fold_result(value, dtype) } else { value })
@@ -497,8 +497,8 @@ macro_rules! bitwise {
             fn $name(a: Expr, b: Expr, loc: Location) -> Result<Expr> {
                 check_bitwise(&a, &b, $symbol, $what, (&INTEGER_OR_BOOL, INTEGER_OR_BOOL_CODES))?;
                 let (a, b) = math::match_types_at(a, b, &loc)?;
-                let dtype = prim_dtype(&a)?;
-                let index = fold::is_index_type(dtype) && fold::is_index_type(prim_dtype(&b)?);
+                let dtype = a.prim_dtype()?;
+                let index = fold::is_index_type(dtype) && fold::is_index_type(b.prim_dtype()?);
                 if let (true, Some(x), Some(y)) = (index, int_value(&a), int_value(&b)) {
                     return Ok(int_imm_at(dtype, x $op y, &loc)?.into());
                 }
@@ -570,7 +570,7 @@ fn unary(value: Ex, op: UnaryOp) -> Ex {
 /// C++ `neg` (unary `-`): a constant is negated in place (a signed 64-bit one wraps), anything
 /// else becomes `MakeConst(a.ty(), 0) - a`.
 fn neg(a: Expr) -> Result<Expr> {
-    let dtype = prim_dtype(&a)?;
+    let dtype = a.prim_dtype()?;
     if let Some(imm) = a.as_node::<IntImmObj>() {
         let mut value = -&imm.value;
         if dtype.code == math::INT && dtype.bits >= 64 {
@@ -933,7 +933,7 @@ pub fn if_then_else(condition: impl Into<Ex>, t: impl Into<Ex>, f: impl Into<Ex>
 }
 
 fn if_then_else_at(condition: Expr, t: Expr, f: Expr, loc: Location) -> Result<Expr> {
-    if prim_dtype(&condition)?.code != math::BOOL {
+    if condition.prim_dtype()?.code != math::BOOL {
         let check = "cond.ty().MatchesCode(DLDataTypeCode::kDLBool)";
         let message = "if_then_else only accept the condition to be boolean type.";
         return Err(math::check_failed(INTERNAL_ERROR, check, message));

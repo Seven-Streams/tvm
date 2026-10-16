@@ -30,18 +30,18 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    bail, dispatch, structural_mutate, structural_walk, Any, Array, FieldGetter,
-    Function as FfiFunction, Map, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
-    String, Unchanged, WalkOrder, WalkResult, INTERNAL_ERROR, VALUE_ERROR,
+    bail, dispatch, structural_mutate, structural_walk, Any, AnyCompatible, AnyView, Array,
+    FieldGetter, Function as FfiFunction, Map, Mutator, ObjectIdentity, ObjectRefCast,
+    ObjectRefCore, Result, String, Unchanged, WalkOrder, WalkResult, INTERNAL_ERROR, VALUE_ERROR,
 };
 
 use super::cuda_exec_analysis::{lower_indices, ExecAnalysis, LaunchParams};
 use super::util::{MutatorExt, function_pass, get_attr, print_ir, sequential};
 use crate::ir::{
-    Bind, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, Op, OpObj, OpAttrMap, Range,
-    RegionStmt, SeqStmt, Stmt, Var,
+    Bind, BindObj, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, Op, OpObj, OpAttrMap, Range,
+    RegionStmt, SeqStmt, SeqStmtObj, Stmt, Var,
 };
-use crate::ops::{int32_dtype, prim_dtype, repr};
+use crate::ops::{int32_dtype, repr};
 use crate::prim::Max;
 use crate::sym::Analyzer;
 use crate::target::Target;
@@ -90,7 +90,7 @@ fn seek(stmt: &Stmt, body: &Stmt) -> Result<Stmt> {
     impl Searcher<'_> {
         fn mutate_evaluate(&mut self, op: Evaluate, m: &mut Mutator) -> Result<Any> {
             if op.value.as_node::<CallObj>().is_some_and(|call| KERNEL_REPLACE_POINT.is(&call.op)) {
-                return Ok(self.body.clone().into());
+                return Ok(self.body.to_any());
             }
             m.default_mutate(self, &op)
         }
@@ -111,7 +111,7 @@ fn rewrite_tensor_ref(stmt: &Stmt, src: &Var, dst: &Var) -> Result<Stmt> {
     impl Rewriter<'_> {
         fn mutate_var(&mut self, var: Var, m: &mut Mutator) -> Result<Any> {
             if var.same_as(self.src) {
-                return Ok(self.dst.clone().into());
+                return Ok(self.dst.to_any());
             }
             m.default_mutate(self, &var)
         }
@@ -223,7 +223,7 @@ impl TileDispatcher {
         if self.post_tensor_def_stmts.is_empty() {
             return Ok(stmt.into());
         }
-        let seq: SeqStmt = stmt.clone().try_cast()?;
+        let seq = stmt.as_node::<SeqStmtObj>().expect("a sequence mutates to a sequence");
         let mut rebuilt = Vec::with_capacity(seq.seq.len());
         let mut changed = false;
         for s in seq.seq.iter() {
@@ -238,7 +238,7 @@ impl TileDispatcher {
         if !changed {
             return Ok(stmt.into());
         }
-        Ok(Stmt::from(SeqStmt::new_full(rebuilt, seq.loc.clone())?).into())
+        Ok(Stmt::from(SeqStmt::new_full(rebuilt, &seq.loc)?).into())
     }
 
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
@@ -251,14 +251,15 @@ impl TileDispatcher {
             }
         }
         let stmt: Stmt = m.default_mutate_as(self, &Stmt::from(op))?;
-        let bind: Bind =
-            stmt.clone().try_cast().map_err(|_| error!(INTERNAL_ERROR, "Check failed: bind"))?;
-        if prim_dtype(&bind.value).is_ok() {
+        let bind = stmt
+            .as_node::<BindObj>()
+            .ok_or_else(|| error!(INTERNAL_ERROR, "Check failed: bind"))?;
+        if bind.value.prim_dtype().is_ok() {
             if let Some(analysis) = &mut self.analysis {
                 analysis.bind(&bind.var, &bind.value)?;
             }
             // Bind is flat: under SSA a stale entry is never consulted, so none is removed.
-            self.set_var_range(&bind.var, Range::from_min_extent(bind.value.clone(), 1)?);
+            self.set_var_range(&bind.var, Range::from_min_extent(&bind.value, 1)?);
         }
         Ok(stmt.into())
     }
@@ -270,10 +271,7 @@ impl TileDispatcher {
             "!var_range_map_.count(loop_var)",
             "Internal Error: Duplicate loop variable",
         );
-        self.set_var_range(
-            &op.loop_var,
-            Range::from_min_extent(op.min.clone(), op.extent.clone())?,
-        );
+        self.set_var_range(&op.loop_var, Range::from_min_extent(&op.min, &op.extent)?);
         m.default_mutate(self, &op)
     }
 
@@ -288,13 +286,13 @@ impl TileDispatcher {
             Some(analysis) => analysis.rewrite_predicate(&op.condition)?,
             None => op.condition.clone(),
         };
-        let then_case: Stmt = m.mutate_as(self, &Stmt::from(op.then_case.clone()))?;
+        let then_case: Stmt = m.mutate_as(self, &Stmt::from(&op.then_case))?;
         if let Some(analysis) = &mut self.analysis {
             analysis.pop(pushed);
         }
         let else_case = match &op.else_case {
             Some(else_case) => {
-                Some(SeqStmt::from_stmt(m.mutate_as::<_, Stmt>(self, &else_case.clone().into())?)?)
+                Some(SeqStmt::from_stmt(m.mutate_as::<_, Stmt>(self, &Stmt::from(else_case))?)?)
             }
             None => None,
         };
@@ -319,15 +317,15 @@ impl TileDispatcher {
         };
         let call: Call = stmt.value.clone().try_cast()?;
         call.validate()?;
-        let Some(attrs) = call.attrs.clone() else {
+        let Some(attrs) = &call.attrs else {
             bail!(
                 VALUE_ERROR,
                 "Check failed: (op->attrs.has_value()) is false: A tile instruction must have \
                  scope attributes"
             );
         };
-        let attrs_type = Any::from(attrs.clone()).type_index();
-        let scope_name: String = FieldGetter::new(attrs_type, "scope")?.get(&*attrs)?;
+        let attrs_type = AnyView::from(attrs).type_index();
+        let scope_name: String = FieldGetter::new(attrs_type, "scope")?.get(&**attrs)?;
         let kind = self.target.kind()?.name()?;
         let scope = ExecScope::new(kind, scope_name)?;
         let (inter, intra) = match &self.analysis {
@@ -338,13 +336,14 @@ impl TileDispatcher {
             .launch_params
             .iter()
             .map(|(tag, var, extent)| {
-                (String::from(tag.as_str()), Array::new(vec![var.clone().into(), extent.clone()]))
+                (String::from(tag.as_str()), Array::new(vec![Expr::from(var), extent.clone()]))
             })
             .collect();
         let var_range_map: Map<Var, Range> = self.var_ranges.iter().cloned().collect();
+        let scope_kind = scope.name.clone();
         let context = DispatchContext::new_full(
             self.target.clone(),
-            scope.clone(),
+            scope,
             launch_params,
             var_range_map,
             false,
@@ -352,7 +351,7 @@ impl TileDispatcher {
             self.shared_state.clone(),
             inter,
             intra,
-            scope.name.clone(),
+            scope_kind,
         )?;
         let implementation = dispatcher.call_tuple((call, context.clone()))?;
         tvm_ffi::ensure!(
@@ -364,14 +363,14 @@ impl TileDispatcher {
         let implementation: Function = implementation.try_into()?;
         self.collect_callbacks(&context.callbacks()?)?;
         self.shared_state = context.shared_state()?;
-        let Some(body) = implementation.body.clone() else {
+        let Some(body) = &implementation.body else {
             bail!(
                 VALUE_ERROR,
                 "Check failed: (res->body.has_value()) is false: A tile op implementation must \
                  have a body"
             );
         };
-        m.mutate(self, &body)
+        m.mutate(self, body)
     }
 }
 
@@ -543,7 +542,7 @@ impl TileDispatcher {
             )?);
         }
 
-        let body_input: Stmt = entry.body.clone().into();
+        let body_input = Stmt::from(&entry.body);
         let body: Stmt = m.mutate_as(self, &body_input)?;
         let body_unchanged = body.same_as(&body_input);
 
@@ -556,7 +555,7 @@ impl TileDispatcher {
             self.is_first_block = is_first_block;
             restore(self);
             if body_unchanged {
-                return Ok(entry.clone().into());
+                return Ok(Stmt::from(entry));
             }
             let region = RegionStmt::new_full(
                 entry.op.clone(),
@@ -565,17 +564,17 @@ impl TileDispatcher {
                 entry.attrs.clone(),
                 body,
                 entry.result_vars.clone(),
-                entry.loc.clone(),
+                &entry.loc,
             )?;
             return Ok(region.into());
         }
 
         let mut body = body;
-        for init in self.device_init_stmts.clone().iter().rev() {
+        for init in self.device_init_stmts.iter().rev() {
             body = seek(init, &body)?;
         }
         if !self.alloc_tensors.is_empty() {
-            let mut seq: Vec<Stmt> = self.alloc_tensors.iter().cloned().map(Stmt::from).collect();
+            let mut seq: Vec<Stmt> = self.alloc_tensors.iter().map(Stmt::from).collect();
             seq.push(body);
             body = SeqStmt::new(seq)?.into();
         }
@@ -636,7 +635,7 @@ impl TileDispatcher {
             } else {
                 continue;
             };
-            prim_dtype(&arg)?;
+            arg.prim_dtype()?;
             let extent = self.analyzer.simplify(&arg, 2)?;
             let var = Var::prim(&tag, int32_dtype())?;
             if !self.launch_params.iter().any(|(name, _, _)| *name == tag) {
@@ -663,9 +662,9 @@ impl TileDispatcher {
             let preferred_field = format!("preferred_cluster.{axis}");
             for (field, arg) in fields.iter().zip(entry.args.iter()) {
                 if field.as_str() == preferred_field {
-                    prim_dtype(&arg)?;
+                    arg.prim_dtype()?;
                     self.variable_cluster |= !self.analyzer.can_prove_equal(&extent, &arg)?;
-                    let max = Max::new(extent.clone(), arg)?;
+                    let max = Max::new(&extent, arg)?;
                     extent = self.analyzer.simplify(&max.into(), 2)?;
                 }
             }
@@ -690,7 +689,7 @@ pub fn tile_dispatch() -> Result<Pass> {
                 .ok_or_else(|| error!(INTERNAL_ERROR, "Target context required"))?,
         };
         let body = lower_op_calls(body, target)?;
-        let func = func.with_body(Some(SeqStmt::from_stmt(body.clone())?));
+        let func = func.with_body(Some(SeqStmt::from_stmt(&body)?));
         tvm_ffi::ensure!(
             no_tile_calls_left(&body, &Dispatchers::new()?)?,
             INTERNAL_ERROR,

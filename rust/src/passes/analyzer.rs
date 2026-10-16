@@ -35,7 +35,7 @@ use tvm_ffi::{
 };
 
 use super::side_effect::{side_effect, PURE};
-use super::util::{int32_dtype, int_imm, prim_dtype, prim_type, ContextExt};
+use super::util::{int32_dtype, int_imm, prim_type, ContextExt};
 use crate::ir::{
     AssertStmt, Bind, Call, Evaluate, Expr, For, If, OpHandle, PrimType, Range, RegionStmt,
     SeqStmt, StringImm, Var,
@@ -228,7 +228,7 @@ fn descend_for<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: For) -> Res
         let step = ctx.mutate_as(&op.step)?;
         let body: SeqStmt = ctx.scoped(|ctx| {
             // C++ `extent > IntImm(extent.ty(), 0)`.
-            let positive = extent.greater(int_imm(prim_dtype(&extent)?, 0)).expr()?;
+            let positive = extent.greater(int_imm(extent.prim_dtype()?, 0)).expr()?;
             ctx.base().assume_facts(&positive)?;
             ctx.mutate_as(&op.body)
         })?;
@@ -307,7 +307,7 @@ fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionSt
         if LAUNCH_THREAD.is(&op.op) {
             let var = op.body_params.get(0)?;
             let extent = op.args.get(1)?;
-            let zero = int_imm(prim_dtype(&extent)?, 0)?;
+            let zero = int_imm(extent.prim_dtype()?, 0)?;
             let dom = Range::from_min_extent(zero, extent)?;
             ctx.base().analyzer.bind_range(&var, &dom)?;
             ctx.base().record_iter_var(&var, &dom);
@@ -395,7 +395,7 @@ fn descend_if_then_else<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Ca
         tvm_ffi::Array::new(vec![cond_new, true_new, false_new]),
         op.attrs.clone(),
         tvm_ffi::Array::new(vec![]),
-        op.loc.clone(),
+        &op.loc,
     )?;
     Ok(call.into())
 }
@@ -484,7 +484,7 @@ fn floordiv_facts(
     if divisor <= 0 {
         return Ok(());
     }
-    let dtype = prim_dtype(&div.a)?;
+    let dtype = div.a.prim_dtype()?;
     let (lo, hi) = (k as i128 * divisor as i128, (k as i128 + 1) * divisor as i128);
     let signed = dtype.code == DL_INT;
     let limit: i128 = 1i128 << (dtype.bits as u32 - signed as u32);
@@ -519,7 +519,7 @@ fn compare_facts(lhs: &Expr, rhs: &Expr, kind: Compare, out: &mut Vec<Expr>) -> 
 }
 
 fn is_bool(expr: &Expr) -> bool {
-    matches!(prim_dtype(expr), Ok(dtype) if dtype.code == DL_BOOL && dtype.bits == 8 && dtype.lanes == 1)
+    matches!(expr.prim_dtype(), Ok(dtype) if dtype.code == DL_BOOL && dtype.bits == 8 && dtype.lanes == 1)
 }
 
 fn collect_derived_facts(condition: &Expr, out: &mut Vec<Expr>) -> Result<()> {

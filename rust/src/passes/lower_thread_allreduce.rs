@@ -24,17 +24,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tvm_ffi::{
-    bail, dispatch, structural_map, structural_mutate, Any, AnyView, Array, DLDataType, Map,
-    Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String, UnchangedOr, WalkOrder,
-    INTERNAL_ERROR, TYPE_ERROR, VALUE_ERROR,
+    bail, dispatch, structural_map, structural_mutate, Any, AnyCompatible, AnyView, Array,
+    DLDataType, Map, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String,
+    UnchangedOr, WalkOrder, INTERNAL_ERROR, TYPE_ERROR, VALUE_ERROR,
 };
 
 use super::analyzer::is_const_int;
-use super::util::{MutatorExt, dict_with, function_pass, get_attr, int_imm, prim_dtype};
+use super::util::{MutatorExt, dict_with, function_pass, get_attr, int_imm};
 use crate::ir::{
     Bind, Call, CallObj, DictAttrs, Evaluate, Expr, If, LambdaExpr, LambdaExprObj, OpHandle,
-    PrimType, PrimTypeObj, RegionStmt, SeqStmt, Stmt, StringImm, StringImmObj, TensorLoad,
-    TensorLoadObj, TensorStore, TupleObj, Var, VarObj,
+    PrimTypeObj, RegionStmt, SeqStmt, Stmt, StringImm, StringImmObj, TensorLoad, TensorLoadObj,
+    TensorStore, TupleObj, Var, VarObj,
 };
 use crate::ops::{prim_type, PrimOps};
 use crate::prim::{CastObj, Select};
@@ -50,11 +50,11 @@ use crate::transform::Pass;
 
 /// `TensorStore(dest, indices, value)`, as a statement.
 fn tensor_store(dest: &Var, indices: Vec<Expr>, value: Expr) -> Result<Stmt> {
-    Ok(TensorStore::new(dest.clone(), indices, value)?.into())
+    Ok(TensorStore::new(dest, indices, value)?.into())
 }
 
 fn tensor_load(source: &Var, indices: Vec<Expr>) -> Result<Expr> {
-    Ok(TensorLoad::new(source.clone(), indices)?.into())
+    Ok(TensorLoad::new(source, indices)?.into())
 }
 
 /// The tensor type of a `TensorVar`.
@@ -63,19 +63,21 @@ fn tensor_ty(var: &Var) -> &TensorTypeObj {
 }
 
 /// `expr.as_or_throw<TensorVar>()`: exactly a `Var` whose type is a `TensorType`.
-fn as_tensor_var(expr: &Expr) -> Result<Var> {
-    let var = expr.as_node::<VarObj>().filter(|_| is_exact_var(expr));
+fn as_tensor_var(expr: impl Into<Expr>) -> Result<Var> {
+    let expr: Expr = expr.into();
+    let var = expr.as_node::<VarObj>().filter(|_| is_exact_var(&expr));
     match var {
-        Some(var) if var.ty.as_node::<TensorTypeObj>().is_some() => Ok(expr.clone().try_cast()?),
+        Some(var) if var.ty.as_node::<TensorTypeObj>().is_some() => Ok(expr.try_cast()?),
         _ => bail!(TYPE_ERROR, "Cannot convert to `tirx.TensorVar`"),
     }
 }
 
 /// `expr.as<PrimVar>()`: exactly a `Var` whose type is a `PrimType`.
-fn as_prim_var(expr: &Expr) -> Option<Var> {
-    let var = expr.as_node::<VarObj>().filter(|_| is_exact_var(expr))?;
+fn as_prim_var(expr: impl Into<Expr>) -> Option<Var> {
+    let expr: Expr = expr.into();
+    let var = expr.as_node::<VarObj>().filter(|_| is_exact_var(&expr))?;
     var.ty.as_node::<PrimTypeObj>()?;
-    expr.clone().try_cast().ok()
+    expr.try_cast().ok()
 }
 
 fn is_exact_var(expr: &Expr) -> bool {
@@ -88,11 +90,6 @@ fn as_prim_expr(expr: &Expr) -> Result<Expr> {
         Some(_) => Ok(expr.clone()),
         None => bail!(TYPE_ERROR, "Cannot convert to `ir.PrimExpr`"),
     }
-}
-
-fn prim_ty(expr: &Expr) -> Result<PrimType> {
-    as_prim_expr(expr)?;
-    expr.ty.clone().try_cast()
 }
 
 /// `PrimType::lanes()`, which a scalable vector has none of at compile time.
@@ -222,9 +219,9 @@ impl Remaps {
             call.args.clone(),
             Some(annotations.into()),
             Array::new(vec![ty]),
-            call.loc.clone(),
+            &call.loc,
         )?;
-        Ok(Bind::new_full(replacement.clone(), value, node.loc.clone())?.into())
+        Ok(Bind::new_full(replacement.clone(), value, &node.loc)?.into())
     }
 }
 
@@ -272,7 +269,7 @@ impl ThreadAllreduceBuilder {
             }
             if DECL_TENSOR.is(&call.op) {
                 let data = call.args.get(0)?;
-                self.register_tensor_alias(&as_tensor_var(&op.var.clone().into())?, &data)?;
+                self.register_tensor_alias(&as_tensor_var(&op.var)?, &data)?;
                 // Declarations are remapped by `DeferredRemapper`, once every allreduce is known.
                 return m.default_mutate(self, &op);
             }
@@ -284,13 +281,13 @@ impl ThreadAllreduceBuilder {
         let allocation = self.remaps.allocation_key(&as_tensor_var(&op.source)?);
         if let Some(remapped) = self.load_remap.get(&allocation) {
             check_zero_indices(op.indices.iter())?;
-            return Ok(remapped.clone().into());
+            return Ok(remapped.to_any());
         }
         let load: TensorLoad = m.default_mutate_as(self, &op)?;
         match self.remaps.remapped_tensor(&as_tensor_var(&load.source)?) {
             Some(tensor) => {
                 let indices: Vec<Expr> = load.indices.iter().collect();
-                Ok(TensorLoad::new_full(tensor, indices, load.loc.clone())?.into())
+                Ok(TensorLoad::new_full(tensor, indices, &load.loc)?.into())
             }
             None => Ok(load.into()),
         }
@@ -424,7 +421,7 @@ impl ThreadAllreduceBuilder {
         let Some(first) = threads.first() else {
             return Ok((crate::ops::int32(0)?.into(), 1));
         };
-        let mut index: Expr = first.var.clone().into();
+        let mut index = Expr::from(&first.var);
         let mut total = first.extent;
         for thread in &threads[1..] {
             index = (&index + (&thread.var * total)).expr()?;
@@ -521,7 +518,7 @@ impl ThreadAllreduceBuilder {
                 let init = as_prim_expr(&inits[idx])?;
                 value = Select::new(&cond, value, init)?.into();
             }
-            dtypes.push(prim_dtype(&value)?);
+            dtypes.push(value.prim_dtype()?);
             values.push(value);
         }
         let mut tensors = Vec::with_capacity(size);
@@ -556,7 +553,7 @@ impl ThreadAllreduceBuilder {
         let mut nmatch = 0usize;
         let mut thread_axes_by_dim: BTreeMap<i32, (ThreadEntry, bool)> = BTreeMap::new();
         for launch in &self.thread_extents {
-            let var = as_prim_var(&launch.body_params.get(0)?.into())
+            let var = as_prim_var(launch.body_params.get(0)?)
                 .ok_or_else(|| error!(TYPE_ERROR, "Cannot convert to `ir.PrimVar`"))?;
             let tag = thread_tag(launch)?;
             if tag.starts_with("vthread") {
@@ -629,7 +626,7 @@ impl ThreadAllreduceBuilder {
 
         let mut seq: Vec<Stmt> = Vec::new();
         let mut new_alloc_bufs: Vec<Var> = Vec::new();
-        let reduce_dtype = prim_dtype(&reduce_index)?;
+        let reduce_dtype = reduce_index.prim_dtype()?;
         let zero_index: Expr = int_imm(reduce_dtype, 0)?.into();
         if self.is_warp_reduction(&dtypes, group_extent, reduce_extent, contiguous_reduce_extent)? {
             let uint32 = prim_type(DLDataType { code: 1, bits: 32, lanes: 1 })?;
@@ -656,7 +653,7 @@ impl ThreadAllreduceBuilder {
                     let val = tensor_load(&buf, vec![zero_index.clone()])?;
                     check_dtype(&val, dtypes[i])?;
                     let lane =
-                        (crate::ops::make_const(prim_dtype(&group_index)?, reduce_extent as i64)?
+                        (crate::ops::make_const(group_index.prim_dtype()?, reduce_extent as i64)?
                             * &group_index)
                             .expr()?;
                     let splat =
@@ -767,7 +764,7 @@ impl ThreadAllreduceBuilder {
             }
             // A previous iteration may still be reading the same tensor.
             seq.push(self.sync_thread("shared")?);
-            let group_dtype = prim_dtype(&group_index)?;
+            let group_dtype = group_index.prim_dtype()?;
             let mut shared_bufs = Vec::with_capacity(size);
             for (idx, value) in values.into_iter().enumerate() {
                 let shape =
@@ -872,7 +869,7 @@ impl ThreadAllreduceBuilder {
         // The active lanes, cached as the reduction may sit in divergent control flow.
         let mut mask_tensor = None;
         if self.need_warp_shuffle_mask {
-            let ty = TensorType::new(shape()?, prim_ty(mask)?, self.local.clone())?;
+            let ty = TensorType::new(shape()?, mask.prim_ty()?, self.local.clone())?;
             let tensor = Var::new("mask", ty)?;
             seq.push(tensor_store(&tensor, zero()?, mask.clone())?);
             local_bufs.push(tensor.clone());
@@ -988,7 +985,7 @@ impl ThreadAllreduceBuilder {
                 let loads = fload(reduce_align)?;
                 let mut vars = Vec::with_capacity(loads.len());
                 for (k, load) in loads.iter().enumerate() {
-                    vars.push(Var::new(format!("w_{reduce_align}_{k}"), load.ty.clone())?);
+                    vars.push(Var::new(format!("w_{reduce_align}_{k}"), &load.ty)?);
                 }
                 let mut body: Vec<Stmt> = Vec::with_capacity(loads.len() + 3);
                 for (var, load) in vars.iter().zip(loads) {
@@ -1015,7 +1012,7 @@ fn load_source(load: &Expr) -> Result<Var> {
 }
 
 fn check_dtype(expr: &Expr, dtype: DLDataType) -> Result<()> {
-    if prim_dtype(expr)? != dtype {
+    if expr.prim_dtype()? != dtype {
         bail!(INTERNAL_ERROR, "Check failed: the reduction keeps its value types");
     }
     Ok(())
@@ -1049,9 +1046,7 @@ impl DeferredRemapper<'_> {
                 return Ok(Evaluate::new(0)?.into());
             }
             let node: Bind = m.default_mutate_as(self, &op)?;
-            let Some(tensor) =
-                self.remaps.remapped_tensor(&as_tensor_var(&node.var.clone().into())?)
-            else {
+            let Some(tensor) = self.remaps.remapped_tensor(&as_tensor_var(&node.var)?) else {
                 return Ok(node.into());
             };
             let call = node.value.as_node::<CallObj>().expect("checked to be a decl_tensor call");
@@ -1062,9 +1057,9 @@ impl DeferredRemapper<'_> {
                 Array::new(vec![call.args.get(0)?]),
                 call.attrs.clone(),
                 Array::new(vec![ty]),
-                call.loc.clone(),
+                &call.loc,
             )?;
-            return Ok(Bind::new_full(tensor, value, node.loc.clone())?.into());
+            return Ok(Bind::new_full(tensor, value, &node.loc)?.into());
         }
         m.default_mutate(self, &op)
     }

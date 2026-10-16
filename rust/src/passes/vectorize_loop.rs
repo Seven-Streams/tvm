@@ -39,8 +39,8 @@ use crate::ir::{
     While,
 };
 use crate::ops::{
-    deep_equal, int32, int_imm, make_const, prim_dtype, prim_type, repr, structural_equal,
-    unknown_loc, Ex, PrimOps,
+    deep_equal, int32, int_imm, make_const, prim_type, repr, structural_equal, unknown_loc, Ex,
+    PrimOps,
 };
 use crate::prim::op::{IF_THEN_ELSE, VSCALE};
 use crate::prim::{
@@ -118,7 +118,7 @@ fn call(
     args: Vec<Expr>,
     attrs: Option<crate::ir::Attrs>,
     ty_args: Array<crate::ir::Type>,
-    loc: crate::ir::Location,
+    loc: impl Into<crate::ir::Location>,
 ) -> Result<Expr> {
     let args = Array::new(args);
     Ok(Call::new_full(Some(ty.into()), op, args, attrs, ty_args, loc)?.into())
@@ -157,12 +157,12 @@ fn int32_dtype() -> DLDataType {
 
 /// `BroadcastTo(e, lanes, is_scalable)`.
 fn broadcast_to(e: Expr, lanes: i32, scalable: bool) -> Result<Expr> {
-    let dtype = prim_dtype(&e)?;
+    let dtype = e.prim_dtype()?;
     if lanes_or_factor(dtype)? == lanes && is_scalable(dtype) == scalable {
         return Ok(e);
     }
     if let Some(broadcast) = e.as_node::<BroadcastObj>() {
-        let broadcast_dtype = prim_dtype(&e)?;
+        let broadcast_dtype = e.prim_dtype()?;
         check!(
             is_scalable(broadcast_dtype) == scalable,
             INTERNAL_ERROR,
@@ -171,11 +171,7 @@ fn broadcast_to(e: Expr, lanes: i32, scalable: bool) -> Result<Expr> {
         );
         let e_lanes = lanes_or_factor(broadcast_dtype)?;
         if lanes % e_lanes == 0 {
-            return Ok(Broadcast::new(
-                broadcast.value.clone(),
-                create_new_lanes(scalable, lanes)?,
-            )?
-            .into());
+            return Ok(Broadcast::new(&broadcast.value, create_new_lanes(scalable, lanes)?)?.into());
         }
     }
     check!(
@@ -232,7 +228,7 @@ fn enable_tensor_level_predication(context: &PassContext, target: &Option<Target
 }
 
 /// `ContainsCallNode`: a primitive call anywhere in `stmt`.
-fn contains_call(stmt: &Stmt) -> Result<bool> {
+fn contains_call(stmt: &SeqStmt) -> Result<bool> {
     let found = structural_walk(
         stmt,
         |call: Call| match call.ty.as_node::<PrimTypeObj>() {
@@ -258,9 +254,10 @@ fn contains_vscale(expr: &Expr) -> Result<bool> {
 }
 
 /// `stmt` with every use of `var` replaced by `value`.
-fn substitute(stmt: Stmt, var: &Var, value: &Expr) -> Result<Stmt> {
+fn substitute(stmt: impl Into<Stmt>, var: &Var, value: impl Into<Expr>) -> Result<Stmt> {
+    let value: Expr = value.into();
     structural_map(
-        stmt,
+        stmt.into(),
         |candidate: Var, kind: DefRegionKind| -> UnchangedOr<Any> {
             if kind == DefRegionKind::None && candidate.same_as(var) {
                 UnchangedOr::changed(Any::from(value.clone()))
@@ -329,7 +326,7 @@ impl TryPredicateTensorAccesses {
             Array::new(args),
             call.attrs.clone(),
             call.ty_args.clone(),
-            call.loc.clone(),
+            &call.loc,
         )?;
         Ok(call.into())
     }
@@ -349,7 +346,8 @@ impl TryPredicateTensorAccesses {
     }
 
     /// `Run(stmt, condition)`: whether every access was predicated, and the rewritten statement.
-    fn run(mut self, stmt: Stmt, condition: &Expr) -> Result<(bool, Stmt)> {
+    fn run(mut self, stmt: impl Into<Stmt>, condition: &Expr) -> Result<(bool, Stmt)> {
+        let stmt: Stmt = stmt.into();
         let Some(lt) = condition.as_node::<LTObj>() else { return Ok((false, stmt)) };
         let (Some(ramp), Some(broadcast)) =
             (lt.a.as_node::<RampObj>(), lt.b.as_node::<BroadcastObj>())
@@ -385,7 +383,7 @@ impl TryPredicateTensorAccesses {
         if !structural_equal(&ramp.base_, &base)? && !self.allow_offset_predication {
             return Ok(None);
         }
-        let ramp_dtype = prim_dtype(&indices[0])?;
+        let ramp_dtype = (indices[0]).prim_dtype()?;
         let mask_dtype = with_lanes(
             DLDataType { code: UINT, bits: 1, lanes: 1 },
             lanes_or_factor(ramp_dtype)?,
@@ -415,7 +413,7 @@ impl TryPredicateTensorAccesses {
             args,
             None,
             Array::new(vec![]),
-            load.loc.clone(),
+            &load.loc,
         )?;
         Ok(masked.into())
     }
@@ -427,15 +425,9 @@ impl TryPredicateTensorAccesses {
         args.extend(indices);
         args.push(mask);
         let void = prim_type(DLDataType::try_from_str("void")?)?;
-        let masked = call(
-            void,
-            MASKED_STORE.get()?.into(),
-            args,
-            None,
-            Array::new(vec![]),
-            store.loc.clone(),
-        )?;
-        Ok(Evaluate::new_full(masked, store.loc.clone())?.into())
+        let masked =
+            call(void, MASKED_STORE.get()?.into(), args, None, Array::new(vec![]), &store.loc)?;
+        Ok(Evaluate::new_full(masked, &store.loc)?.into())
     }
 }
 
@@ -498,11 +490,11 @@ impl Vectorizer {
     }
 
     fn mutate_add(&mut self, op: crate::prim::Add, m: &mut Mutator) -> Result<Any> {
-        self.add_sub(op.clone().into(), op.a.clone(), op.b.clone(), true, m)
+        self.add_sub(&op, &op.a, &op.b, true, m)
     }
 
     fn mutate_sub(&mut self, op: crate::prim::Sub, m: &mut Mutator) -> Result<Any> {
-        self.add_sub(op.clone().into(), op.a.clone(), op.b.clone(), false, m)
+        self.add_sub(&op, &op.a, &op.b, false, m)
     }
 
     fn mutate_mul(&mut self, op: crate::prim::Mul, m: &mut Mutator) -> Result<Any> {
@@ -511,7 +503,7 @@ impl Vectorizer {
         if a.same_as(&op.a) && b.same_as(&op.b) {
             return Ok(op.into());
         }
-        let (a_dtype, b_dtype) = (prim_dtype(&a)?, prim_dtype(&b)?);
+        let (a_dtype, b_dtype) = (a.prim_dtype()?, b.prim_dtype()?);
         let (vector_a, vector_b) = (is_vector(a_dtype), is_vector(b_dtype));
         if vector_a && vector_b {
             check!(
@@ -526,14 +518,14 @@ impl Vectorizer {
                 if is_scalar(b_dtype) && self.can_prove(b.greater(0))? {
                     let base = (&ramp.base_ * &b).expr()?;
                     let stride = (&ramp.stride * &b).expr()?;
-                    return Ok(Ramp::new(base, stride, ramp.lanes.clone())?.into());
+                    return Ok(Ramp::new(base, stride, &ramp.lanes)?.into());
                 }
             }
             if let Some(ramp) = b.as_node::<RampObj>() {
                 if is_scalar(a_dtype) && self.can_prove(a.greater(0))? {
                     let base = (&ramp.base_ * &a).expr()?;
                     let stride = (&ramp.stride * &a).expr()?;
-                    return Ok(Ramp::new(base, stride, ramp.lanes.clone())?.into());
+                    return Ok(Ramp::new(base, stride, &ramp.lanes)?.into());
                 }
             }
             let lanes = lanes_or_factor(a_dtype)?.max(lanes_or_factor(b_dtype)?);
@@ -542,174 +534,83 @@ impl Vectorizer {
             return Ok(Mul::new(a, b)?.into());
         }
         // C++ falls back to `BinaryVec<Mul>`, which visits both operands again.
-        self.binary(op.clone().into(), op.a.clone(), op.b.clone(), op.loc.clone(), Mul::new_full, m)
+        self.binary(&op, &op.a, &op.b, &op.loc, Mul::new_full, m)
     }
 
     fn mutate_div(&mut self, op: crate::prim::Div, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::Div::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::Div::new_full, m)
     }
 
     fn mutate_mod(&mut self, op: crate::prim::Mod, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::Mod::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::Mod::new_full, m)
     }
 
     fn mutate_floordiv(&mut self, op: crate::prim::FloorDiv, m: &mut Mutator) -> Result<Any> {
-        let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, crate::prim::FloorDiv::new_full, m)
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::FloorDiv::new_full, m)
     }
 
     fn mutate_floormod(&mut self, op: crate::prim::FloorMod, m: &mut Mutator) -> Result<Any> {
-        let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, crate::prim::FloorMod::new_full, m)
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::FloorMod::new_full, m)
     }
 
     fn mutate_min(&mut self, op: crate::prim::Min, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::Min::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::Min::new_full, m)
     }
 
     fn mutate_max(&mut self, op: crate::prim::Max, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::Max::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::Max::new_full, m)
     }
 
     fn mutate_eq(&mut self, op: crate::prim::EQ, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::EQ::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::EQ::new_full, m)
     }
 
     fn mutate_ne(&mut self, op: crate::prim::NE, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::NE::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::NE::new_full, m)
     }
 
     fn mutate_lt(&mut self, op: crate::prim::LT, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::LT::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::LT::new_full, m)
     }
 
     fn mutate_le(&mut self, op: crate::prim::LE, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::LE::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::LE::new_full, m)
     }
 
     fn mutate_gt(&mut self, op: crate::prim::GT, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::GT::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::GT::new_full, m)
     }
 
     fn mutate_ge(&mut self, op: crate::prim::GE, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::GE::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::GE::new_full, m)
     }
 
     fn mutate_and(&mut self, op: crate::prim::And, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::And::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::And::new_full, m)
     }
 
     fn mutate_or(&mut self, op: crate::prim::Or, m: &mut Mutator) -> Result<Any> {
-        self.binary(
-            op.clone().into(),
-            op.a.clone(),
-            op.b.clone(),
-            op.loc.clone(),
-            crate::prim::Or::new_full,
-            m,
-        )
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::Or::new_full, m)
     }
 
     fn mutate_lshift(&mut self, op: crate::prim::LShift, m: &mut Mutator) -> Result<Any> {
-        let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, crate::prim::LShift::new_full, m)
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::LShift::new_full, m)
     }
 
     fn mutate_rshift(&mut self, op: crate::prim::RShift, m: &mut Mutator) -> Result<Any> {
-        let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, crate::prim::RShift::new_full, m)
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::RShift::new_full, m)
     }
 
     fn mutate_bitwise_and(&mut self, op: crate::prim::BitwiseAnd, m: &mut Mutator) -> Result<Any> {
-        let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, crate::prim::BitwiseAnd::new_full, m)
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::BitwiseAnd::new_full, m)
     }
 
     fn mutate_bitwise_or(&mut self, op: crate::prim::BitwiseOr, m: &mut Mutator) -> Result<Any> {
-        let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, crate::prim::BitwiseOr::new_full, m)
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::BitwiseOr::new_full, m)
     }
 
     fn mutate_bitwise_xor(&mut self, op: crate::prim::BitwiseXor, m: &mut Mutator) -> Result<Any> {
-        let (a, b, loc) = (op.a.clone(), op.b.clone(), op.loc.clone());
-        self.binary(op.into(), a, b, loc, crate::prim::BitwiseXor::new_full, m)
+        self.binary(&op, &op.a, &op.b, &op.loc, crate::prim::BitwiseXor::new_full, m)
     }
 
     fn mutate_bitwise_not(&mut self, op: crate::prim::BitwiseNot, m: &mut Mutator) -> Result<Any> {
@@ -717,7 +618,7 @@ impl Vectorizer {
         if a.same_as(&op.a) {
             return Ok(op.into());
         }
-        Ok(crate::prim::BitwiseNot::new_full(a, op.loc.clone())?.into())
+        Ok(crate::prim::BitwiseNot::new_full(a, &op.loc)?.into())
     }
 
     fn mutate_not(&mut self, op: crate::prim::Not, m: &mut Mutator) -> Result<Any> {
@@ -733,7 +634,7 @@ impl Vectorizer {
     fn mutate_ramp(&mut self, op: crate::prim::Ramp, m: &mut Mutator) -> Result<Any> {
         let base: Expr = m.mutate_as(self, &op.base_)?;
         let stride: Expr = m.mutate_as(self, &op.stride)?;
-        let (base_dtype, stride_dtype) = (prim_dtype(&base)?, prim_dtype(&stride)?);
+        let (base_dtype, stride_dtype) = (base.prim_dtype()?, stride.prim_dtype()?);
         check!(
             !is_scalable(base_dtype),
             INTERNAL_ERROR,
@@ -762,7 +663,7 @@ impl Vectorizer {
             let same = base_ramp.stride.equal(&stride * step).expr()?;
             if self.analyzer.can_prove(&same, 0)? {
                 let lanes = (op_lanes * base_ramp_lanes) as i32;
-                return Ok(Ramp::new(base_ramp.base_.clone(), stride, lanes)?.into());
+                return Ok(Ramp::new(&base_ramp.base_, stride, lanes)?.into());
             }
         }
         let lanes = lanes(base_dtype)?.max(lanes(stride_dtype)?);
@@ -770,9 +671,9 @@ impl Vectorizer {
         let stride = broadcast_to(stride, lanes, false)?;
         let mut elems = Vec::with_capacity(lanes as usize);
         for i in 0..lanes {
-            let b = Shuffle::extract_element(base.clone(), i)?;
-            let s = Shuffle::extract_element(stride.clone(), i)?;
-            elems.push(Ramp::new(b, s, op.lanes.clone())?.into());
+            let b = Shuffle::extract_element(&base, i)?;
+            let s = Shuffle::extract_element(&stride, i)?;
+            elems.push(Ramp::new(b, s, &op.lanes)?.into());
         }
         Ok(Shuffle::concat(elems)?.into())
     }
@@ -781,14 +682,14 @@ impl Vectorizer {
     /// from its original value.
     fn mutate_broadcast(&mut self, op: crate::prim::Broadcast, m: &mut Mutator) -> Result<Any> {
         let value: Expr = m.mutate_as(self, &op.value)?;
-        if is_vector(prim_dtype(&value)?) {
+        if is_vector(value.prim_dtype()?) {
             self.need_scalarize = true;
             return Ok(op.into());
         }
         if value.same_as(&op.value) {
             return Ok(op.into());
         }
-        Ok(Broadcast::new(op.value.clone(), op.lanes.clone())?.into())
+        Ok(Broadcast::new(&op.value, &op.lanes)?.into())
     }
 
     fn mutate_select(&mut self, op: crate::prim::Select, m: &mut Mutator) -> Result<Any> {
@@ -798,7 +699,7 @@ impl Vectorizer {
         if cond.same_as(&op.condition) && t.same_as(&op.true_value) && f.same_as(&op.false_value) {
             return Ok(op.into());
         }
-        let dtypes = [prim_dtype(&cond)?, prim_dtype(&t)?, prim_dtype(&f)?];
+        let dtypes = [cond.prim_dtype()?, t.prim_dtype()?, f.prim_dtype()?];
         let mut lanes = 0;
         for dtype in dtypes {
             lanes = lanes.max(lanes_or_factor(dtype)?);
@@ -815,7 +716,7 @@ impl Vectorizer {
         if value.same_as(&op.value) {
             return Ok(op.into());
         }
-        let (value_dtype, target) = (prim_dtype(&value)?, prim_dtype(&Expr::from(op.clone()))?);
+        let (value_dtype, target) = (value.prim_dtype()?, op.prim_dtype()?);
         let ty = match is_scalable(value_dtype) {
             true => with_lanes(target, lanes_or_factor(value_dtype)?, true),
             false => with_lanes(target, lanes(value_dtype)?, false),
@@ -842,7 +743,7 @@ impl Vectorizer {
                 args,
                 op.attrs.clone(),
                 op.ty_args.clone(),
-                op.loc.clone(),
+                &op.loc,
             )?;
             return Ok(call.into());
         };
@@ -874,14 +775,8 @@ impl Vectorizer {
                 args.push(new_arg);
             }
             // As above, C++ always rebuilds, dropping the type arguments.
-            let call = call(
-                ret_ty,
-                op.op.clone(),
-                args,
-                op.attrs.clone(),
-                Array::new(vec![]),
-                op.loc.clone(),
-            )?;
+            let call =
+                call(ret_ty, op.op.clone(), args, op.attrs.clone(), Array::new(vec![]), &op.loc)?;
             return Ok(call.into());
         }
         let mut lanes = 0;
@@ -897,14 +792,8 @@ impl Vectorizer {
             updated
         };
         let ty = prim_type(with_lanes(ret, lanes, false))?;
-        let call = call(
-            ty,
-            op.op.clone(),
-            new_args,
-            op.attrs.clone(),
-            Array::new(vec![]),
-            op.loc.clone(),
-        )?;
+        let call =
+            call(ty, op.op.clone(), new_args, op.attrs.clone(), Array::new(vec![]), &op.loc)?;
         Ok(call.into())
     }
 
@@ -913,7 +802,7 @@ impl Vectorizer {
         if !changed {
             return Ok(op.into());
         }
-        Ok(TensorLoad::new_full(op.source.clone(), indices, op.loc.clone())?.into())
+        Ok(TensorLoad::new_full(&op.source, indices, &op.loc)?.into())
     }
 
     fn mutate_let(&mut self, op: Let, m: &mut Mutator) -> Result<Any> {
@@ -927,8 +816,8 @@ impl Vectorizer {
                 "Let cannot bind the same var to two different values",
             );
         }
-        if lanes_or_factor(prim_dtype(&value)?)? != lanes_or_factor(prim_dtype(&op.value)?)? {
-            let new_var = Var::new(op.var.name.clone(), value.ty.clone())?;
+        if lanes_or_factor(value.prim_dtype()?)? != lanes_or_factor(op.value.prim_dtype()?)? {
+            let new_var = Var::new(op.var.name.clone(), &value.ty)?;
             self.remap.insert(key, new_var.clone().into());
             let body: Expr = m.mutate_as(self, &op.body)?;
             return Ok(Let::new(new_var, value, body)?.into());
@@ -959,7 +848,7 @@ impl Vectorizer {
             return Ok(op.into());
         }
         let var_lanes = int_value(&self.var_lanes)?;
-        let vector_lanes = lanes(prim_dtype(&vectors[0])?)? as i64;
+        let vector_lanes = lanes((vectors[0]).prim_dtype()?)? as i64;
         let new_vec_length = var_lanes / vector_lanes;
         check!(
             shuffle_index_matches(&new_indices[0], var_lanes, vector_lanes),
@@ -967,7 +856,7 @@ impl Vectorizer {
             "f_check_index(updated_index)",
         );
         if new_vec_length == 1 {
-            let zero: Expr = int_imm(prim_dtype(&Expr::from(self.var.clone()))?, 0)?.into();
+            let zero: Expr = int_imm(self.var.prim_dtype()?, 0)?.into();
             let var = self.var.clone();
             let substituted = structural_map(
                 vectors[0].clone(),
@@ -982,7 +871,7 @@ impl Vectorizer {
             return Ok(substituted);
         }
         let previous = self.var_lanes.clone();
-        self.var_lanes = int_imm(prim_dtype(&previous)?, new_vec_length as i128)?.into();
+        self.var_lanes = int_imm(previous.prim_dtype()?, new_vec_length as i128)?.into();
         let result = self.mutate_array(&vectors, &mut 0, m);
         self.var_lanes = previous;
         let (vectors, _) = result?;
@@ -990,13 +879,11 @@ impl Vectorizer {
     }
 
     fn mutate_for(&mut self, op: For, m: &mut Mutator) -> Result<Any> {
-        let original: Stmt = op.clone().into();
-        self.statement(original, |this| this.vectorize_for(op, m))
+        self.statement(Stmt::from(&op), |this| this.vectorize_for(op, m))
     }
 
     fn mutate_if(&mut self, op: If, m: &mut Mutator) -> Result<Any> {
-        let original: Stmt = op.clone().into();
-        self.statement(original, |this| this.vectorize_if(op, m))
+        self.statement(Stmt::from(&op), |this| this.vectorize_if(op, m))
     }
 
     fn mutate_while(&mut self, op: While) -> Result<Any> {
@@ -1007,13 +894,11 @@ impl Vectorizer {
     }
 
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Any> {
-        let original: Stmt = op.clone().into();
-        self.statement(original, |this| this.vectorize_bind(op, m))
+        self.statement(Stmt::from(&op), |this| this.vectorize_bind(op, m))
     }
 
     fn mutate_store(&mut self, op: TensorStore, m: &mut Mutator) -> Result<Any> {
-        let original: Stmt = op.clone().into();
-        self.statement(original, |this| this.vectorize_store(op, m))
+        self.statement(Stmt::from(&op), |this| this.vectorize_store(op, m))
     }
 
     fn mutate_stmt(&mut self, op: Stmt, m: &mut Mutator) -> Result<Any> {
@@ -1066,9 +951,8 @@ impl Vectorizer {
     ) -> Result<Self> {
         let vectorizable = Op::attr_map::<bool>("TVectorizable")?
             .ok_or_else(|| error!(INTERNAL_ERROR, "Attribute 'TVectorizable' is not registered"))?;
-        let dtype = prim_dtype(&Expr::from(var.clone()))?;
-        let ramp: Expr =
-            Ramp::new(int_imm(dtype, 0)?, int_imm(dtype, 1)?, var_lanes.clone())?.into();
+        let dtype = var.prim_dtype()?;
+        let ramp: Expr = Ramp::new(int_imm(dtype, 0)?, int_imm(dtype, 1)?, &var_lanes)?.into();
         let mut remap = HashMap::new();
         remap.insert(ObjectIdentity::of(&var), ramp);
         Ok(Self {
@@ -1101,10 +985,10 @@ impl Vectorizer {
 
     /// `Scalarize(stmt)`: a serial loop over the lanes, the vectorized variable renamed.
     fn scalarize(&self, stmt: Stmt) -> Result<Stmt> {
-        let dtype = prim_dtype(&Expr::from(self.var.clone()))?;
+        let dtype = self.var.prim_dtype()?;
         let index = prim_var(&format!("{}.s", self.var.name.as_str()), dtype)?;
-        let stmt = substitute(stmt, &self.var, &index.clone().into())?;
-        Ok(For::new(index, int_imm(dtype, 0)?, self.var_lanes.clone(), FOR_DEFAULT, stmt)?.into())
+        let stmt = substitute(stmt, &self.var, &index)?;
+        Ok(For::new(index, int_imm(dtype, 0)?, &self.var_lanes, FOR_DEFAULT, stmt)?.into())
     }
 
     fn can_prove(&self, condition: Ex) -> Result<bool> {
@@ -1114,59 +998,59 @@ impl Vectorizer {
     /// `AddSubVec`: a scalar added to a ramp moves into the ramp's base.
     fn add_sub(
         &mut self,
-        original: Expr,
-        a: Expr,
-        b: Expr,
+        original: impl Into<Expr>,
+        a: &Expr,
+        b: &Expr,
         add: bool,
         m: &mut Mutator,
     ) -> Result<Any> {
-        let new_a: Expr = m.mutate_as(self, &a)?;
-        let new_b: Expr = m.mutate_as(self, &b)?;
-        if new_a.same_as(&a) && new_b.same_as(&b) {
-            return Ok(original.into());
+        let new_a: Expr = m.mutate_as(self, a)?;
+        let new_b: Expr = m.mutate_as(self, b)?;
+        if new_a.same_as(a) && new_b.same_as(b) {
+            return Ok(original.into().into());
         }
-        let compute = |x: Expr, y: Expr| -> Result<Expr> {
+        let compute = |x: &Expr, y: &Expr| -> Result<Expr> {
             match add {
                 true => (Ex::from(x) + y).expr(),
                 false => (Ex::from(x) - y).expr(),
             }
         };
-        let (a_dtype, b_dtype) = (prim_dtype(&new_a)?, prim_dtype(&new_b)?);
+        let (a_dtype, b_dtype) = (new_a.prim_dtype()?, new_b.prim_dtype()?);
         let lanes = lanes_or_factor(a_dtype)?.max(lanes_or_factor(b_dtype)?);
         if lanes != 1 {
             if let Some(ramp) = new_b.as_node::<RampObj>().filter(|_| is_scalar(a_dtype)) {
-                let zero: Expr = int_imm(prim_dtype(&ramp.stride)?, 0)?.into();
-                let base = compute(new_a.clone(), ramp.base_.clone())?;
-                let stride = compute(zero, ramp.stride.clone())?;
-                return Ok(Ramp::new(base, stride, ramp.lanes.clone())?.into());
+                let zero: Expr = int_imm(ramp.stride.prim_dtype()?, 0)?.into();
+                let base = compute(&new_a, &ramp.base_)?;
+                let stride = compute(&zero, &ramp.stride)?;
+                return Ok(Ramp::new(base, stride, &ramp.lanes)?.into());
             }
             if let Some(ramp) = new_a.as_node::<RampObj>().filter(|_| is_scalar(b_dtype)) {
-                let base = compute(ramp.base_.clone(), new_b.clone())?;
-                return Ok(Ramp::new(base, ramp.stride.clone(), ramp.lanes.clone())?.into());
+                let base = compute(&ramp.base_, &new_b)?;
+                return Ok(Ramp::new(base, &ramp.stride, &ramp.lanes)?.into());
             }
         }
         let scalable = is_scalable(a_dtype) || is_scalable(b_dtype);
         let (a, b) = (broadcast_to(new_a, lanes, scalable)?, broadcast_to(new_b, lanes, scalable)?);
-        Ok(compute(a, b)?.into())
+        Ok(compute(&a, &b)?.into())
     }
 
     /// `BinaryVec<Node>`: both operands broadcast to the wider lanes, rebuilt by the raw
     /// constructor `build` (`Node::new_full`).
-    fn binary<N: Into<Any>>(
+    fn binary<'l, N: Into<Any>>(
         &mut self,
-        original: Expr,
-        a: Expr,
-        b: Expr,
-        loc: crate::ir::Location,
-        build: impl FnOnce(Expr, Expr, crate::ir::Location) -> Result<N>,
+        original: impl Into<Expr>,
+        a: &Expr,
+        b: &Expr,
+        loc: &'l crate::ir::Location,
+        build: impl FnOnce(Expr, Expr, &'l crate::ir::Location) -> Result<N>,
         m: &mut Mutator,
     ) -> Result<Any> {
-        let new_a: Expr = m.mutate_as(self, &a)?;
-        let new_b: Expr = m.mutate_as(self, &b)?;
-        if new_a.same_as(&a) && new_b.same_as(&b) {
-            return Ok(original.into());
+        let new_a: Expr = m.mutate_as(self, a)?;
+        let new_b: Expr = m.mutate_as(self, b)?;
+        if new_a.same_as(a) && new_b.same_as(b) {
+            return Ok(original.into().into());
         }
-        let (a_dtype, b_dtype) = (prim_dtype(&new_a)?, prim_dtype(&new_b)?);
+        let (a_dtype, b_dtype) = (new_a.prim_dtype()?, new_b.prim_dtype()?);
         let lanes = lanes_or_factor(a_dtype)?.max(lanes_or_factor(b_dtype)?);
         let scalable = is_scalable(a_dtype) || is_scalable(b_dtype);
         let (a, b) = (broadcast_to(new_a, lanes, scalable)?, broadcast_to(new_b, lanes, scalable)?);
@@ -1200,11 +1084,11 @@ impl Vectorizer {
         for value in values {
             let new_value: Expr = m.mutate_as(self, value)?;
             changed |= !new_value.same_as(value);
-            *lanes = (*lanes).max(self::lanes(prim_dtype(&new_value)?)?);
+            *lanes = (*lanes).max(self::lanes(new_value.prim_dtype()?)?);
             result.push(new_value);
         }
         for value in result.iter_mut() {
-            if self::lanes(prim_dtype(value)?)? != *lanes {
+            if self::lanes(value.prim_dtype()?)? != *lanes {
                 *value = broadcast_to(value.clone(), *lanes, false)?;
                 changed = true;
             }
@@ -1248,7 +1132,7 @@ impl Vectorizer {
     fn if_then_else(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
         let args: Vec<Expr> = op.args.iter().collect();
         let cond: Expr = m.mutate_as(self, &args[0])?;
-        if is_vector(prim_dtype(&cond)?) {
+        if is_vector(cond.prim_dtype()?) {
             self.need_scalarize = true;
             return Ok(op.into());
         }
@@ -1257,12 +1141,12 @@ impl Vectorizer {
         if cond.same_as(&args[0]) && t.same_as(&args[1]) && f.same_as(&args[2]) {
             return Ok(op.into());
         }
-        let (t_dtype, f_dtype) = (prim_dtype(&t)?, prim_dtype(&f)?);
+        let (t_dtype, f_dtype) = (t.prim_dtype()?, f.prim_dtype()?);
         let lanes = lanes_or_factor(t_dtype)?.max(lanes_or_factor(f_dtype)?);
         let scalable = is_scalable(t_dtype) || is_scalable(f_dtype);
         let t = broadcast_to(t, lanes, scalable)?;
         let f = broadcast_to(f, lanes, scalable)?;
-        let ret = prim_dtype(&Expr::from(op.clone()))?;
+        let ret = op.prim_dtype()?;
         let ty = prim_type(with_lanes(ret, lanes, scalable))?;
         let call = call(
             ty,
@@ -1270,7 +1154,7 @@ impl Vectorizer {
             vec![cond, t, f],
             op.attrs.clone(),
             Array::new(vec![]),
-            op.loc.clone(),
+            &op.loc,
         )?;
         Ok(call.into())
     }
@@ -1281,12 +1165,12 @@ impl Vectorizer {
         if value.same_as(&input) {
             return Ok(op.into());
         }
-        let ret = prim_dtype(&Expr::from(op.clone()))?;
-        let value_dtype = prim_dtype(&value)?;
+        let ret = op.prim_dtype()?;
+        let value_dtype = value.prim_dtype()?;
         let ty = if is_scalable(value_dtype) {
             with_lanes(ret, lanes_or_factor(value_dtype)?, true)
         } else {
-            let input_dtype = prim_dtype(&input)?;
+            let input_dtype = input.prim_dtype()?;
             let new_lanes = if ret.code != FLOAT4_E2M1FN && input_dtype.code != FLOAT4_E2M1FN {
                 (value_dtype.bits as i32 * lanes(value_dtype)?) / ret.bits as i32
             } else {
@@ -1300,7 +1184,7 @@ impl Vectorizer {
             vec![value],
             op.attrs.clone(),
             Array::new(vec![]),
-            op.loc.clone(),
+            &op.loc,
         )?;
         Ok(call.into())
     }
@@ -1329,8 +1213,7 @@ impl Vectorizer {
         let mut new_args = args[..args.len() - 1].to_vec();
         new_args.push(fcd[0].clone());
         let ty = prim_type(with_lanes(ret, lane, false))?;
-        Ok(call(ty, op.op.clone(), new_args, op.attrs.clone(), Array::new(vec![]), op.loc.clone())?
-            .into())
+        Ok(call(ty, op.op.clone(), new_args, op.attrs.clone(), Array::new(vec![]), &op.loc)?.into())
     }
 
     fn texture_store(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
@@ -1346,27 +1229,20 @@ impl Vectorizer {
         );
         let last = args.len() - 1;
         args[last] = value[0].clone();
-        Ok(call(
-            op.ty.clone(),
-            op.op.clone(),
-            args,
-            op.attrs.clone(),
-            Array::new(vec![]),
-            op.loc.clone(),
-        )?
-        .into())
+        Ok(call(op.ty.clone(), op.op.clone(), args, op.attrs.clone(), Array::new(vec![]), &op.loc)?
+            .into())
     }
 
     fn vectorize_for(&mut self, op: For, m: &mut Mutator) -> Result<Any> {
         // C++ also logs a warning for a vectorized loop nested in one; it keeps the loop.
         check!(is_const_int(&op.min, 0), INTERNAL_ERROR, "IsZero(op->min)");
         check!(
-            !is_vector(prim_dtype(&op.extent)?),
+            !is_vector(op.extent.prim_dtype()?),
             INTERNAL_ERROR,
             "!op->extent.ty().IsScalableVector() && !op->extent.ty().IsFixedLengthVector()",
         );
         let extent: Expr = m.mutate_as(self, &op.extent)?;
-        if is_vector(prim_dtype(&extent)?) {
+        if is_vector(extent.prim_dtype()?) {
             return Ok(self.scalarize(op.into())?.into());
         }
         let body = self.mutate_body(&op.body, m)?;
@@ -1383,7 +1259,7 @@ impl Vectorizer {
 
     /// C++ `Mutate(const SeqStmt&)`: a changed statement is wrapped into a sequence.
     fn mutate_body(&mut self, body: &SeqStmt, m: &mut Mutator) -> Result<SeqStmt> {
-        let result: Stmt = m.mutate_as(self, &Stmt::from(body.clone()))?;
+        let result: Stmt = m.mutate_as(self, &Stmt::from(body))?;
         if result.same_as(body) {
             return Ok(body.clone());
         }
@@ -1392,7 +1268,7 @@ impl Vectorizer {
 
     fn vectorize_if(&mut self, op: If, m: &mut Mutator) -> Result<Any> {
         check!(
-            !is_vector(prim_dtype(&op.condition)?),
+            !is_vector(op.condition.prim_dtype()?),
             INTERNAL_ERROR,
             "!op->condition.ty().IsScalableVector() && !op->condition.ty().IsFixedLengthVector()",
         );
@@ -1403,11 +1279,11 @@ impl Vectorizer {
             Some(else_case) => Some(self.mutate_body(else_case, m)?),
             None => None,
         };
-        let condition_is_vector = is_vector(prim_dtype(&condition)?);
+        let condition_is_vector = is_vector(condition.prim_dtype()?);
         let predication = enable_tensor_level_predication(&self.context, &self.target)?;
         if predication && condition_is_vector && else_case.is_none() {
             let predicator = TryPredicateTensorAccesses::new(target_has_rvv(&self.target)?);
-            let (success, stmt) = predicator.run(then_case.clone().into(), &condition)?;
+            let (success, stmt) = predicator.run(&then_case, &condition)?;
             if success {
                 return Ok(stmt.into());
             }
@@ -1442,8 +1318,8 @@ impl Vectorizer {
             "VarRemapGet(op->var) == nullptr",
             "SSA violation, a single var is binded twice",
         );
-        if lanes_or_factor(prim_dtype(&value)?)? != lanes_or_factor(prim_dtype(&op.value)?)? {
-            let new_var = Var::new(op.var.name.clone(), value.ty.clone())?;
+        if lanes_or_factor(value.prim_dtype()?)? != lanes_or_factor(op.value.prim_dtype()?)? {
+            let new_var = Var::new(op.var.name.clone(), &value.ty)?;
             self.remap.insert(key, new_var.clone().into());
             return Ok(Bind::new(new_var, value)?.into());
         }
@@ -1451,7 +1327,7 @@ impl Vectorizer {
         if value.same_as(&op.value) {
             return Ok(op.into());
         }
-        Ok(Bind::new_full(op.var.clone(), value, op.loc.clone())?.into())
+        Ok(Bind::new_full(op.var.clone(), value, &op.loc)?.into())
     }
 
     fn vectorize_store(&mut self, op: TensorStore, m: &mut Mutator) -> Result<Any> {
@@ -1474,7 +1350,7 @@ impl Vectorizer {
         );
         let mut other_index_lanes = lanes(element)?;
         for index in &indices[..indices.len() - 1] {
-            let dtype = prim_dtype(index)?;
+            let dtype = index.prim_dtype()?;
             other_index_lanes *= lanes(dtype)?;
             check!(
                 !is_scalable(dtype),
@@ -1484,9 +1360,9 @@ impl Vectorizer {
             );
         }
         let last = indices.len() - 1;
-        let last_dtype = prim_dtype(&indices[last])?;
+        let last_dtype = (indices[last]).prim_dtype()?;
         let index_lanes = other_index_lanes * lanes_or_factor(last_dtype)?;
-        let value_lanes = lanes_or_factor(prim_dtype(&value)?)?;
+        let value_lanes = lanes_or_factor(value.prim_dtype()?)?;
         let last_scalable = is_scalable(last_dtype);
         let total_lanes = index_lanes.max(value_lanes);
         check_cmp!(
@@ -1587,7 +1463,7 @@ impl LoopVectorizer {
         if let Some(value) = &extent {
             if *value > BigInt::from(1i64)
                 && target_has_rvv(&self.target)?
-                && !contains_call(&op.body.clone().into())?
+                && !contains_call(&op.body)?
             {
                 let value =
                     value.to_i64().ok_or_else(|| error!(INTERNAL_ERROR, "extent out of range"))?;
@@ -1624,14 +1500,14 @@ impl LoopVectorizer {
     /// scalable vector length, the tail guarded.
     fn vectorize_for_rvv(&mut self, op: For, extent: i64, m: &mut Mutator) -> Result<Any> {
         const DEFAULT_VSCALE_FACTOR: i32 = 4;
-        let index_dtype = prim_dtype(&Expr::from(op.loop_var.clone()))?;
+        let index_dtype = op.loop_var.prim_dtype()?;
         let zero = int_imm(index_dtype, 0)?;
         let fixed_extent: Expr = int_imm(index_dtype, extent as i128)?.into();
         let scalable_lanes = create_new_lanes(true, DEFAULT_VSCALE_FACTOR)?;
-        let lane_dtype = prim_dtype(&scalable_lanes)?;
+        let lane_dtype = scalable_lanes.prim_dtype()?;
         let lanes_index: Expr = match lane_dtype == index_dtype {
             true => scalable_lanes.clone(),
-            false => Cast::new(scalable_lanes.clone(), prim_type(index_dtype)?)?.into(),
+            false => Cast::new(&scalable_lanes, prim_type(index_dtype)?)?.into(),
         };
         let num_chunks = fixed_extent.ceildiv(&lanes_index).expr()?;
         let name = op.loop_var.name.as_str();
@@ -1639,11 +1515,11 @@ impl LoopVectorizer {
         let inner = prim_var(&format!("{name}.vla.i"), lane_dtype)?;
         let inner_index: Expr = match lane_dtype == index_dtype {
             true => inner.clone().into(),
-            false => Cast::new(inner.clone(), prim_type(index_dtype)?)?.into(),
+            false => Cast::new(&inner, prim_type(index_dtype)?)?.into(),
         };
         let index = (&outer * &lanes_index + inner_index).expr()?;
-        let body = substitute(op.body.clone().into(), &op.loop_var, &index)?;
-        let guarded = If::new_full(index.less(&fixed_extent), body, None, op.loc.clone())?;
+        let body = substitute(&op.body, &op.loop_var, &index)?;
+        let guarded = If::new_full(index.less(&fixed_extent), body, None, &op.loc)?;
         let vector_loop = For::new_full(
             inner,
             int_imm(lane_dtype, 0)?,
@@ -1652,7 +1528,7 @@ impl LoopVectorizer {
             guarded,
             op.annotations.clone(),
             None,
-            op.loc.clone(),
+            &op.loc,
         )?;
         let outer_loop = For::new_full(
             outer,
@@ -1662,7 +1538,7 @@ impl LoopVectorizer {
             vector_loop,
             Map::new(),
             None,
-            op.loc.clone(),
+            &op.loc,
         )?;
         m.mutate(self, &outer_loop)
     }

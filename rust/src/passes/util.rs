@@ -88,7 +88,7 @@ pub fn with_attr(func: &Function, key: &str, value: impl Into<Any>) -> Function 
     func.with_attrs(dict_with(&func.attrs, key, value.into()))
 }
 
-pub use crate::ops::{int32, int32_dtype, int_imm, make_const, prim_dtype, prim_type, unknown_loc};
+pub use crate::ops::{int32, int32_dtype, int_imm, make_const, prim_type, unknown_loc};
 
 /// Typed re-entry from a `#[dispatch(mutate)]` handler: `m.mutate_as(self, &op.body)?` gives the
 /// mutated field back as its own type.

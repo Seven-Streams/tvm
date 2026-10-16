@@ -28,12 +28,12 @@
 //! only; here it is the ordered axis list that layout holds.
 
 use tvm_ffi::{
-    bail, Array, Map, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String, WalkOrder,
-    WalkResult, INTERNAL_ERROR, VALUE_ERROR,
+    bail, AnyCompatible, Array, Map, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, String,
+    WalkOrder, WalkResult, INTERNAL_ERROR, VALUE_ERROR,
 };
 
 use crate::ir::{Bind, Call, CallObj, Expr, IntImmObj, OpHandle, OpObj, SeqStmt, Stmt, StringImm, Var};
-use crate::ops::{int32, int32_dtype, int_imm, prim_dtype, prim_type, Ex, PrimOps};
+use crate::ops::{int32, int32_dtype, int_imm, prim_type, Ex, PrimOps};
 use crate::passes::analyzer::is_const_int;
 use crate::prim::{
     AndObj, BitwiseAndObj, BitwiseNot, BitwiseNotObj, BitwiseOrObj, BitwiseXorObj, CastObj, EQObj,
@@ -646,21 +646,21 @@ fn op_to_range(op: CmpOp, c: i64) -> (i64, i64) {
 }
 
 /// The operands of a comparison.
-fn comparison(expr: &Expr) -> Option<(CmpOp, Expr, Expr)> {
+fn comparison(expr: &Expr) -> Option<(CmpOp, &Expr, &Expr)> {
     if let Some(node) = expr.as_node::<EQObj>() {
-        return Some((CmpOp::Eq, node.a.clone(), node.b.clone()));
+        return Some((CmpOp::Eq, &node.a, &node.b));
     }
     if let Some(node) = expr.as_node::<LTObj>() {
-        return Some((CmpOp::Lt, node.a.clone(), node.b.clone()));
+        return Some((CmpOp::Lt, &node.a, &node.b));
     }
     if let Some(node) = expr.as_node::<LEObj>() {
-        return Some((CmpOp::Le, node.a.clone(), node.b.clone()));
+        return Some((CmpOp::Le, &node.a, &node.b));
     }
     if let Some(node) = expr.as_node::<GTObj>() {
-        return Some((CmpOp::Gt, node.a.clone(), node.b.clone()));
+        return Some((CmpOp::Gt, &node.a, &node.b));
     }
     if let Some(node) = expr.as_node::<GEObj>() {
-        return Some((CmpOp::Ge, node.a.clone(), node.b.clone()));
+        return Some((CmpOp::Ge, &node.a, &node.b));
     }
     None
 }
@@ -671,10 +671,10 @@ fn parse_compare_atom(
 ) -> Option<FilterAtom> {
     let (op, lhs, rhs) = comparison(expr)?;
     let as_var = |e: &Expr| e.clone().try_cast::<Var>().ok();
-    let (var, imm, mirrored) = match (as_var(&lhs), rhs.as_node::<IntImmObj>()) {
-        (Some(var), Some(imm)) => (var, imm.value.clone(), false),
-        _ => match (as_var(&rhs), lhs.as_node::<IntImmObj>()) {
-            (Some(var), Some(imm)) => (var, imm.value.clone(), true),
+    let (var, imm, mirrored) = match (as_var(lhs), rhs.as_node::<IntImmObj>()) {
+        (Some(var), Some(imm)) => (var, imm, false),
+        _ => match (as_var(rhs), lhs.as_node::<IntImmObj>()) {
+            (Some(var), Some(imm)) => (var, imm, true),
             _ => return None,
         },
     };
@@ -682,7 +682,7 @@ fn parse_compare_atom(
         return None;
     }
     let normalized = if mirrored { reflect(op) } else { op };
-    let (lo, hi) = op_to_range(normalized, imm.to_i64()?);
+    let (lo, hi) = op_to_range(normalized, imm.value.to_i64()?);
     Some(FilterAtom::Range { var, lo, hi })
 }
 
@@ -1094,14 +1094,14 @@ impl ExecAnalysis {
 
     fn modulo_target(&self, expr: &Expr) -> Result<Option<(ScopeIdTarget, i64)>> {
         let (lhs, rhs) = if let Some(node) = expr.as_node::<ModObj>() {
-            (node.a.clone(), node.b.clone())
+            (&node.a, &node.b)
         } else if let Some(node) = expr.as_node::<FloorModObj>() {
-            (node.a.clone(), node.b.clone())
+            (&node.a, &node.b)
         } else {
             return Ok(None);
         };
-        let Some(target) = self.resolve(&lhs)? else { return Ok(None) };
-        match as_i64(&self.analyzer.simplify(&rhs, 2)?) {
+        let Some(target) = self.resolve(lhs)? else { return Ok(None) };
+        match as_i64(&self.analyzer.simplify(rhs, 2)?) {
             Some(modulus) if modulus > 0 => Ok(Some((target, modulus))),
             _ => Ok(None),
         }
@@ -1121,11 +1121,11 @@ impl ExecAnalysis {
     /// C++ `TryExtractComparisonRange`.
     fn comparison_range(&self, pred: &Expr) -> Result<Option<ScopeIdRange>> {
         match comparison(pred) {
-            Some((CmpOp::Eq, a, b)) => self.linear_equality_range(&a, &b),
-            Some((CmpOp::Lt, a, b)) => self.linear_compare_range(&a, &b, false, true),
-            Some((CmpOp::Le, a, b)) => self.linear_compare_range(&a, &b, true, true),
-            Some((CmpOp::Gt, a, b)) => self.linear_compare_range(&a, &b, false, false),
-            Some((CmpOp::Ge, a, b)) => self.linear_compare_range(&a, &b, true, false),
+            Some((CmpOp::Eq, a, b)) => self.linear_equality_range(a, b),
+            Some((CmpOp::Lt, a, b)) => self.linear_compare_range(a, b, false, true),
+            Some((CmpOp::Le, a, b)) => self.linear_compare_range(a, b, true, true),
+            Some((CmpOp::Gt, a, b)) => self.linear_compare_range(a, b, false, false),
+            Some((CmpOp::Ge, a, b)) => self.linear_compare_range(a, b, true, false),
             None => Ok(None),
         }
     }
@@ -1133,12 +1133,12 @@ impl ExecAnalysis {
     /// C++ `TryPushComparisonPredicate`.
     fn push_comparison(&mut self, pred: &Expr) -> Result<bool> {
         if let Some((CmpOp::Eq, a, b)) = comparison(pred) {
-            if let Some(range) = self.linear_equality_range(&a, &b)? {
+            if let Some(range) = self.linear_equality_range(a, b)? {
                 if self.push_range(range.target, range.lo, range.hi)? {
                     return Ok(true);
                 }
             }
-            return self.push_modulo_equality(&a, &b);
+            return self.push_modulo_equality(a, b);
         }
         match self.comparison_range(pred)? {
             Some(range) => self.push_range(range.target, range.lo, range.hi),
@@ -1162,7 +1162,7 @@ impl ExecAnalysis {
     /// `tirx.gpu_active_thread_selector(var, cond)`, typed as `var`.
     fn selector(&self, var: &Expr, cond: Expr) -> Result<Expr> {
         let op = GPU_ACTIVE_THREAD_SELECTOR.get()?;
-        Ok(Call::new(var.ty.clone(), op, vec![var.clone(), cond])?.into())
+        Ok(Call::new(&var.ty, op, vec![var.clone(), cond])?.into())
     }
 
     fn push_conjunctive(&mut self, pred: &Expr) -> Result<i32> {
@@ -1244,7 +1244,7 @@ impl ExecAnalysis {
         }
         let mut resolve_error = None;
         let atoms = {
-            let mut is_scope_id = |var: &Var| match self.resolve(&var.clone().into()) {
+            let mut is_scope_id = |var: &Var| match self.resolve(&Expr::from(var)) {
                 Ok(target) => target.is_some(),
                 Err(error) => {
                     resolve_error.get_or_insert(error);
@@ -1362,8 +1362,8 @@ impl ExecAnalysis {
 
     fn rewrite_filter_calls(&self, pred: &Expr) -> Result<Expr> {
         if let Some((a, b, rebuild)) = filter_binary(pred) {
-            let (new_a, new_b) = (self.rewrite_filter_calls(&a)?, self.rewrite_filter_calls(&b)?);
-            if new_a.same_as(&a) && new_b.same_as(&b) {
+            let (new_a, new_b) = (self.rewrite_filter_calls(a)?, self.rewrite_filter_calls(b)?);
+            if new_a.same_as(a) && new_b.same_as(b) {
                 return Ok(pred.clone());
             }
             return rebuild(new_a, new_b).expr();
@@ -1373,7 +1373,7 @@ impl ExecAnalysis {
             if a.same_as(&node.a) {
                 return Ok(pred.clone());
             }
-            return Ok(BitwiseNot::new_full(a, node.loc.clone())?.into());
+            return Ok(BitwiseNot::new_full(a, &node.loc)?.into());
         }
         if let Some(call) = pred.as_node::<CallObj>() {
             if GPU_THREAD_FILTER.is(&call.op) {
@@ -1383,7 +1383,7 @@ impl ExecAnalysis {
             let mut changed = false;
             let mut args = Vec::with_capacity(call.args.len());
             for arg in call.args.iter() {
-                let new_arg = if prim_dtype(&arg).is_ok() {
+                let new_arg = if arg.prim_dtype().is_ok() {
                     self.rewrite_filter_calls(&arg)?
                 } else {
                     arg.clone()
@@ -1398,7 +1398,7 @@ impl ExecAnalysis {
                     Array::new(args),
                     call.attrs.clone(),
                     Array::new(vec![]),
-                    call.loc.clone(),
+                    &call.loc,
                 )?;
                 return Ok(call.into());
             }
@@ -1429,24 +1429,24 @@ impl ExecAnalysis {
 type Rebuild = fn(Expr, Expr) -> Ex;
 
 /// The operands of a node `rewrite_predicate` descends into: `&&`, shifts and bitwise ops.
-fn filter_binary(pred: &Expr) -> Option<(Expr, Expr, Rebuild)> {
+fn filter_binary(pred: &Expr) -> Option<(&Expr, &Expr, Rebuild)> {
     if let Some(n) = pred.as_node::<AndObj>() {
-        return Some((n.a.clone(), n.b.clone(), |a, b| a.logical_and(b)));
+        return Some((&n.a, &n.b, |a, b| a.logical_and(b)));
     }
     if let Some(n) = pred.as_node::<LShiftObj>() {
-        return Some((n.a.clone(), n.b.clone(), |a, b| a << b));
+        return Some((&n.a, &n.b, |a, b| a << b));
     }
     if let Some(n) = pred.as_node::<RShiftObj>() {
-        return Some((n.a.clone(), n.b.clone(), |a, b| a >> b));
+        return Some((&n.a, &n.b, |a, b| a >> b));
     }
     if let Some(n) = pred.as_node::<BitwiseAndObj>() {
-        return Some((n.a.clone(), n.b.clone(), |a, b| a & b));
+        return Some((&n.a, &n.b, |a, b| a & b));
     }
     if let Some(n) = pred.as_node::<BitwiseOrObj>() {
-        return Some((n.a.clone(), n.b.clone(), |a, b| a | b));
+        return Some((&n.a, &n.b, |a, b| a | b));
     }
     if let Some(n) = pred.as_node::<BitwiseXorObj>() {
-        return Some((n.a.clone(), n.b.clone(), |a, b| a ^ b));
+        return Some((&n.a, &n.b, |a, b| a ^ b));
     }
     None
 }
@@ -1465,7 +1465,7 @@ fn flatten_conjuncts(pred: &Expr, out: &mut Vec<Expr>) {
 
 /// C++ `AsBool`: a bool itself, anything else `!= 0`.
 fn as_bool(pred: &Expr) -> Result<Expr> {
-    let dtype = prim_dtype(pred)?;
+    let dtype = pred.prim_dtype()?;
     if dtype.code == tvm_ffi::DLDataTypeCode::kDLBool as u8 {
         return Ok(pred.clone());
     }
@@ -1527,7 +1527,7 @@ impl CudaIndexLowerer {
     fn mutate_var(&mut self, var: Var, m: &mut tvm_ffi::Mutator) -> Result<tvm_ffi::Any> {
         let identity = ObjectIdentity::of(&var);
         if let Some((_, value)) = self.remap.iter().find(|(key, _)| *key == identity) {
-            return Ok(value.clone().into());
+            return Ok(value.to_any());
         }
         m.default_mutate(self, &var)
     }
@@ -1575,11 +1575,10 @@ impl CudaIndexLowerer {
             "thread_in_warpgroup" => FloorMod::new(self.linear_thread()?, 128)?.into(),
             "warp_id" | "warpgroup_id" | "warp_in_warpgroup" => {
                 self.needs_warp = true;
-                let warp: Expr = self.warp.clone().into();
                 match name {
-                    "warp_id" => warp,
-                    "warpgroup_id" => FloorDiv::new(warp, 4)?.into(),
-                    _ => FloorMod::new(warp, 4)?.into(),
+                    "warp_id" => Expr::from(&self.warp),
+                    "warpgroup_id" => FloorDiv::new(&self.warp, 4)?.into(),
+                    _ => FloorMod::new(&self.warp, 4)?.into(),
                 }
             }
             "cta_pair_id" => {
@@ -1697,7 +1696,7 @@ pub(crate) fn lower_indices(stmt: &Stmt, params: &LaunchParams) -> Result<Stmt> 
                 int32(32)?.into(),
             ],
         )?;
-        prefix.push(Bind::new(lowerer.warp.clone(), shuffle)?.into());
+        prefix.push(Bind::new(lowerer.warp, shuffle)?.into());
     }
     prefix.push(result);
     Ok(SeqStmt::new(prefix)?.into())

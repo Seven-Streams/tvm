@@ -23,7 +23,7 @@
 use tvm_ffi::{DLDataType, DLDataTypeCode, Result, INTERNAL_ERROR};
 
 use crate::ir::{Expr, PrimType};
-use crate::ops::{if_then_else, make_const, prim_dtype, prim_type, Ex, PrimOps};
+use crate::ops::{if_then_else, make_const, prim_type, Ex, PrimOps};
 
 const FLOAT: u8 = DLDataTypeCode::kDLFloat as u8;
 const BFLOAT: u8 = DLDataTypeCode::kDLBfloat as u8;
@@ -79,7 +79,7 @@ pub(crate) fn storage_uint(dtype: DLDataType) -> DLDataType {
 
 /// C++ `DTypeConversion(src_value, tgt_dtype)` with `RoundingMode::kHalfToEven`.
 pub(crate) fn dtype_conversion(src_value: Expr, tgt: &PrimType) -> Result<Expr> {
-    let (src_dtype, tgt_dtype) = (prim_dtype(&src_value)?, tgt.dtype);
+    let (src_dtype, tgt_dtype) = (src_value.prim_dtype()?, tgt.dtype);
     check_cmp!(
         src_dtype.lanes,
         ==,
@@ -120,7 +120,7 @@ pub(crate) fn dtype_conversion(src_value: Expr, tgt: &PrimType) -> Result<Expr> 
         } else if bias_delta < 0 {
             ret -= Ex::from(make_const(tgt_uint_dtype, -bias_delta as i64)?) << tgt_fp.mantissa;
         }
-        return ret.reinterpret(tgt.clone()).expr();
+        return ret.reinterpret(tgt).expr();
     }
     let mantissa_mask = make_const(tgt_uint_dtype, (1i64 << tgt_fp.mantissa) - 1)?;
     let ret_mantissa = shift_left(&value) & mantissa_mask;
@@ -132,12 +132,12 @@ pub(crate) fn dtype_conversion(src_value: Expr, tgt: &PrimType) -> Result<Expr> 
             true => (&exponent_before_delta + bias_delta).cast(&tgt_uint) << tgt_fp.mantissa,
             false => exponent_before_delta.cast(&tgt_uint) << tgt_fp.mantissa,
         };
-        return (ret_mantissa | ret_exponent | ret_sign).reinterpret(tgt.clone()).expr();
+        return (ret_mantissa | ret_exponent | ret_sign).reinterpret(tgt).expr();
     }
     let round_to_zero = exponent_before_delta.less(-bias_delta);
     let ret_exponent = (&exponent_before_delta - -bias_delta).cast(&tgt_uint) << tgt_fp.mantissa;
     let zero = make_const(tgt_uint_dtype, 0)?;
     if_then_else(round_to_zero, zero, ret_mantissa | ret_exponent | ret_sign)
-        .reinterpret(tgt.clone())
+        .reinterpret(tgt)
         .expr()
 }

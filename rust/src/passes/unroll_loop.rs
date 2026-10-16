@@ -130,7 +130,7 @@ impl LoopUnroller {
         if !changed {
             return Ok(op.into());
         }
-        Ok(SeqStmt::new_full(seq, op.loc.clone())?.into())
+        Ok(SeqStmt::new_full(seq, &op.loc)?.into())
     }
 }
 

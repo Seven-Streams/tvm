@@ -23,7 +23,7 @@
 //! same kind with the same message.
 
 use tvm::ir::{Call, Expr, Location, PrimType, Type};
-use tvm::ops::{ex, float_imm, if_then_else, make_const, prim_dtype, unknown_loc, Ex, PrimOps};
+use tvm::ops::{ex, float_imm, if_then_else, make_const, unknown_loc, Ex, PrimOps};
 use tvm::prim::{Broadcast, Ramp};
 use tvm::tvm_ffi::{Any, AnyView, BigInt, DLDataType, DLDataTypeExt, Result, String as FfiString};
 
@@ -327,7 +327,7 @@ fn literals_and_compound_expressions_match_cpp() {
     for value in
         [imm("int64", i64::MIN), imm("int32", 5i64), fimm("float32", 2.5), prim_var("int32")]
     {
-        let zero = make_const(prim_dtype(&value).unwrap(), 0).unwrap();
+        let zero = make_const(value.prim_dtype().unwrap(), 0).unwrap();
         let native = sub.call_tuple((zero, value.clone(), loc()));
         outcome.check(|| format!("-{}", repr(&value)), (-&value).expr(), native);
     }

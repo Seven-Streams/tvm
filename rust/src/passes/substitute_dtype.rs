@@ -28,12 +28,12 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    bail, dispatch, structural_mutate, structural_walk, Any, AnyView, Array, Mutator,
-    DLDataTypeExt, ObjectCore, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result, WalkOrder,
-    WalkResult, INTERNAL_ERROR,
+    bail, dispatch, structural_mutate, structural_walk, Any, AnyCompatible, AnyView, Array,
+    Mutator, DLDataTypeExt, ObjectCore, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
+    WalkOrder, WalkResult, INTERNAL_ERROR,
 };
 
-use super::util::{prim_dtype, prim_type, MutatorExt};
+use super::util::{prim_type, MutatorExt};
 use crate::ir::{Call, Expr, PrimTypeObj, TensorLoad, TensorLoadObj, Var, VarObj};
 use crate::ops::{ex, Ex, PrimOps};
 use crate::prim::op::{CLZ, IF_THEN_ELSE, POW};
@@ -89,7 +89,7 @@ pub(crate) fn is_tensor_var(expr: &Expr) -> bool {
 }
 
 fn same_type(a: &Expr, b: &Expr) -> Result<bool> {
-    Ok(prim_dtype(a)? == prim_dtype(b)?)
+    Ok(a.prim_dtype()? == b.prim_dtype()?)
 }
 
 impl Legalizer {
@@ -98,7 +98,7 @@ impl Legalizer {
     fn binary(
         &mut self,
         m: &mut Mutator,
-        node: Expr,
+        node: &impl AnyCompatible,
         a: &Expr,
         b: &Expr,
         op: impl FnOnce(Ex, Expr) -> Ex,
@@ -106,7 +106,7 @@ impl Legalizer {
         let new_a: Expr = m.mutate_as(self, a)?;
         let new_b: Expr = m.mutate_as(self, b)?;
         if new_a.same_as(a) && new_b.same_as(b) && same_type(&new_a, &new_b)? {
-            return Ok(node.into());
+            return Ok(node.to_any());
         }
         Ok(op(ex(new_a), new_b).expr()?.into())
     }
@@ -115,7 +115,7 @@ impl Legalizer {
     fn shift(
         &mut self,
         m: &mut Mutator,
-        node: Expr,
+        node: &impl AnyCompatible,
         a: &Expr,
         b: &Expr,
         op: impl FnOnce(Ex, Expr) -> Ex,
@@ -123,7 +123,7 @@ impl Legalizer {
         let lhs: Expr = m.mutate_as(self, a)?;
         let rhs: Expr = m.mutate_as(self, b)?;
         if lhs.same_as(a) && rhs.same_as(b) && same_type(&lhs, &rhs)? {
-            return Ok(node.into());
+            return Ok(node.to_any());
         }
         Ok(op(ex(lhs), rhs).expr()?.into())
     }
@@ -133,90 +133,70 @@ impl Legalizer {
 impl Legalizer {
     fn mutate_var(&mut self, var: Var, m: &mut Mutator) -> Result<Any> {
         match self.remap.get(&ObjectIdentity::of(&var)) {
-            Some(replacement) => Ok(replacement.clone().into()),
+            Some(replacement) => Ok(replacement.to_any()),
             None => m.default_mutate(self, &var),
         }
     }
 
     fn mutate_add(&mut self, op: Add, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a + b)
+        self.binary(m, &op, &op.a, &op.b, |a, b| a + b)
     }
     fn mutate_sub(&mut self, op: Sub, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a - b)
+        self.binary(m, &op, &op.a, &op.b, |a, b| a - b)
     }
     fn mutate_mul(&mut self, op: Mul, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a * b)
+        self.binary(m, &op, &op.a, &op.b, |a, b| a * b)
     }
     fn mutate_div(&mut self, op: Div, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.div(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.div(b))
     }
     fn mutate_mod(&mut self, op: Mod, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.truncmod(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.truncmod(b))
     }
     fn mutate_floordiv(&mut self, op: FloorDiv, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.floordiv(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.floordiv(b))
     }
     fn mutate_floormod(&mut self, op: FloorMod, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.floormod(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.floormod(b))
     }
     fn mutate_min(&mut self, op: Min, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.min(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.min(b))
     }
     fn mutate_max(&mut self, op: Max, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.max(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.max(b))
     }
     fn mutate_eq(&mut self, op: EQ, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.equal(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.equal(b))
     }
     fn mutate_ne(&mut self, op: NE, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.not_equal(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.not_equal(b))
     }
     fn mutate_le(&mut self, op: LE, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.less_equal(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.less_equal(b))
     }
     fn mutate_lt(&mut self, op: LT, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.less(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.less(b))
     }
     fn mutate_gt(&mut self, op: GT, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.greater(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.greater(b))
     }
     fn mutate_ge(&mut self, op: GE, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a.greater_equal(b))
+        self.binary(m, &op, &op.a, &op.b, |a, b| a.greater_equal(b))
     }
     fn mutate_bitwise_and(&mut self, op: BitwiseAnd, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a & b)
+        self.binary(m, &op, &op.a, &op.b, |a, b| a & b)
     }
     fn mutate_bitwise_or(&mut self, op: BitwiseOr, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a | b)
+        self.binary(m, &op, &op.a, &op.b, |a, b| a | b)
     }
     fn mutate_bitwise_xor(&mut self, op: BitwiseXor, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.binary(m, op.into(), &a, &b, |a, b| a ^ b)
+        self.binary(m, &op, &op.a, &op.b, |a, b| a ^ b)
     }
     fn mutate_left_shift(&mut self, op: LShift, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.shift(m, op.into(), &a, &b, |a, b| a << b)
+        self.shift(m, &op, &op.a, &op.b, |a, b| a << b)
     }
     fn mutate_right_shift(&mut self, op: RShift, m: &mut Mutator) -> Result<Any> {
-        let (a, b) = (op.a.clone(), op.b.clone());
-        self.shift(m, op.into(), &a, &b, |a, b| a >> b)
+        self.shift(m, &op, &op.a, &op.b, |a, b| a >> b)
     }
 
     fn mutate_bitwise_not(&mut self, op: BitwiseNot, m: &mut Mutator) -> Result<Any> {
@@ -224,7 +204,7 @@ impl Legalizer {
         if a.same_as(&op.a) {
             return Ok(op.into());
         }
-        Ok(BitwiseNot::new_full(a, op.loc.clone())?.into())
+        Ok(BitwiseNot::new_full(a, &op.loc)?.into())
     }
 
     /// Both values are cast to the wider of their types.
@@ -239,7 +219,7 @@ impl Legalizer {
         {
             return Ok(op.into());
         }
-        let (true_dtype, false_dtype) = (prim_dtype(&true_value)?, prim_dtype(&false_value)?);
+        let (true_dtype, false_dtype) = (true_value.prim_dtype()?, false_value.prim_dtype()?);
         let dtype =
             tvm_ffi::DLDataType { bits: true_dtype.bits.max(false_dtype.bits), ..true_dtype };
         let true_value = match true_dtype == dtype {
@@ -260,7 +240,7 @@ impl Legalizer {
         if base.same_as(&op.base_) && stride.same_as(&op.stride) && same_type(&base, &stride)? {
             return Ok(op.into());
         }
-        let (base_dtype, stride_dtype) = (prim_dtype(&base)?, prim_dtype(&stride)?);
+        let (base_dtype, stride_dtype) = (base.prim_dtype()?, stride.prim_dtype()?);
         let int = tvm_ffi::DLDataTypeCode::kDLInt as u8;
         check!(
             base_dtype.code == int && stride_dtype.code == int,
@@ -278,7 +258,7 @@ impl Legalizer {
             true => stride,
             false => stride.cast(dtype).expr()?,
         };
-        Ok(Ramp::new(base, stride, op.lanes.clone())?.into())
+        Ok(Ramp::new(base, stride, &op.lanes)?.into())
     }
 
     /// Rebuilt by the constructor, which infers the type.
@@ -308,11 +288,11 @@ impl Legalizer {
         let var: Var = m.mutate(self, &op.var)?.try_into()?;
         let var_dtype = var.ty.as_node::<PrimTypeObj>().map(|ty| ty.dtype);
         let mut var = var;
-        if Some(prim_dtype(&value)?) != var_dtype {
+        if Some(value.prim_dtype()?) != var_dtype {
             if var.same_as(&op.var) {
-                let ty = prim_type(prim_dtype(&value)?)?;
-                let retyped = Var::new_full(op.var.name.clone(), ty, op.var.loc.clone())?;
-                self.remap.insert(ObjectIdentity::of(&op.var), retyped.clone().into());
+                let ty = prim_type(value.prim_dtype()?)?;
+                let retyped = Var::new_full(op.var.name.clone(), ty, &op.var.loc)?;
+                self.remap.insert(ObjectIdentity::of(&op.var), Expr::from(&retyped));
                 var = retyped;
             } else {
                 let var_ty = var.ty.clone().try_cast::<crate::ir::PrimType>()?;
@@ -324,7 +304,7 @@ impl Legalizer {
         if value_unchanged && body.same_as(&op.body) && var.same_as(&op.var) {
             return Ok(op.into());
         }
-        Ok(Let::new_full(var, value, body, op.loc.clone())?.into())
+        Ok(Let::new_full(var, value, body, &op.loc)?.into())
     }
 
     /// `pow`, `if_then_else` and `clz` are rebuilt for the new argument types.
@@ -348,13 +328,13 @@ impl Legalizer {
                 args,
                 call.attrs.clone(),
                 Array::new(vec![]),
-                call.loc.clone(),
+                &call.loc,
             )?;
             return Ok(rebuilt.into());
         }
         if CLZ.is(&call.op) {
             let (before_dtype, after_dtype) =
-                (prim_dtype(&before.args.get(0)?)?, prim_dtype(&call.args.get(0)?)?);
+                (before.args.get(0)?.prim_dtype()?, call.args.get(0)?.prim_dtype()?);
             let integer = |d: tvm_ffi::DLDataType| d.code <= 1 && (d.bits == 32 || d.bits == 64);
             for (when, dtype) in [("before", before_dtype), ("after", after_dtype)] {
                 if !integer(dtype) {
@@ -373,15 +353,15 @@ impl Legalizer {
 
     /// A changed load of a tensor variable is rebuilt by the constructor, which infers its type.
     fn mutate_load(&mut self, op: TensorLoad, m: &mut Mutator) -> Result<Any> {
-        let original: Expr = op.clone().into();
+        let original: Expr = op.into();
         let result: Expr = m.default_mutate_as(self, &original)?;
         if result.same_as(&original) {
-            return Ok(op.into());
+            return Ok(original.into());
         }
         let load = result.as_node::<TensorLoadObj>().expect("a load mutates to a load");
         if is_tensor_var(&load.source) {
             let indices: Vec<Expr> = load.indices.iter().collect();
-            return Ok(TensorLoad::new_full(load.source.clone(), indices, load.loc.clone())?.into());
+            return Ok(TensorLoad::new_full(&load.source, indices, &load.loc)?.into());
         }
         Ok(result.into())
     }

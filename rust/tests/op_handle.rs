@@ -30,7 +30,7 @@ use tvm::ir::{
     register_ops, Call, CallObj, DictAttrs, Evaluate, Expr, Op, OpHandle, RegionStmt,
     RegionStmtObj, Signature, StringImm, Var,
 };
-use tvm::ops::{int32, int_imm, prim_dtype, unknown_loc};
+use tvm::ops::{int32, int_imm, unknown_loc};
 use tvm::tvm_ffi::{
     Any, Array, DLDataType, DLDataTypeExt, Error, ErrorKind, Map, ObjectRefCast, ObjectRefCore,
     Result, String as FfiString, ATTRIBUTE_ERROR, INTERNAL_ERROR, VALUE_ERROR,
@@ -74,7 +74,7 @@ static PANICKING: OpHandle = OpHandle::define("rust_test.panicking_region", "", 
 
 fn launch_body_params(call: &CallObj) -> Result<Array<Var>> {
     let tag = call.args.get(0)?.try_cast::<StringImm>()?;
-    let dtype = prim_dtype(&call.args.get(1)?)?;
+    let dtype = call.args.get(1)?.prim_dtype()?;
     if tag.value.as_str().is_empty() {
         let message = "Check failed: (!tag->value.empty()) is false: launch_thread expects a \
                        nonempty StringImm thread tag";

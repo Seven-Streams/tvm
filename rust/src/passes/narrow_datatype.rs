@@ -35,7 +35,7 @@ use tvm_ffi::{
 };
 
 use super::data_type_rewriter::{DataTypeRewrite, DataTypeRewriterBase, DataTypeRewriterState};
-use super::util::{function_pass, int_imm, prim_dtype, prim_type, MutatorExt};
+use super::util::{function_pass, int_imm, prim_type, MutatorExt};
 use crate::ir::{
     AssertStmt, Bind, Call, CallObj, Expr, FloatImmObj, For, IntImm, IntImmObj, OpaqueExprObj,
     PrimTypeObj, Range, RegionStmt, SeqStmt, Stmt, TensorLoad, TensorLoadObj, TensorStore, Tuple,
@@ -144,7 +144,7 @@ impl DataTypeVisitor {
             return self.memoize(&op.body);
         }
         let value = self.analyzer.const_int_bound(&op.value)?;
-        let unbound = self.analyzer.const_int_bound(&op.var.clone().into())?;
+        let unbound = self.analyzer.const_int_bound(&Expr::from(&op.var))?;
         self.analyzer.update_const_int_bound(&op.var, &value, true)?;
         self.released_lets.remove(&key);
         let result = self.memoize(&op.body);
@@ -180,14 +180,14 @@ impl DataTypeVisitor {
             }
         };
         let limit = 1i128 << (self.target_bits - 1);
-        let fits = prim_dtype(expr)?.bits as i32 <= self.target_bits
+        let fits = expr.prim_dtype()?.bits as i32 <= self.target_bits
             || ((max as i128) < limit && min as i128 >= -limit);
         Ok(if fits { self.target_bits } else { MAX_BITS })
     }
 
     /// Record that `expr` may be narrowed to `bits`; the widest requirement wins.
     fn narrow(&mut self, expr: Expr, bits: i32) -> Result<()> {
-        let dtype = prim_dtype(&expr)?;
+        let dtype = expr.prim_dtype()?;
         let key = ObjectIdentity::of(&expr);
         let bits = match self.vmap.get(&key) {
             Some((_, found)) => (found.bits as i32).max(bits),
@@ -243,7 +243,7 @@ fn visit_node(
     if let Some(op) = value.cast::<For>() {
         let state = ctx.state_mut();
         state.analyzer.bind_range(&op.loop_var, &Range::from_min_extent(&op.min, &op.extent)?)?;
-        state.vextent.insert(ObjectIdentity::of(&op.loop_var), prim_dtype(&op.extent)?);
+        state.vextent.insert(ObjectIdentity::of(&op.loop_var), op.extent.prim_dtype()?);
     }
     if let Some(op) = value.cast::<Let>() {
         // The analysis of an integer `Let` (here or as part of an enclosing expression) recorded
@@ -259,9 +259,9 @@ fn visit_node(
         if LAUNCH_THREAD.is(&op.op) {
             let var = op.body_params.get(0)?;
             let extent = op.args.get(1)?;
-            let zero = int_imm(prim_dtype(&extent)?, 0)?;
+            let zero = int_imm(extent.prim_dtype()?, 0)?;
             state.analyzer.bind_range(&var, &Range::from_min_extent(zero, &extent)?)?;
-            state.vextent.insert(ObjectIdentity::of(&var), prim_dtype(&extent)?);
+            state.vextent.insert(ObjectIdentity::of(&var), extent.prim_dtype()?);
         }
     }
     if value.as_node::<VarObj>().is_some() {
@@ -275,7 +275,7 @@ fn visit_node(
     if let Some(imm) = value.cast::<IntImm>() {
         let expr: Expr = imm.into();
         let state = ctx.state_mut();
-        let dtype = prim_dtype(&expr)?;
+        let dtype = expr.prim_dtype()?;
         if dtype.code == DL_INT {
             let bits = (dtype.bits as i32).min(state.bits);
             state.narrow(expr, bits)?;
@@ -285,7 +285,7 @@ fn visit_node(
     if let Some(cast) = value.cast::<Cast>() {
         let expr: Expr = cast.into();
         let state = ctx.state_mut();
-        let dtype = prim_dtype(&expr)?;
+        let dtype = expr.prim_dtype()?;
         if dtype.code == DL_INT {
             let bits = (dtype.bits as i32).min(state.bits);
             state.narrow(expr, bits)?;
@@ -398,7 +398,7 @@ impl NarrowRewriter {
             Some(dtype) if self.base.is_enabled => {
                 let cast: Cast = m.default_mutate_as(self, &op)?;
                 let value = cast.value.clone();
-                if prim_dtype(&value)? == dtype {
+                if value.prim_dtype()? == dtype {
                     return Ok(value.into());
                 }
                 Ok(Cast::new(value, prim_type(dtype)?)?.into())
@@ -466,7 +466,7 @@ impl NarrowRewriter {
     ) -> Result<Any> {
         let new_a: Expr = m.mutate_as(self, a)?;
         let new_b: Expr = m.mutate_as(self, b)?;
-        let types_match = prim_dtype(&new_a)? == prim_dtype(&new_b)?;
+        let types_match = new_a.prim_dtype()? == new_b.prim_dtype()?;
         if new_a.same_as(a) && new_b.same_as(b) && types_match {
             return Ok(UnchangedOr::<Any>::unchanged().into());
         }
@@ -488,7 +488,7 @@ fn narrow_body(body: SeqStmt, target_bits: i32) -> Result<SeqStmt> {
     let mut rewriter =
         NarrowRewriter { base: DataTypeRewriterBase::new(true), vmap: HashMap::new() };
     for (key, (expr, dtype)) in visitor.into_state().vmap {
-        if prim_dtype(&expr)? == dtype {
+        if expr.prim_dtype()? == dtype {
             continue;
         }
         if expr.as_node::<VarObj>().is_some() {

@@ -30,7 +30,7 @@ use tvm_ffi::{
 
 use super::analyzer::{bind_range, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::side_effect::{side_effect, PURE};
-use super::util::{function_pass, make_const, prim_dtype, MutatorExt};
+use super::util::{function_pass, make_const, MutatorExt};
 use crate::ir::{
     Bind, Call, CallObj, Evaluate, Expr, For, If, IntImmObj, PrimTypeObj, SeqStmt, Stmt, StringImm,
     TensorLoadObj, TensorStore, Var, VarObj,
@@ -201,7 +201,7 @@ fn stores_loaded_value(store: &TensorStore) -> Result<bool> {
 /// `AnalyzerObj::MarkGlobalNonNegValue`, which has no global: for `value = symbol * scale +
 /// offset` with a positive constant scale, bound `symbol >= -offset`.
 pub(crate) fn mark_global_non_neg_value(analyzer: &Analyzer, value: &Expr) -> Result<()> {
-    let dtype = prim_dtype(value)?;
+    let dtype = value.prim_dtype()?;
     let constant = |expr: &Expr| {
         expr.as_node::<IntImmObj>().map(|imm| imm.value.to_i64().unwrap_or(0) as i128)
     };

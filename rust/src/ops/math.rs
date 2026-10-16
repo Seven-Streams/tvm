@@ -26,16 +26,15 @@
 //! combine expressions with the operators of [`super::arith`].
 
 use tvm_ffi::{
-    Array, BigInt, DLDataType, DLDataTypeCode, DLDataTypeExt, Error, ErrorKind, ObjectRefCast,
-    ObjectRefCore, Result, INTERNAL_ERROR, TYPE_ERROR,
+    Array, BigInt, DLDataType, DLDataTypeCode, DLDataTypeExt, Error, ErrorKind, ObjectRefCore,
+    Result, INTERNAL_ERROR, TYPE_ERROR,
 };
 
 use super::arith::{Ex, PrimOps};
 use super::fold::fold_result;
 use super::native::repr;
 use super::build::{
-    float_imm, float_imm_at, int32, int32_dtype, int_imm_at, prim_dtype, prim_type, IntoExpr,
-    IntoPrimType,
+    float_imm, float_imm_at, int32, int32_dtype, int_imm_at, prim_type, IntoExpr, IntoPrimType,
 };
 use crate::ir::{
     Call, Expr, FloatImmObj, IntImmObj, Location, Op, PrimType, PrimTypeObj, PtrTypeObj,
@@ -135,12 +134,6 @@ fn vscale() -> Result<Expr> {
     call(Some(prim_type(int32_dtype())?.into()), "prim.vscale", vec![], &super::unknown_loc()?)
 }
 
-/// `x.ty()` of a `PrimExpr`.
-fn prim_ty(x: &Expr) -> Result<PrimType> {
-    prim_dtype(x)?;
-    Ok(x.ty.clone().try_cast().expect("checked to be a PrimType"))
-}
-
 // ---------------------------------------------------------------------------------------------
 // MakeConst and cast
 
@@ -232,7 +225,7 @@ fn fold_or_cast(value: Expr, ty: PrimType, loc: &Location) -> Result<Expr> {
 /// constant is folded, a scalar cast to a vector type is broadcast, and a broadcast or an
 /// integer ramp is cast element by element; anything else is a `Cast` node.
 pub(crate) fn cast(value: Expr, ty: PrimType, loc: &Location) -> Result<Expr> {
-    let (from, to) = (prim_dtype(&value)?, ty.dtype);
+    let (from, to) = (value.prim_dtype()?, ty.dtype);
     if from == to {
         return Ok(value);
     }
@@ -284,7 +277,7 @@ pub(crate) fn cast(value: Expr, ty: PrimType, loc: &Location) -> Result<Expr> {
 /// C++ `BroadcastToMatchLanes`: a scalar next to a vector of type `other` is broadcast to its
 /// lanes.
 fn broadcast_to_lanes(value: Expr, other: DLDataType) -> Result<Expr> {
-    let dtype = prim_dtype(&value)?;
+    let dtype = value.prim_dtype()?;
     if is_scalable(dtype)
         || is_fixed_vector(dtype)
         || !(is_scalable(other) || is_fixed_vector(other))
@@ -347,12 +340,12 @@ pub fn match_types(lhs: impl IntoExpr, rhs: impl IntoExpr) -> Result<(Expr, Expr
 }
 
 pub(crate) fn match_types_at(lhs: Expr, rhs: Expr, loc: &Location) -> Result<(Expr, Expr)> {
-    if prim_dtype(&lhs)? == prim_dtype(&rhs)? {
+    if lhs.prim_dtype()? == rhs.prim_dtype()? {
         return Ok((lhs, rhs));
     }
-    let lhs = broadcast_to_lanes(lhs, prim_dtype(&rhs)?)?;
-    let rhs = broadcast_to_lanes(rhs, prim_dtype(&lhs)?)?;
-    let (lhs_ty, rhs_ty) = (prim_dtype(&lhs)?, prim_dtype(&rhs)?);
+    let lhs = broadcast_to_lanes(lhs, rhs.prim_dtype()?)?;
+    let rhs = broadcast_to_lanes(rhs, lhs.prim_dtype()?)?;
+    let (lhs_ty, rhs_ty) = (lhs.prim_dtype()?, rhs.prim_dtype()?);
     if is_scalable(lhs_ty) != is_scalable(rhs_ty) {
         let condition = "lhs_ty.IsScalableVector() == rhs_ty.IsScalableVector()";
         return Err(check_failed(
@@ -391,7 +384,7 @@ pub(crate) fn match_types_at(lhs: Expr, rhs: Expr, loc: &Location) -> Result<(Ex
 /// `floor`, `ceil`, `round`, `nearbyint` and `trunc`: an integer or a bool is itself, a float
 /// constant is folded with `fold`, keeping its location, and anything else is a call.
 fn rounding(x: Expr, name: &'static str, fold: fn(f64) -> f64, loc: &Location) -> Result<Expr> {
-    let dtype = prim_dtype(&x)?;
+    let dtype = x.prim_dtype()?;
     if matches!(dtype.code, INT | UINT | BOOL) {
         return Ok(x);
     }
@@ -428,12 +421,12 @@ pub(crate) fn isnan(x: Expr, loc: &Location) -> Result<Expr> {
 }
 
 pub(crate) fn isinf(x: Expr, loc: &Location) -> Result<Expr> {
-    let dtype = prim_dtype(&x)?;
+    let dtype = x.prim_dtype()?;
     let result = DLDataType { code: BOOL, bits: 8, lanes: lanes(dtype)? as u16 };
     match dtype.code {
         INT | UINT => make_const(result, Value::Int(BigInt::from(0i64)), loc),
         FLOAT => {
-            let infinity = infinity_at(prim_ty(&x)?, loc)?;
+            let infinity = infinity_at(x.prim_ty()?, loc)?;
             let finite = Ex::from(abs(x.clone(), loc)?).equal(infinity);
             finite.logical_and(!Ex::from(isnan(x, loc)?)).expr()
         }
@@ -474,7 +467,7 @@ fn infinity_at(ty: PrimType, loc: &Location) -> Result<Expr> {
 }
 
 pub(crate) fn abs(x: Expr, loc: &Location) -> Result<Expr> {
-    let dtype = prim_dtype(&x)?;
+    let dtype = x.prim_dtype()?;
     match dtype.code {
         INT => integer_abs(x, loc),
         FLOAT | BFLOAT => match x.as_node::<FloatImmObj>() {
@@ -495,7 +488,7 @@ pub(crate) fn abs(x: Expr, loc: &Location) -> Result<Expr> {
 /// C++ `IntegerAbs(x, loc)`: a constant folded, wrapping at 64 bits; `select(x >= 0, x, -x)`
 /// otherwise.
 fn integer_abs(x: Expr, loc: &Location) -> Result<Expr> {
-    let dtype = prim_dtype(&x)?;
+    let dtype = x.prim_dtype()?;
     if let Some(imm) = x.as_node::<IntImmObj>() {
         let mut value = if imm.value.is_negative() { -&imm.value } else { imm.value.clone() };
         if dtype.bits >= 64 {
@@ -533,7 +526,7 @@ pub(crate) fn intrinsic(
     float_only: bool,
     loc: &Location,
 ) -> Result<Expr> {
-    let dtype = prim_dtype(&x)?;
+    let dtype = x.prim_dtype()?;
     if float_only && dtype.code != FLOAT && !is_bfloat16(dtype) {
         let condition = "dtype.code() == DLDataTypeCode::kDLFloat || \
                          dtype.MatchesElementType(DLDataTypeCode::kDLBfloat, 16)";
@@ -566,7 +559,7 @@ pub(crate) fn binary_intrinsic(
 /// `pow` and `fmod`: both sides matched, and a float result.
 fn float_binary(x: Expr, y: Expr, name: &'static str, what: &str, loc: &Location) -> Result<Expr> {
     let (x, y) = match_types_at(x, y, loc)?;
-    if prim_dtype(&x)?.code != FLOAT {
+    if x.prim_dtype()?.code != FLOAT {
         let condition = "x.ty().MatchesCode(DLDataTypeCode::kDLFloat)";
         return Err(check_failed(
             INTERNAL_ERROR,
@@ -589,7 +582,7 @@ pub(crate) fn fmod(x: Expr, y: Expr, loc: &Location) -> Result<Expr> {
 /// C++ `tirx::logaddexp(a, b, loc)`: `log(exp(a) + exp(b))` of two matched floats.
 pub(crate) fn logaddexp(a: Expr, b: Expr, loc: &Location) -> Result<Expr> {
     for (side, value) in [("a", &a), ("b", &b)] {
-        if prim_dtype(value)?.code != FLOAT {
+        if value.prim_dtype()?.code != FLOAT {
             let condition = format!("{side}.ty().MatchesCode(DLDataTypeCode::kDLFloat)");
             return Err(check_failed(INTERNAL_ERROR, &condition, &repr(value)));
         }

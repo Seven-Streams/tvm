@@ -38,7 +38,7 @@ use std::collections::HashMap;
 
 use tvm_ffi::{
     bail, match_any, Any, Array, MutContextPolicy, MutateContext, MutateValue, ObjectIdentity,
-    ObjectRefCast, ObjectRefCore, Result, UnchangedOr, INTERNAL_ERROR, TYPE_ERROR,
+    ObjectRefCore, Result, UnchangedOr, INTERNAL_ERROR, TYPE_ERROR,
 };
 
 use super::util::ContextExt;
@@ -199,15 +199,6 @@ fn rewrite<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, value: Any) -> Rewritt
 // ---------------------------------------------------------------------------------------------
 // Types
 
-/// `expr.ty()` of a `PrimExpr`.
-pub fn prim_ty(expr: &Expr) -> Result<PrimType> {
-    expr.ty.clone().try_cast()
-}
-
-fn dtype(expr: &Expr) -> Result<DLDataType> {
-    Ok(prim_ty(expr)?.dtype)
-}
-
 /// `PrimType::WithBits(bits)`.
 pub fn with_bits(ty: &PrimType, bits: u8) -> Result<PrimType> {
     crate::ops::prim_type(DLDataType { bits, ..ty.dtype })
@@ -242,8 +233,8 @@ fn legalize_region<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: RegionStmt
     }
     let var: Expr = region.body_params.get(0)?.into();
     let extent = region.args.get(1)?;
-    let var_ty = prim_ty(&var)?;
-    if var_ty.dtype == dtype(&extent)? {
+    let var_ty = var.prim_ty()?;
+    if var_ty.dtype == extent.prim_dtype()? {
         return changed(result);
     }
     let mut args: Vec<Expr> = region.args.iter().collect();
@@ -255,7 +246,7 @@ fn legalize_region<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: RegionStmt
 fn legalize_for<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: For) -> Rewritten {
     let result: For = ctx.default_mutate(&op)?.try_into()?;
     let var: Expr = ctx.mutate_as(&result.loop_var)?.into();
-    let var_ty = prim_ty(&var)?;
+    let var_ty = var.prim_ty()?;
     let min = cast(result.min.clone(), &var_ty)?;
     let extent = cast(result.extent.clone(), &var_ty)?;
     let step = result.step.clone().map(|step| cast(step, &var_ty)).transpose()?;
@@ -273,8 +264,8 @@ fn legalize_bind<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Bind) -> Rew
     }
     let value: Expr = ctx.mutate_as(&op.value)?;
     let mut var = op.var.clone();
-    if let Ok(value_ty) = prim_ty(&value) {
-        if value_ty.dtype != dtype(&op.var.clone().into())? {
+    if let Ok(value_ty) = value.prim_ty() {
+        if value_ty.dtype != op.var.prim_dtype()? {
             var = copy_with_type(&op.var, value_ty);
             ctx.state_mut().base().remap_set(&op.var, var.clone());
         }
@@ -282,7 +273,7 @@ fn legalize_bind<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Bind) -> Rew
     if value.same_as(&op.value) && var.same_as(&op.var) {
         return unchanged();
     }
-    changed(Bind::new_full(var, value, op.loc.clone())?)
+    changed(Bind::new_full(var, value, &op.loc)?)
 }
 
 /// A let variable takes the type of its value, or the value the type of a replaced variable.
@@ -290,10 +281,10 @@ fn legalize_let<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Let) -> Rewri
     let mut value: Expr = ctx.mutate_as(&op.value)?;
     let mut value_unchanged = value.same_as(&op.value);
     let mut var: Var = ctx.mutate_as(&op.var)?;
-    let var_ty = prim_ty(&var.clone().into())?;
-    if dtype(&value)? != var_ty.dtype {
+    let var_ty = var.prim_ty()?;
+    if value.prim_dtype()? != var_ty.dtype {
         if var.same_as(&op.var) {
-            var = copy_with_type(&op.var, prim_ty(&value)?);
+            var = copy_with_type(&op.var, value.prim_ty()?);
             ctx.state_mut().base().remap_set(&op.var, var.clone());
         } else {
             value = cast(value, &var_ty)?;
@@ -304,7 +295,7 @@ fn legalize_let<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Let) -> Rewri
     if value_unchanged && body.same_as(&op.body) && var.same_as(&op.var) {
         return unchanged();
     }
-    changed(Let::new_full(var, value, body, op.loc.clone())?)
+    changed(Let::new_full(var, value, body, &op.loc)?)
 }
 
 /// The two arms of a select take the wider of their types.
@@ -317,7 +308,7 @@ fn select<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Select, index: bool
     let condition: Expr = condition?;
     let true_value: Expr = ctx.mutate_as(&op.true_value)?;
     let false_value: Expr = ctx.mutate_as(&op.false_value)?;
-    let (true_ty, false_ty) = (prim_ty(&true_value)?, prim_ty(&false_value)?);
+    let (true_ty, false_ty) = (true_value.prim_ty()?, false_value.prim_ty()?);
     if condition.same_as(&op.condition)
         && true_value.same_as(&op.true_value)
         && false_value.same_as(&op.false_value)
@@ -331,7 +322,7 @@ fn select<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Select, index: bool
 
 /// Both values cast to the first one's type with the wider of their bit widths.
 fn widen(lhs: Expr, rhs: Expr) -> Result<(Expr, Expr)> {
-    let (lhs_ty, rhs_ty) = (prim_ty(&lhs)?, prim_ty(&rhs)?);
+    let (lhs_ty, rhs_ty) = (lhs.prim_ty()?, rhs.prim_ty()?);
     let ty = with_bits(&lhs_ty, lhs_ty.dtype.bits.max(rhs_ty.dtype.bits))?;
     let lhs = if lhs_ty.dtype != ty.dtype { cast(lhs, &ty)? } else { lhs };
     let rhs = if rhs_ty.dtype != ty.dtype { cast(rhs, &ty)? } else { rhs };
@@ -341,7 +332,7 @@ fn widen(lhs: Expr, rhs: Expr) -> Result<(Expr, Expr)> {
 fn legalize_ramp<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Ramp) -> Rewritten {
     let base: Expr = ctx.mutate_as(&op.base_)?;
     let stride: Expr = ctx.mutate_as(&op.stride)?;
-    let (base_ty, stride_ty) = (prim_ty(&base)?, prim_ty(&stride)?);
+    let (base_ty, stride_ty) = (base.prim_ty()?, stride.prim_ty()?);
     if base.same_as(&op.base_) && stride.same_as(&op.stride) && base_ty.dtype == stride_ty.dtype {
         return unchanged();
     }
@@ -352,7 +343,7 @@ fn legalize_ramp<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Ramp) -> Rew
          stride_dtype.MatchesCode(DLDataTypeCode::kDLInt)"
     );
     let (base, stride) = widen(base, stride)?;
-    changed(Ramp::new(base, stride, op.lanes.clone())?)
+    changed(Ramp::new(base, stride, &op.lanes)?)
 }
 
 /// Rebuilt by its constructor, which infers the type again.
@@ -383,16 +374,16 @@ fn shift<S: DataTypeRewriterState>(
     b: &Expr,
     combine: fn(&Expr, &Expr) -> Ex,
 ) -> Rewritten {
-    let before = dtype(a)?;
+    let before = a.prim_dtype()?;
     let lhs: Expr = ctx.mutate_as(a)?;
     let mut rhs: Expr = ctx.mutate_as(b)?;
-    let after = dtype(&lhs)?;
+    let after = lhs.prim_dtype()?;
     let clamp = ctx.state_mut().base().clamp_shift_amounts;
     if clamp && before.code == DL_INT && after.code == DL_INT && before.bits > after.bits {
-        let limit = make_const(dtype(&rhs)?, after.bits as i64 - 1)?;
+        let limit = make_const(rhs.prim_dtype()?, after.bits as i64 - 1)?;
         rhs = rhs.min(&limit).expr()?;
     }
-    if lhs.same_as(a) && rhs.same_as(b) && after == dtype(&rhs)? {
+    if lhs.same_as(a) && rhs.same_as(b) && after == rhs.prim_dtype()? {
         return unchanged();
     }
     changed(combine(&lhs, &rhs).expr()?)
@@ -406,7 +397,7 @@ fn legalize_bitwise_not<S: DataTypeRewriterState>(
     if a.same_as(&op.a) {
         return unchanged();
     }
-    changed(BitwiseNot::new_full(a, op.loc.clone())?)
+    changed(BitwiseNot::new_full(a, &op.loc)?)
 }
 
 /// A binary operation rebuilt by its C++ operator, which matches the operand types.
@@ -418,7 +409,7 @@ fn binary<S: DataTypeRewriterState>(
 ) -> Rewritten {
     let new_a: Expr = ctx.mutate_as(a)?;
     let new_b: Expr = ctx.mutate_as(b)?;
-    if new_a.same_as(a) && new_b.same_as(b) && dtype(&new_a)? == dtype(&new_b)? {
+    if new_a.same_as(a) && new_b.same_as(b) && new_a.prim_dtype()? == new_b.prim_dtype()? {
         return unchanged();
     }
     changed(combine(&new_a, &new_b).expr()?)
@@ -435,7 +426,7 @@ fn comparison<S: DataTypeRewriterState>(
     if !index {
         return binary(ctx, a, b, combine);
     }
-    let is_int = |e: &Expr| dtype(e).map(|d| d.code == DL_INT);
+    let is_int = |e: &Expr| e.prim_dtype().map(|d| d.code == DL_INT);
     let enable = ctx.state_mut().base().is_condition && is_int(a)? && is_int(b)?;
     let enabled = std::mem::replace(&mut ctx.state_mut().base().is_enabled, enable);
     let result = binary(ctx, a, b, combine);
@@ -454,7 +445,7 @@ fn legalize_call<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, before: Call) ->
         return changed(call.args.get(0)?.pow(call.args.get(1)?).expr()?);
     }
     if IF_THEN_ELSE.is(&call.op) {
-        let ty = prim_ty(&call.clone().into())?;
+        let ty = call.prim_ty()?;
         let args = Array::new(vec![call.args.get(0)?, call.args.get(1)?, call.args.get(2)?]);
         let rebuilt = Call::new_full(
             Some(ty.into()),
@@ -462,13 +453,13 @@ fn legalize_call<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, before: Call) ->
             args,
             call.attrs.clone(),
             Array::new(vec![]),
-            call.loc.clone(),
+            &call.loc,
         )?;
         return changed(rebuilt);
     }
     if CLZ.is(&call.op) {
-        let before_dtype = dtype(&before.args.get(0)?)?;
-        let after_dtype = dtype(&call.args.get(0)?)?;
+        let before_dtype = before.args.get(0)?.prim_dtype()?;
+        let after_dtype = call.args.get(0)?.prim_dtype()?;
         for (when, d) in [("before", before_dtype), ("after", after_dtype)] {
             if !(matches!(d.code, 0 | 1) && matches!(d.bits, 32 | 64)) {
                 bail!(
@@ -504,7 +495,7 @@ fn index_store<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: TensorStore) -
     let mut value: Expr = ctx.mutate_as(&op.value)?;
     let mut value_unchanged = value.same_as(&op.value);
     let element = tensor_dtype(&dest)?;
-    let value_dtype = dtype(&value)?;
+    let value_dtype = value.prim_dtype()?;
     if element.dtype != value_dtype && value_dtype.lanes == 1 {
         value = cast(value, &element)?;
         value_unchanged = false;
@@ -522,7 +513,7 @@ fn index_load<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: TensorLoad) -> 
     if source.same_as(&op.source) && indices.same_as(&op.indices) {
         return changed(op);
     }
-    changed(TensorLoad::new_full(source, indices.iter(), op.loc.clone())?)
+    changed(TensorLoad::new_full(source, indices.iter(), &op.loc)?)
 }
 
 fn index_if<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: If) -> Rewritten {
@@ -563,7 +554,7 @@ fn index_for<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: For) -> Rewritte
     {
         return unchanged();
     }
-    let var_ty = prim_ty(&loop_var.clone().into())?;
+    let var_ty = loop_var.prim_ty()?;
     let min = cast(min, &var_ty)?;
     let extent = cast(extent, &var_ty)?;
     changed(op.with(|node| {
@@ -585,8 +576,8 @@ fn index_bind<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Bind) -> Rewrit
     let enabled = std::mem::replace(&mut ctx.state_mut().base().is_enabled, true);
     let value = ctx.mutate_as(&op.value);
     ctx.state_mut().base().is_enabled = enabled;
-    let value = cast(value?, &prim_ty(&var.clone().into())?)?;
-    changed(Bind::new_full(var, value, op.loc.clone())?)
+    let value = cast(value?, &var.prim_ty()?)?;
+    changed(Bind::new_full(var, value, &op.loc)?)
 }
 
 /// `if_then_else`: the condition is a condition, and the arms take the wider type.
@@ -598,14 +589,14 @@ fn index_if_then_else<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Call) -
     let true_value: Expr = ctx.mutate_as(&op.args.get(1)?)?;
     let false_value: Expr = ctx.mutate_as(&op.args.get(2)?)?;
     let (true_value, false_value) = widen(true_value, false_value)?;
-    let ty = prim_ty(&true_value)?;
+    let ty = true_value.prim_ty()?;
     let call = Call::new_full(
         Some(ty.into()),
         op.op.clone(),
         Array::new(vec![condition, true_value, false_value]),
         op.attrs.clone(),
         Array::new(vec![]),
-        op.loc.clone(),
+        &op.loc,
     )?;
     changed(call)
 }

@@ -32,7 +32,7 @@ use tvm_ffi::{
     Mutator, ObjectIdentity, ObjectRefCore, Result, Unchanged, UnchangedOr, WalkOrder, WalkResult,
 };
 
-use super::util::{function_pass, prim_dtype, MutatorExt};
+use super::util::{function_pass, MutatorExt};
 use crate::ir::{
     AssertStmt, Bind, Break, Call, Continue, DictAttrs, Evaluate, Expr, FloatImmObj, For, If,
     IntImmObj, OpaqueExpr, OpaqueExprObj, PrimTypeObj, RegionStmt, Return, SeqStmt, Stmt,
@@ -244,7 +244,7 @@ fn is_eligible(expr: &Expr) -> Result<bool> {
     if expr.as_node::<RampObj>().is_some() || expr.as_node::<BroadcastObj>().is_some() {
         return Ok(false);
     }
-    if prim_dtype(expr)?.code == DL_BOOL {
+    if expr.prim_dtype()?.code == DL_BOOL {
         return Ok(false);
     }
     Ok(structural_walk(expr, &mut ForbiddenFinder, WalkOrder::PreOrder)?.is_none())
@@ -274,9 +274,9 @@ impl Planner {
     }
 
     /// Visit `body` in a new scope made by `creator`.
-    fn scoped(&mut self, creator: Stmt, body: &SeqStmt, m: &mut Mutator) -> Result<()> {
+    fn scoped(&mut self, creator: impl Into<Stmt>, body: &SeqStmt, m: &mut Mutator) -> Result<()> {
         let saved = self.current_scope;
-        self.current_scope = self.alloc_scope(saved, creator);
+        self.current_scope = self.alloc_scope(saved, creator.into());
         let result = m.mutate(self, body);
         self.current_scope = saved;
         result.map(|_| ())
@@ -382,7 +382,7 @@ impl Planner {
             let insert_at = self.insertion_stmt(entry);
             counter += 1;
             let repr = entry.repr.clone();
-            let var = Var::prim(&format!("cse_v{counter}"), prim_dtype(&repr)?)?;
+            let var = Var::prim(&format!("cse_v{counter}"), repr.prim_dtype()?)?;
             let bind = Bind::new(var.clone(), &repr)?;
             plan.insert_before.entry(ObjectIdentity::of(&insert_at)).or_default().push(bind);
             let key = self.table.entries[index].0.clone();
@@ -399,8 +399,7 @@ impl Planner {
                 if self.table.entries[other].1.expr_depth <= depth {
                     continue;
                 }
-                let substituted =
-                    substitute(&self.table.entries[other].1.repr, &repr, &var.clone().into())?;
+                let substituted = substitute(&self.table.entries[other].1.repr, &repr, &var)?;
                 self.table.entries[other].1.repr = substituted;
             }
         }
@@ -413,7 +412,7 @@ impl Planner {
     // Statements: each sets the current statement, as the C++ `Visit` override does.
 
     fn mutate_bind(&mut self, op: Bind, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.mutate(self, &op.value)?;
         m.mutate_with(self, &op.var, DefRegionKind::Simple)?;
         Ok(Unchanged)
@@ -422,43 +421,43 @@ impl Planner {
     /// Operands in the current scope; the body of a launch-thread region in a new one, and of
     /// any other region not at all.
     fn mutate_region(&mut self, op: RegionStmt, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.mutate(self, &op.args)?;
         m.mutate(self, &op.attrs)?;
         if LAUNCH_THREAD.is(&op.op) {
-            self.scoped(op.clone().into(), &op.body, m)?;
+            self.scoped(&op, &op.body, m)?;
         }
         Ok(Unchanged)
     }
 
     fn mutate_if(&mut self, op: If, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.mutate(self, &op.condition)?;
-        self.scoped(op.clone().into(), &op.then_case, m)?;
+        self.scoped(&op, &op.then_case, m)?;
         if let Some(else_case) = &op.else_case {
-            self.scoped(op.clone().into(), else_case, m)?;
+            self.scoped(&op, else_case, m)?;
         }
         Ok(Unchanged)
     }
 
     /// The bounds in the current scope, the body in a new one; the step is not visited.
     fn mutate_for(&mut self, op: For, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.mutate(self, &op.min)?;
         m.mutate(self, &op.extent)?;
-        self.scoped(op.clone().into(), &op.body, m)?;
+        self.scoped(&op, &op.body, m)?;
         Ok(Unchanged)
     }
 
     fn mutate_while(&mut self, op: While, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.mutate(self, &op.condition)?;
-        self.scoped(op.clone().into(), &op.body, m)?;
+        self.scoped(&op, &op.body, m)?;
         Ok(Unchanged)
     }
 
     fn mutate_return(&mut self, op: Return, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.mutate(self, &op.value)?;
         Ok(Unchanged)
     }
@@ -474,7 +473,7 @@ impl Planner {
     }
 
     fn mutate_store(&mut self, op: TensorStore, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.mutate(self, &op.dest)?;
         for index in op.indices.iter() {
             m.mutate(self, &index)?;
@@ -485,14 +484,14 @@ impl Planner {
 
     /// The message parts are constant and not visited.
     fn mutate_assert(&mut self, op: AssertStmt, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.mutate(self, &op.condition)?;
         m.mutate(self, &op.error_kind)?;
         Ok(Unchanged)
     }
 
     fn mutate_seq(&mut self, op: SeqStmt, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         for stmt in op.seq.iter() {
             m.mutate(self, &stmt)?;
         }
@@ -500,13 +499,13 @@ impl Planner {
     }
 
     fn mutate_evaluate(&mut self, op: Evaluate, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.mutate(self, &op.value)?;
         Ok(Unchanged)
     }
 
     fn mutate_stmt(&mut self, op: Stmt, m: &mut Mutator) -> Result<Unchanged> {
-        self.enter(op.clone());
+        self.enter(&op);
         m.default_mutate(self, &op)?;
         Ok(Unchanged)
     }
@@ -620,8 +619,8 @@ impl Planner {
 
 /// C++ `SubstituteSubexpr`: `body` with every expression equal to `target` replaced, not looking
 /// inside a replaced one.
-fn substitute(body: &Expr, target: &Expr, replacement: &Expr) -> Result<Expr> {
-    let mut replacer = Replacer { target: target.clone(), replacement: replacement.clone() };
+fn substitute(body: &Expr, target: &Expr, replacement: impl Into<Expr>) -> Result<Expr> {
+    let mut replacer = Replacer { target: target.clone(), replacement: replacement.into() };
     structural_mutate(body.clone(), &mut replacer)?.try_into()
 }
 
@@ -662,7 +661,7 @@ impl Rewriter {
         let mut visited: Stmt = visited.try_into()?;
         let mut stmts: Vec<Stmt> = Vec::with_capacity(binds.len() + 1);
         if self.materialized.insert(key) {
-            stmts.extend(binds.iter().map(|bind| Stmt::from(bind.clone())));
+            stmts.extend(binds.iter().map(Stmt::from));
         } else {
             let mut fresh_vars: HashMap<ObjectIdentity, Var> = HashMap::new();
             for bind in binds {

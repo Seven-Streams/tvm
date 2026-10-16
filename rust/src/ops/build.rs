@@ -38,11 +38,11 @@ use super::arith::Ex;
 use super::math::{check_failed, element, lanes, op, BOOL, HANDLE, INT, UINT};
 use super::native::{repr, structural_equal};
 use crate::ir::{
-    AssertStmt, Attrs, Bind, Call, CallObj, DictAttrs, Evaluate, EvaluateObj, Expr, FloatImm, For,
-    FuncType, FuncTypeObj, GlobalVar, If, IntImm, IntImmObj, LambdaExpr, Location, MissingType,
-    MissingTypeObj, Op, OpObj, PrimType, PrimTypeObj, PtrType, Range, RegionStmt, Return, SeqStmt,
-    SeqStmtObj, Stmt, StringImm, StringType, TensorLoad, TensorStore, Tuple, TupleType, Type,
-    UniqueNameSupply, UnknownLoc, Var,
+    ExprObj, AssertStmt, Attrs, Bind, Call, CallObj, DictAttrs, Evaluate, EvaluateObj, Expr,
+    FloatImm, For, FuncType, FuncTypeObj, GlobalVar, If, IntImm, IntImmObj, LambdaExpr, Location,
+    MissingType, MissingTypeObj, Op, OpObj, PrimType, PrimTypeObj, PtrType, Range, RegionStmt,
+    Return, SeqStmt, SeqStmtObj, Stmt, StringImm, StringType, TensorLoad, TensorStore, Tuple,
+    TupleType, Type, UniqueNameSupply, UnknownLoc, Var,
 };
 use crate::prim::{
     Add, And, BitwiseAnd, BitwiseNot, BitwiseOr, BitwiseXor, Broadcast, Cast, Div, FloorDiv,
@@ -117,11 +117,22 @@ pub fn prim_type(dtype: DLDataType) -> Result<PrimType> {
     Ok(ty)
 }
 
-/// The dtype of a PrimExpr (`expr.ty()`); an error for any other expression.
-pub fn prim_dtype(expr: &Expr) -> Result<DLDataType> {
-    match expr.ty.as_node::<PrimTypeObj>() {
-        Some(ty) => Ok(ty.dtype),
-        None => Err(tvm_ffi::Error::new(tvm_ffi::TYPE_ERROR, "expected a PrimType expression", "")),
+impl ExprObj {
+    /// The type of a PrimExpr (C++ `expr.ty()` of a `PrimExpr`); an error for any other
+    /// expression. Every expression node has it: `var.prim_ty()`, `call.args.get(0)?.prim_ty()`.
+    pub fn prim_ty(&self) -> Result<PrimType> {
+        self.prim_dtype()?;
+        self.ty.clone().try_cast()
+    }
+
+    /// The dtype of a PrimExpr (C++ `expr.ty()->dtype`); an error for any other expression.
+    pub fn prim_dtype(&self) -> Result<DLDataType> {
+        match self.ty.as_node::<PrimTypeObj>() {
+            Some(ty) => Ok(ty.dtype),
+            None => {
+                Err(tvm_ffi::Error::new(tvm_ffi::TYPE_ERROR, "expected a PrimType expression", ""))
+            }
+        }
     }
 }
 
@@ -549,8 +560,8 @@ impl Range {
     /// C++ `Range(begin, end)`: the extent is `end - begin`, or `end` from a constant 0.
     pub fn new(begin: impl IntoExpr, end: impl IntoExpr) -> Result<Self> {
         let (begin, end) = (begin.into_expr()?, end.into_expr()?);
-        prim_dtype(&begin)?;
-        prim_dtype(&end)?;
+        begin.prim_dtype()?;
+        end.prim_dtype()?;
         let extent = match is_const_int(&begin, 0) {
             true => end,
             false => (Ex::from(end) - Ex::from(begin.clone())).expr()?,
@@ -561,8 +572,8 @@ impl Range {
     /// C++ `Range::FromMinExtent(min, extent)`.
     pub fn from_min_extent(min: impl IntoExpr, extent: impl IntoExpr) -> Result<Self> {
         let (min, extent) = (min.into_expr()?, extent.into_expr()?);
-        prim_dtype(&min)?;
-        prim_dtype(&extent)?;
+        min.prim_dtype()?;
+        extent.prim_dtype()?;
         Ok(Self::from_complete_fields(min, extent, unknown_loc()?))
     }
 }
@@ -626,7 +637,11 @@ impl TupleType {
         Self::new_full(fields, unknown_loc()?)
     }
 
-    pub fn new_full(fields: impl IntoIterator<Item = Type>, loc: Location) -> Result<Self> {
+    pub fn new_full(
+        fields: impl IntoIterator<Item = Type>,
+        loc: impl Into<Location>,
+    ) -> Result<Self> {
+        let loc: Location = loc.into();
         Ok(Self::from_complete_fields(loc, fields.into_iter().collect()))
     }
 }
@@ -655,8 +670,9 @@ impl TensorType {
         data_alignment: i32,
         offset_factor: i32,
         layout: Option<Layout>,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         /// `runtime::kAllocAlignment`.
         const ALLOC_ALIGNMENT: i32 = 64;
         let elem_offset = match elem_offset {
@@ -691,7 +707,12 @@ impl Var {
         Self::new_full(name, ty, unknown_loc()?)
     }
 
-    pub fn new_full(name: impl Into<String>, ty: impl Into<Type>, loc: Location) -> Result<Self> {
+    pub fn new_full(
+        name: impl Into<String>,
+        ty: impl Into<Type>,
+        loc: impl Into<Location>,
+    ) -> Result<Self> {
+        let loc: Location = loc.into();
         Ok(Self::from_complete_fields(loc, ty.into(), name.into()))
     }
 
@@ -714,7 +735,8 @@ impl GlobalVar {
         Self::new_full(name_hint, unknown_loc()?)
     }
 
-    pub fn new_full(name_hint: impl Into<String>, loc: Location) -> Result<Self> {
+    pub fn new_full(name_hint: impl Into<String>, loc: impl Into<Location>) -> Result<Self> {
+        let loc: Location = loc.into();
         Ok(Self::from_complete_fields(loc, MissingType::new()?.into(), name_hint.into()))
     }
 }
@@ -851,8 +873,9 @@ impl Call {
         args: Array<Expr>,
         attrs: Option<Attrs>,
         ty_args: Array<Type>,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         if let Some(ty) = ret_ty {
             return Ok(Self::from_complete_fields(loc, ty, op, args, attrs, ty_args));
         }
@@ -875,13 +898,14 @@ impl TensorLoad {
     pub fn new_full(
         source: impl Into<Expr>,
         indices: impl IntoIterator<Item = Expr>,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         static INFER: OnceLock<Option<TypeAttrColumn>> = OnceLock::new();
         let source = source.into();
         let indices: Array<Expr> = indices.into_iter().collect();
         for index in &indices {
-            prim_dtype(&index)?;
+            index.prim_dtype()?;
         }
         let ty_index = AnyView::from(&source.ty).type_index();
         let column = *INFER.get_or_init(|| TypeAttrColumn::new("__tvm_tensor_load_infer_type__"));
@@ -915,7 +939,7 @@ fn bool_type(lanes: u16) -> Result<Type> {
 }
 
 fn binary_type(node: &str, operands: Operands, a: &Expr, b: &Expr) -> Result<Type> {
-    let (a_ty, b_ty) = (prim_dtype(a)?, prim_dtype(b)?);
+    let (a_ty, b_ty) = (a.prim_dtype()?, b.prim_dtype()?);
     if let Operands::Logical = operands {
         for (ty, condition) in [(a_ty, "a_ty"), (b_ty, "b_ty")] {
             if ty.code != BOOL {
@@ -961,7 +985,8 @@ macro_rules! raw_binary {
             }
 
             #[doc = concat!("C++ `", stringify!($node), "(a, b, loc)`.")]
-            pub fn new_full(a: impl IntoExpr, b: impl IntoExpr, loc: Location) -> Result<Self> {
+            pub fn new_full(a: impl IntoExpr, b: impl IntoExpr, loc: impl Into<Location>) -> Result<Self> {
+        let loc: Location = loc.into();
                 let (a, b) = (a.into_expr()?, b.into_expr()?);
                 let ty = binary_type(stringify!($node), $operands, &a, &b)?;
                 Ok(Self::from_complete_fields(loc, ty, a, b))
@@ -1001,9 +1026,10 @@ impl Not {
         Self::new_full(a, unknown_loc()?)
     }
 
-    pub fn new_full(a: impl IntoExpr, loc: Location) -> Result<Self> {
+    pub fn new_full(a: impl IntoExpr, loc: impl Into<Location>) -> Result<Self> {
+        let loc: Location = loc.into();
         let a = a.into_expr()?;
-        let a_ty = prim_dtype(&a)?;
+        let a_ty = a.prim_dtype()?;
         if a_ty.code != BOOL {
             let condition = "a_ty.MatchesCode(DLDataTypeCode::kDLBool)";
             return Err(check_failed(INTERNAL_ERROR, condition, ""));
@@ -1018,9 +1044,10 @@ impl BitwiseNot {
         Self::new_full(a, unknown_loc()?)
     }
 
-    pub fn new_full(a: impl IntoExpr, loc: Location) -> Result<Self> {
+    pub fn new_full(a: impl IntoExpr, loc: impl Into<Location>) -> Result<Self> {
+        let loc: Location = loc.into();
         let a = a.into_expr()?;
-        if !matches!(prim_dtype(&a)?.code, INT | UINT | BOOL) {
+        if !matches!(a.prim_dtype()?.code, INT | UINT | BOOL) {
             let condition = "a_ty.MatchesCode(DLDataTypeCode::kDLInt, DLDataTypeCode::kDLUInt) || \
                              a_ty.MatchesCode(DLDataTypeCode::kDLBool)";
             let message = "BitwiseNot requires an integer or boolean operand";
@@ -1056,8 +1083,9 @@ impl Shuffle {
     pub fn new_full(
         vectors: impl IntoIterator<Item = Expr>,
         indices: impl IntoIterator<Item = Expr>,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         let (vectors, indices): (Array<Expr>, Array<Expr>) =
             (vectors.into_iter().collect(), indices.into_iter().collect());
         let Some(first) = vectors.iter().next() else {
@@ -1066,10 +1094,10 @@ impl Shuffle {
         if indices.is_empty() {
             return Err(compare_failed(INTERNAL_ERROR, "indices.size() != 0U", 0, 0, ""));
         }
-        let base = element(prim_dtype(&first)?);
+        let base = element(first.prim_dtype()?);
         let mut total_lanes = 0;
         for vector in &vectors {
-            let dtype = prim_dtype(&vector)?;
+            let dtype = vector.prim_dtype()?;
             if element(dtype) != base {
                 return Err(check_failed(
                     INTERNAL_ERROR,
@@ -1097,7 +1125,7 @@ impl Shuffle {
         }
         let mut indices = Vec::new();
         for vector in &vectors {
-            for _ in 0..lanes(prim_dtype(vector)?)? {
+            for _ in 0..lanes(vector.prim_dtype()?)? {
                 indices.push(int32(indices.len() as i64)?.into());
             }
         }
@@ -1116,7 +1144,11 @@ impl Tuple {
         Self::new_full(fields, unknown_loc()?)
     }
 
-    pub fn new_full(fields: impl IntoIterator<Item = Expr>, loc: Location) -> Result<Self> {
+    pub fn new_full(
+        fields: impl IntoIterator<Item = Expr>,
+        loc: impl Into<Location>,
+    ) -> Result<Self> {
+        let loc: Location = loc.into();
         let fields: Array<Expr> = fields.into_iter().collect();
         let types: Vec<Type> = fields.iter().map(|field| field.ty.clone()).collect();
         let ty: Type = match types.iter().any(|ty| ty.as_node::<MissingTypeObj>().is_some()) {
@@ -1151,10 +1183,11 @@ impl Select {
         condition: impl IntoExpr,
         true_value: impl IntoExpr,
         false_value: impl IntoExpr,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         let (c, t, f) = (condition.into_expr()?, true_value.into_expr()?, false_value.into_expr()?);
-        let (condition_ty, true_ty, false_ty) = (prim_dtype(&c)?, prim_dtype(&t)?, prim_dtype(&f)?);
+        let (condition_ty, true_ty, false_ty) = (c.prim_dtype()?, t.prim_dtype()?, f.prim_dtype()?);
         if condition_ty.code != BOOL {
             let condition = "condition_ty.MatchesCode(DLDataTypeCode::kDLBool)";
             return Err(check_failed(INTERNAL_ERROR, condition, ""));
@@ -1197,11 +1230,12 @@ impl Let {
         var: Var,
         value: impl IntoExpr,
         body: impl IntoExpr,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         let (value, body) = (value.into_expr()?, body.into_expr()?);
-        let (value_ty, var_ty) = (prim_dtype(&value)?, prim_dtype(&var.clone().into())?);
-        prim_dtype(&body)?;
+        let (value_ty, var_ty) = (value.prim_dtype()?, var.prim_dtype()?);
+        body.prim_dtype()?;
         if value_ty != var_ty {
             let condition = "value.ty() == var->ty.as_or_throw<PrimType>()";
             return Err(check_failed(INTERNAL_ERROR, condition, ""));
@@ -1216,9 +1250,10 @@ impl Cast {
         Self::new_full(value, ty, unknown_loc()?)
     }
 
-    pub fn new_full(value: impl IntoExpr, ty: PrimType, loc: Location) -> Result<Self> {
+    pub fn new_full(value: impl IntoExpr, ty: PrimType, loc: impl Into<Location>) -> Result<Self> {
+        let loc: Location = loc.into();
         let value = value.into_expr()?;
-        let value_lanes = prim_dtype(&value)?.lanes;
+        let value_lanes = value.prim_dtype()?.lanes;
         if ty.dtype.lanes != value_lanes {
             let condition = "value_ty->dtype.lanes == value_expr_ty->dtype.lanes";
             return Err(compare_failed(INTERNAL_ERROR, condition, ty.dtype.lanes, value_lanes, ""));
@@ -1234,9 +1269,14 @@ impl Broadcast {
         Self::new_full(value, lanes, unknown_loc()?)
     }
 
-    pub fn new_full(value: impl IntoExpr, lanes: impl IntoExpr, loc: Location) -> Result<Self> {
+    pub fn new_full(
+        value: impl IntoExpr,
+        lanes: impl IntoExpr,
+        loc: impl Into<Location>,
+    ) -> Result<Self> {
+        let loc: Location = loc.into();
         let (value, lanes) = (value.into_expr()?, lanes.into_expr()?);
-        let value_ty = prim_dtype(&value)?;
+        let value_ty = value.prim_dtype()?;
         if value_ty.lanes != 1 {
             return Err(check_failed(INTERNAL_ERROR, "value_ty.IsScalar()", ""));
         }
@@ -1256,10 +1296,11 @@ impl Ramp {
         base: impl IntoExpr,
         stride: impl IntoExpr,
         lanes: impl IntoExpr,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         let (base, stride, lanes) = (base.into_expr()?, stride.into_expr()?, lanes.into_expr()?);
-        let (base_ty, stride_ty) = (prim_dtype(&base)?, prim_dtype(&stride)?);
+        let (base_ty, stride_ty) = (base.prim_dtype()?, stride.prim_dtype()?);
         if base_ty.lanes != 1 {
             return Err(check_failed(INTERNAL_ERROR, "base_ty.IsScalar()", ""));
         }
@@ -1323,7 +1364,8 @@ impl SeqStmt {
     }
 
     /// C++ `SeqStmt(seq, loc)`.
-    pub fn new_full(seq: impl IntoIterator<Item = Stmt>, loc: Location) -> Result<Self> {
+    pub fn new_full(seq: impl IntoIterator<Item = Stmt>, loc: impl Into<Location>) -> Result<Self> {
+        let loc: Location = loc.into();
         Ok(seq_stmt(seq.into_iter().collect(), loc))
     }
 
@@ -1370,7 +1412,8 @@ impl Evaluate {
         Self::new_full(value, unknown_loc()?)
     }
 
-    pub fn new_full(value: impl IntoExpr, loc: Location) -> Result<Self> {
+    pub fn new_full(value: impl IntoExpr, loc: impl Into<Location>) -> Result<Self> {
+        let loc: Location = loc.into();
         static VALIDATE: OnceLock<Option<TypeAttrColumn>> = OnceLock::new();
         let value = value.into_expr()?;
         let ty_index = AnyView::from(&value.ty).type_index();
@@ -1388,7 +1431,8 @@ impl Return {
         Self::new_full(value, unknown_loc()?)
     }
 
-    pub fn new_full(value: impl IntoExpr, loc: Location) -> Result<Self> {
+    pub fn new_full(value: impl IntoExpr, loc: impl Into<Location>) -> Result<Self> {
+        let loc: Location = loc.into();
         Ok(Self::from_complete_fields(loc, value.into_expr()?))
     }
 }
@@ -1409,14 +1453,15 @@ impl TensorStore {
         dest: impl Into<Expr>,
         indices: impl IntoIterator<Item = Expr>,
         value: impl IntoExpr,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         static VALIDATE: OnceLock<Option<TypeAttrColumn>> = OnceLock::new();
         let (dest, value) = (dest.into(), value.into_expr()?);
         let indices: Array<Expr> = indices.into_iter().collect();
-        prim_dtype(&value)?;
+        value.prim_dtype()?;
         for index in &indices {
-            prim_dtype(&index)?;
+            index.prim_dtype()?;
         }
         let ty_index = AnyView::from(&dest.ty).type_index();
         let column = *VALIDATE.get_or_init(|| TypeAttrColumn::new("__tvm_tensor_store_validate__"));
@@ -1439,7 +1484,8 @@ impl Bind {
         Self::new_full(var, value, unknown_loc()?)
     }
 
-    pub fn new_full(var: Var, value: impl IntoExpr, loc: Location) -> Result<Self> {
+    pub fn new_full(var: Var, value: impl IntoExpr, loc: impl Into<Location>) -> Result<Self> {
+        let loc: Location = loc.into();
         let value = value.into_expr()?;
         if !structural_equal(&value.ty, &var.ty)? {
             let condition = "ffi::StructuralEqual()(value->ty, var->ty)";
@@ -1463,10 +1509,11 @@ impl AssertStmt {
         condition: impl IntoExpr,
         error_kind: StringImm,
         message_parts: Array<StringImm>,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         let condition = condition.into_expr()?;
-        if prim_dtype(&condition)?.code != BOOL {
+        if condition.prim_dtype()?.code != BOOL {
             let message = format!(
                 "AssertStmt should have boolean condition, but received {} with dtype {}",
                 repr(&condition),
@@ -1493,10 +1540,11 @@ impl If {
         condition: impl IntoExpr,
         then_case: impl IntoBody,
         else_case: Option<SeqStmt>,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         let condition = condition.into_expr()?;
-        prim_dtype(&condition)?;
+        condition.prim_dtype()?;
         Ok(Self::from_complete_fields(loc, condition, then_case.into_body()?, else_case))
     }
 }
@@ -1523,8 +1571,9 @@ impl For {
         body: impl IntoBody,
         annotations: Map<String, Any>,
         step: Option<Expr>,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         let (min, extent, body) = (min.into_expr()?, extent.into_expr()?, body.into_body()?);
         let loop_expr: Expr = loop_var.clone().into();
         require_scalar_int(&loop_expr, "loop_var")?;
@@ -1534,7 +1583,7 @@ impl For {
         let min = promote_to_loop_type(min, loop_ty)?;
         let extent = promote_to_loop_type(extent, loop_ty)?;
         let same_type = |expr: &Expr, condition: &str| -> Result<()> {
-            if prim_dtype(expr)? != prim_dtype(&loop_expr)? {
+            if expr.prim_dtype()? != loop_expr.prim_dtype()? {
                 let message = format!("{} vs {}", repr(loop_ty), repr(&expr.ty));
                 return Err(check_failed(INTERNAL_ERROR, condition, &message));
             }
@@ -1557,7 +1606,7 @@ impl For {
 
 /// The check of a `For` field (`field`) for a scalar integer.
 fn require_scalar_int(expr: &Expr, field: &str) -> Result<()> {
-    let dtype = prim_dtype(expr)?;
+    let dtype = expr.prim_dtype()?;
     if dtype.lanes == 1 && matches!(dtype.code, INT | UINT) {
         return Ok(());
     }
@@ -1577,7 +1626,7 @@ fn promote_to_loop_type(expr: Expr, loop_ty: &Type) -> Result<Expr> {
     let Some(loop_dtype) = loop_ty.as_node::<PrimTypeObj>().map(|ty| ty.dtype) else {
         return Err(tvm_ffi::Error::new(TYPE_ERROR, "expected a PrimType expression", ""));
     };
-    let dtype = prim_dtype(&expr)?;
+    let dtype = expr.prim_dtype()?;
     if dtype == loop_dtype {
         return Ok(expr);
     }
@@ -1644,8 +1693,9 @@ impl RegionStmt {
         attrs: DictAttrs,
         body: impl IntoBody,
         result_vars: Array<Var>,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         let body = body.into_body()?;
         let name = op.name.as_str().to_string();
         let expected = region_body_params(&op, &args, &attrs)?;
@@ -1738,8 +1788,9 @@ impl Function {
         body: Option<SeqStmt>,
         ret_type: Type,
         attrs: DictAttrs,
-        loc: Location,
+        loc: impl Into<Location>,
     ) -> Result<Self> {
+        let loc: Location = loc.into();
         let ret_type = match ret_type.as_node::<MissingTypeObj>() {
             Some(_) => TupleType::new([])?.into(),
             None => ret_type,

@@ -25,20 +25,22 @@ use tvm_ffi::{AnyView, Array, ObjectCore, ObjectRefCast, ObjectRefCore, Result, 
 
 use super::analyzer::is_const_int;
 use crate::ir::{Expr, Var, VarObj};
+use crate::ops::pattern::{PVar, Pattern, PatternOps};
 use crate::ops::{deep_equal, int32, unknown_loc, Ex, PrimOps};
 use crate::prim::{AddObj, FloorDivObj, FloorModObj, Max, MulObj};
 use crate::sym::Analyzer;
 use crate::tirx::TensorType;
 
 /// A `TensorVar`: a `Var`, not a subclass, whose type is a `TensorType` (C++ `as<TensorVar>()`).
-pub(crate) fn as_tensor_var(expr: &Expr) -> Option<(Var, TensorType)> {
+pub(crate) fn as_tensor_var(expr: impl Into<Expr>) -> Option<(Var, TensorType)> {
+    let expr: Expr = expr.into();
     if expr.as_node::<VarObj>().is_none()
-        || AnyView::from(expr).type_index() != VarObj::type_index()
+        || AnyView::from(&expr).type_index() != VarObj::type_index()
     {
         return None;
     }
     let ty: TensorType = expr.ty.clone().try_cast().ok()?;
-    Some((expr.clone().try_cast().ok()?, ty))
+    Some((expr.try_cast().ok()?, ty))
 }
 
 /// The `TensorType` of a variable known to be a tensor.
@@ -84,7 +86,7 @@ pub(crate) fn flattened_tensor(tensor: &Var, ty: &TensorType) -> Result<(Var, Te
         None,
         unknown_loc()?,
     )?;
-    Ok((Var::new_full(tensor.name.clone(), flat_ty.clone(), tensor.loc.clone())?, flat_ty))
+    Ok((Var::new_full(tensor.name.clone(), &flat_ty, &tensor.loc)?, flat_ty))
 }
 
 /// C++ `TensorTypeNode::ElemOffset(indices, inner)`: the offset of an element in elements,
@@ -238,11 +240,12 @@ impl Terms {
 /// C++ `MergeMulMod`: `x // y * y + x % y` becomes `x`, and every product that pairs with a
 /// modulus as `MergeMulModInner` describes is merged, repeatedly.
 fn merge_mul_mod(analyzer: &Analyzer, base: Expr) -> Result<Expr> {
-    let mut simplified = base;
-    if let Some(x) = div_mul_plus_mod(&simplified)? {
-        simplified = x;
-    }
-    let simplified = analyzer.simplify(&simplified, 2)?;
+    let (x, y) = (PVar::expr(), PVar::expr());
+    let base = match (x.floordiv(&y) * &y + x.floormod(&y)).matches(&base) {
+        true => x.get(),
+        false => base,
+    };
+    let simplified = analyzer.simplify(&base, 2)?;
     let mut terms = Terms::default();
     terms.insert(split_addition(&simplified))?;
     let mut find_opt = false;
@@ -287,26 +290,4 @@ fn merge_mul_mod(analyzer: &Analyzer, base: Expr) -> Result<Expr> {
         total = Some(sum(total, &lhs.indexmod(rhs).expr()?)?);
     }
     Ok(total.expect("a merge leaves a term"))
-}
-
-/// The pattern `floordiv(x, y) * y + floormod(x, y)`, matched as `sym::PVar` matches it: the
-/// first occurrence of `x` and `y` binds them, later ones must be deeply equal.
-fn div_mul_plus_mod(expr: &Expr) -> Result<Option<Expr>> {
-    let Some(add) = expr.as_node::<AddObj>() else { return Ok(None) };
-    let Some(mult) = add.a.as_node::<MulObj>() else { return Ok(None) };
-    let Some(div) = mult.a.as_node::<FloorDivObj>() else { return Ok(None) };
-    let (x, y) = (&div.a, &div.b);
-    if !same_or_deep_equal(&mult.b, y)? {
-        return Ok(None);
-    }
-    let Some(modulo) = add.b.as_node::<FloorModObj>() else { return Ok(None) };
-    if same_or_deep_equal(&modulo.a, x)? && same_or_deep_equal(&modulo.b, y)? {
-        return Ok(Some(x.clone()));
-    }
-    Ok(None)
-}
-
-/// `PEqualChecker<PrimExpr>`: the same object, or deeply equal.
-fn same_or_deep_equal(value: &Expr, bound: &Expr) -> Result<bool> {
-    Ok(value.same_as(bound) || deep_equal(bound, value)?)
 }

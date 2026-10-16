@@ -30,9 +30,9 @@ use tvm_ffi::{
 };
 
 use super::data_type_rewriter::{
-    copy_with_type, tensor_dtype, DataTypeRewrite, DataTypeRewriterBase, DataTypeRewriterState,
+    copy_with_type, DataTypeRewrite, DataTypeRewriterBase, DataTypeRewriterState,
 };
-use super::util::{MutatorExt, function_pass, int32_dtype, prim_dtype, prim_type};
+use super::util::{MutatorExt, function_pass, int32_dtype, prim_type};
 use crate::ir::{Bind, CallObj, Expr, IntImm, PrimType, SeqStmt, Stmt, Var};
 use crate::ops::repr;
 use crate::prim::Cast;
@@ -111,7 +111,7 @@ impl DataTypeRewriterState for Int32Narrower {
 impl Int32Narrower {
     /// Every `int64` constant becomes `int32`, index or not.
     fn mutate_int_imm(&mut self, op: IntImm) -> Result<Any> {
-        let dtype = prim_dtype(&op.clone().into())?;
+        let dtype = op.prim_dtype()?;
         if !(dtype.code == DL_INT && dtype.bits == 64 && dtype.lanes == 1) {
             return Ok(UnchangedOr::<Any>::unchanged().into());
         }
@@ -135,7 +135,7 @@ impl Int32Narrower {
             return m.default_mutate(self, &op);
         }
         let value: Expr = m.mutate_as(self, &op.value)?;
-        if prim_dtype(&value)? == self.target.dtype {
+        if value.prim_dtype()? == self.target.dtype {
             return Ok(value.into());
         }
         Ok(Cast::new(value, self.target.clone())?.into())
@@ -178,13 +178,13 @@ impl Int32Narrower {
         let Some(ty) = tensor.ty.as_node::<TensorTypeObj>() else { return Ok(()) };
         let is_scalar = tensor.tensor_is_scalar(true)?;
         let is_local_scalar = ty.scope.same_as(&self.local) && is_scalar;
-        let dtype = tensor_dtype(&tensor.clone().into())?;
+        let dtype = &ty.dtype;
         if !is_local_scalar && dtype.dtype.code == DL_INT && dtype.dtype.bits > 32 {
             tvm_ffi::bail!(
                 INTERNAL_ERROR,
                 "The tensor {} allocated in the function has dtype {}. The function is {}",
                 repr(tensor),
-                repr(&dtype),
+                repr(dtype),
                 repr(&self.func)
             );
         }
@@ -195,16 +195,14 @@ impl Int32Narrower {
 /// `CheckTensorParams`: no integer tensor parameter may be wider than `int32`.
 fn check_tensor_params(func: &Function) -> Result<()> {
     for param in func.params.iter() {
-        if !is_tensor_var(&param) {
-            continue;
-        }
-        let dtype = tensor_dtype(&param.clone().into())?;
+        let Some(ty) = param.ty.as_node::<TensorTypeObj>() else { continue };
+        let dtype = &ty.dtype;
         if dtype.dtype.code == DL_INT && dtype.dtype.bits > 32 {
             tvm_ffi::bail!(
                 INTERNAL_ERROR,
                 "The tensor parameter {} has dtype {}. The function is {}",
                 repr(&param),
-                repr(&dtype),
+                repr(dtype),
                 repr(func)
             );
         }
@@ -230,7 +228,7 @@ fn rewrite(func: Function) -> Result<Function> {
             && ty.dtype != narrower.target.dtype
             && narrower.base.remap_get(&var).is_none()
         {
-            let narrowed = copy_with_type(&var, narrower.target.clone());
+            let narrowed = copy_with_type(&var, &narrower.target);
             narrower.base.remap_set(&var, narrowed);
         }
     }

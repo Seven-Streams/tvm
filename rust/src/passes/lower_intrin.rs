@@ -22,15 +22,14 @@
 //! division and modulo to truncating forms, and fuse multiply-add.
 
 use tvm_ffi::{
-    dispatch, Any, DLDataType, Function as FfiFunction, Mutator, ObjectRefCast, ObjectRefCore,
-    Result, String,
+    dispatch, Any, BigInt, DLDataType, Function as FfiFunction, Mutator, ObjectRefCore, Result,
+    String,
 };
 
 use super::analyzer::{AnalyzerBase, AnalyzerScope, AnalyzerState};
-use super::util::{function_pass, get_attr, int_imm, prim_dtype, MutatorExt};
-use crate::ir::{
-    Call, Expr, IntImmObj, Op, OpAttrMap, OpObj, PrimType, PrimTypeObj, SeqStmt, Stmt, Var,
-};
+use super::util::{function_pass, get_attr, int_imm, MutatorExt};
+use crate::ir::{Call, Expr, IntImmObj, Op, OpAttrMap, OpObj, PrimTypeObj, SeqStmt, Stmt, Var};
+use crate::ops::pattern::{PVar, Pattern, PatternOps};
 use crate::ops::{let_, max_value, select, Ex, PrimOps};
 use crate::prim::op::FMA;
 use crate::prim::{
@@ -99,7 +98,7 @@ impl LoweringRules {
         if call.ty.as_node::<PrimTypeObj>().is_none() {
             return Ok(None);
         }
-        let expr: Expr = call.clone().into();
+        let expr = Expr::from(call);
         for column in &self.columns {
             let Some(rule) = column.get(op)? else { continue };
             let lowered: Expr = rule.call_tuple((expr.clone(),))?.try_into()?;
@@ -140,8 +139,7 @@ impl IntrinInjecter {
             (None, Some(mul)) => (mul, &op.b),
             (None, None) => return m.default_mutate(self, &op),
         };
-        let (a, b, c) = (mul.a.clone(), mul.b.clone(), c.clone());
-        self.make_fma(op, a, b, c, m)
+        self.make_fma(&op, &mul.a, &mul.b, c, m)
     }
 
     fn mutate_floordiv(&mut self, op: FloorDiv, m: &mut Mutator) -> Result<Any> {
@@ -163,32 +161,34 @@ impl IntrinInjecter {
 
     /// `max(floordiv(x, y), c)` with `c >= 0` and `y >= 0` is `max(truncdiv(x, y), c)`.
     fn mutate_max(&mut self, op: Max, m: &mut Mutator) -> Result<Any> {
-        if let (Some(div), Some(c)) = (op.a.as_node::<FloorDivObj>(), op.b.as_node::<IntImmObj>()) {
-            if c.value >= tvm_ffi::BigInt::from(0i64)
-                && self.analyzer().can_prove_greater_equal(&div.b, 0)?
-            {
-                let truncated = div.a.truncdiv(&div.b).expr()?;
-                let lowered: Expr = m.mutate_as(self, &truncated)?;
-                return lowered.max(&op.b).expr().map(Any::from);
-            }
+        let (x, y, c) = (PVar::expr(), PVar::expr(), PVar::int());
+        if x.floordiv(&y).max(&c).matches(&Expr::from(&op))
+            && c.get().value >= BigInt::from(0i64)
+            && self.analyzer().can_prove_greater_equal(&y.get(), 0)?
+        {
+            let input = x.truncdiv(&y).eval()?;
+            let lowered: Expr = m.mutate_as(self, &input)?;
+            return lowered.max(c.get()).expr().map(Any::from);
         }
         m.default_mutate(self, &op)
     }
 
     /// `floormod(x, y) == 0` is `truncmod(x, y) == 0`.
     fn mutate_eq(&mut self, op: EQ, m: &mut Mutator) -> Result<Any> {
-        match divisibility(&op.a, &op.b, true)? {
-            Some(test) => m.mutate(self, &test),
-            None => m.default_mutate(self, &op),
+        let (x, y) = (PVar::expr(), PVar::expr());
+        if x.floormod(&y).equal(0).matches(&Expr::from(&op)) {
+            return m.mutate(self, &x.truncmod(&y).equal(0).eval()?);
         }
+        m.default_mutate(self, &op)
     }
 
     /// `floormod(x, y) != 0` is `truncmod(x, y) != 0`.
     fn mutate_ne(&mut self, op: NE, m: &mut Mutator) -> Result<Any> {
-        match divisibility(&op.a, &op.b, false)? {
-            Some(test) => m.mutate(self, &test),
-            None => m.default_mutate(self, &op),
+        let (x, y) = (PVar::expr(), PVar::expr());
+        if x.floormod(&y).not_equal(0).matches(&Expr::from(&op)) {
+            return m.mutate(self, &x.truncmod(&y).not_equal(0).eval()?);
         }
+        m.default_mutate(self, &op)
     }
 }
 
@@ -197,25 +197,25 @@ impl IntrinInjecter {
         &self.base.analyzer
     }
 
-    fn make_fma(&mut self, op: Add, a: Expr, b: Expr, c: Expr, m: &mut Mutator) -> Result<Any> {
-        let lhs = swap_broadcast_cast(&a)?;
-        let rhs = swap_broadcast_cast(&b)?;
-        match (&self.rules.fma, prim_dtype(&op.clone().into())?.code == DL_FLOAT) {
+    fn make_fma(&mut self, op: &Add, a: &Expr, b: &Expr, c: &Expr, m: &mut Mutator) -> Result<Any> {
+        let lhs = swap_broadcast_cast(a)?;
+        let rhs = swap_broadcast_cast(b)?;
+        match (&self.rules.fma, op.prim_dtype()?.code == DL_FLOAT) {
             (Some(fma), true) => {
-                let call: Expr = Call::new(op.ty.clone(), FMA.get()?, vec![lhs, rhs, c])?.into();
+                let call: Expr = Call::new(&op.ty, FMA.get()?, vec![lhs, rhs, c.clone()])?.into();
                 let fused = fma.call_tuple((call,))?;
                 if fused.type_index() != 0 {
                     return m.mutate(self, &Expr::try_from(fused)?);
                 }
             }
-            _ if !lhs.same_as(&a) || !rhs.same_as(&b) => {
+            _ if !lhs.same_as(a) || !rhs.same_as(b) => {
                 let product: Expr = m.mutate_as(self, &Mul::new(lhs, rhs)?.into())?;
-                let c: Expr = m.mutate_as(self, &c)?;
+                let c: Expr = m.mutate_as(self, c)?;
                 return Ok(Add::new(product, c)?.into());
             }
             _ => {}
         }
-        m.default_mutate(self, &op)
+        m.default_mutate(self, op)
     }
 
     /// `TryFindShiftCoefficientForPositiveRange`: a `c` with `a + b * c` non-negative and
@@ -228,7 +228,7 @@ impl IntrinInjecter {
         if bound.min_value >= 0 {
             return Ok(None);
         }
-        let limit = max_value(DLDataType { lanes: 1, ..prim_dtype(a)? })?;
+        let limit = max_value(DLDataType { lanes: 1, ..a.prim_dtype()? })?;
         let Some(dtype_max) = int_value(&limit) else { return Ok(None) };
         let (b, min, max, dtype_max) =
             (b as i128, bound.min_value as i128, bound.max_value as i128, dtype_max as i128);
@@ -249,7 +249,7 @@ impl IntrinInjecter {
     fn lower_floordiv(&mut self, e: &Expr, original: &Expr, m: &mut Mutator) -> Result<Expr> {
         let div = e.as_node::<FloorDivObj>().expect("checked by the caller");
         let (a, b) = (&div.a, &div.b);
-        let dtype = prim_dtype(e)?;
+        let dtype = e.prim_dtype()?;
         if let Some(shift) = power_of_two_shift(b).filter(|_| self.support_bitwise_op) {
             return (a >> int_imm(dtype, shift as i128)).expr();
         }
@@ -288,7 +288,7 @@ impl IntrinInjecter {
     fn lower_floormod(&mut self, e: &Expr, m: &mut Mutator) -> Result<Expr> {
         let modulo = e.as_node::<FloorModObj>().expect("checked by the caller");
         let (a, b) = (&modulo.a, &modulo.b);
-        let dtype = prim_dtype(e)?;
+        let dtype = e.prim_dtype()?;
         if let Some(shift) = power_of_two_shift(b).filter(|_| self.support_bitwise_op) {
             return (a & int_imm(dtype, (1i128 << shift) - 1)).expr();
         }
@@ -318,18 +318,6 @@ impl IntrinInjecter {
     }
 }
 
-/// `floormod(x, y) == 0` (or `!= 0`) as `truncmod(x, y) == 0`; `None` for anything else.
-fn divisibility(lhs: &Expr, rhs: &Expr, equal: bool) -> Result<Option<Expr>> {
-    match (lhs.as_node::<FloorModObj>(), int_value(rhs)) {
-        (Some(modulo), Some(0)) => {
-            let truncated = modulo.a.truncmod(&modulo.b);
-            let test = if equal { truncated.equal(0) } else { truncated.not_equal(0) };
-            test.expr().map(Some)
-        }
-        _ => Ok(None),
-    }
-}
-
 /// `(b >= 0 && r >= 0) || (b < 0 && r <= 0)`: the remainder `r` has the sign of `b`.
 fn signs_agree(b: &Expr, r: &Var) -> Ex {
     let nonneg = b.greater_equal(0).logical_and(r.greater_equal(0));
@@ -342,7 +330,7 @@ fn swap_broadcast_cast(expr: &Expr) -> Result<Expr> {
     let Some(bcast) = expr.as_node::<BroadcastObj>() else { return Ok(expr.clone()) };
     let Some(cast) = bcast.value.as_node::<CastObj>() else { return Ok(expr.clone()) };
     let to = cast.ty.as_node::<PrimTypeObj>().expect("a cast has a PrimType").dtype;
-    let from = prim_dtype(&cast.value)?;
+    let from = cast.value.prim_dtype()?;
     let integral = |code| code == DL_INT || code == DL_UINT;
     let widens = to.bits as u32 == from.bits as u32 * 2
         || (integral(to.code) && integral(from.code) && to.bits > from.bits);
@@ -350,8 +338,7 @@ fn swap_broadcast_cast(expr: &Expr) -> Result<Expr> {
         return Ok(expr.clone());
     }
     let broadcast = Broadcast::new(&cast.value, &bcast.lanes)?;
-    let ty: PrimType = bcast.ty.clone().try_cast()?;
-    Ok(Cast::new(broadcast, ty)?.into())
+    Ok(Cast::new(broadcast, bcast.prim_ty()?)?.into())
 }
 
 fn int_value(expr: &Expr) -> Option<i64> {

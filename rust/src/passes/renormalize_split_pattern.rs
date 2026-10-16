@@ -21,20 +21,17 @@
 //! `floordiv(floormod(x, c1 * c2), c2)` to `floormod(floordiv(x, c2), c1)`, factor common
 //! constants out of `floordiv(x * c1 + y, c2)`, and put comparisons in `<` form.
 //!
-//! The C++ rules are `PVar` patterns; here each is explicit matching in the same order with the
-//! same conditions. A pattern's `Eval()` folds constants and otherwise builds the raw node, which
-//! is what the `ops` operators do on operands of one type, as a matched node's operands are.
+//! The rules are the C++ `PVar` patterns, in the same order with the same conditions
+//! ([`crate::ops::pattern`]).
 
 use tvm_ffi::{dispatch, Any, BigInt, Mutator, ObjectRefCore, Result};
 
 use super::analyzer::{bind_range, AnalyzerBase, AnalyzerScope, AnalyzerState};
-use super::util::{function_pass, int_imm, prim_dtype, MutatorExt};
-use crate::ir::{Expr, For, IntImmObj, SeqStmt, Stmt, VarObj};
-use crate::ops::{deep_equal, ex, PrimOps};
-use crate::prim::{
-    AddObj, Broadcast, BroadcastObj, FloorDiv, FloorDivObj, FloorModObj, GEObj, GTObj, LEObj,
-    LTObj, MulObj, Not, NotObj, GE, GT, LE, LT,
-};
+use super::util::{function_pass, int_imm, MutatorExt};
+use crate::ir::{Expr, For, IntImm, SeqStmt, Stmt, VarObj};
+use crate::ops::pattern::{broadcast, PVar, Pattern, PatternOps};
+use crate::ops::{ex, Ex, PrimOps};
+use crate::prim::{Broadcast, FloorDiv, Not, GE, GT, LE, LT};
 use crate::sym::Analyzer;
 use crate::transform::Pass;
 
@@ -52,34 +49,9 @@ impl AnalyzerState for SplitPatternRenormalizer {
     }
 }
 
-/// A `PVar<IntImm>` match: the constant `expr` holds, if it is one.
-fn int_const(expr: &Expr) -> Option<&IntImmObj> {
-    expr.as_node::<IntImmObj>()
-}
-
-/// A `broadcast(c, lanes)` match with an integer constant `c`: the constant and the lanes.
-fn int_broadcast(expr: &Expr) -> Option<(&Expr, &Expr)> {
-    let broadcast = expr.as_node::<BroadcastObj>()?;
-    int_const(&broadcast.value)?;
-    Some((&broadcast.value, &broadcast.lanes))
-}
-
-/// The value of an integer constant matched by `int_const` or `int_broadcast`.
-fn value(constant: &Expr) -> &BigInt {
-    &int_const(constant).expect("matched as an integer constant").value
-}
-
-/// A `PVar<PrimExpr>` bound twice: the same object, or deep-equal (`PEqualChecker<PrimExpr>`).
-fn same_value(lhs: &Expr, rhs: &Expr) -> Result<bool> {
-    if lhs.same_as(rhs) {
-        return Ok(true);
-    }
-    deep_equal(lhs, rhs)
-}
-
-/// C++ `ffi::BigInt` `%` by a nonzero divisor, compared with zero.
-fn divides(divisor: &BigInt, value: &BigInt) -> Result<bool> {
-    Ok(value.try_rem(divisor)?.is_zero())
+/// C++ `ffi::BigInt` `%` by a nonzero divisor, compared with zero: whether `c2` divides `c3`.
+fn divides(c2: &PVar<IntImm>, c3: &PVar<IntImm>) -> Result<bool> {
+    Ok(c3.get().value.try_rem(&c2.get().value)?.is_zero())
 }
 
 /// `ZeroAwareGCD` of two positive constants.
@@ -95,17 +67,35 @@ fn positive(value: &BigInt) -> Option<i128> {
     value.to_i128().filter(|v| *v > 0)
 }
 
-/// `x * c1` with an integer constant (or, with `broadcast`, a broadcast integer constant) `c1`:
-/// `x`, `c1`, and the lanes of the broadcast.
-fn scaled(expr: &Expr, broadcast: bool) -> Option<(&Expr, &Expr, Option<&Expr>)> {
-    let mul = expr.as_node::<MulObj>()?;
-    if broadcast {
-        let (c1, lanes) = int_broadcast(&mul.b)?;
-        Some((&mul.a, c1, Some(lanes)))
-    } else {
-        int_const(&mul.b)?;
-        Some((&mul.a, &mul.b, None))
+/// `floordiv(x * c1 + y, c2)` with the common factor `c3` of `c1` and `c2` taken out,
+/// `floordiv(x * (c1 / c3) + floordiv(y, c3), c2 / c3)`, each new constant broadcast to `lanes`;
+/// `None` unless `c1` and `c2` are positive with a common factor.
+fn factored(
+    x: &PVar<Expr>,
+    c1: &PVar<IntImm>,
+    c2: &PVar<IntImm>,
+    y: Ex,
+    lanes: Option<&PVar<Expr>>,
+) -> Result<Option<Expr>> {
+    let (c1, c2) = (c1.get(), c2.get());
+    let (Some(c1_val), Some(c2_val)) = (positive(&c1.value), positive(&c2.value)) else {
+        return Ok(None);
+    };
+    let c3 = gcd(c1_val, c2_val);
+    if c3 <= 1 {
+        return Ok(None);
     }
+    let lift = |value: IntImm| -> Result<Expr> {
+        match lanes {
+            Some(lanes) => Ok(Broadcast::new(value, lanes.get())?.into()),
+            None => Ok(value.into()),
+        }
+    };
+    let (c1_ty, c2_ty) = (c1.prim_dtype()?, c2.prim_dtype()?);
+    let c1_div = lift(int_imm(c1_ty, c1_val / c3)?)?;
+    let c2_div = lift(int_imm(c2_ty, c2_val / c3)?)?;
+    let c3 = lift(int_imm(c1_ty, c3)?)?;
+    Ok(Some((ex(x.get()) * &c1_div + y.floordiv(&c3)).floordiv(&c2_div).expr()?))
 }
 
 impl SplitPatternRenormalizer {
@@ -122,98 +112,51 @@ impl SplitPatternRenormalizer {
 
     /// The `floordiv` rules, in the C++ order, on `ret = floordiv(a, b)`.
     fn rewrite_floordiv(&mut self, ret: Expr, m: &mut Mutator) -> Result<Expr> {
-        let Some(div) = ret.as_node::<FloorDivObj>() else { return Ok(ret) };
-        // floordiv(floormod(x, c3), c2) = floormod(floordiv(x, c2), floordiv(c3, c2)) if c2 | c3.
-        if let (Some(modulo), Some(c2)) = (div.a.as_node::<FloorModObj>(), int_const(&div.b)) {
-            if let Some(c3) = int_const(&modulo.b) {
-                if divides(&c2.value, &c3.value)? {
-                    let x = &modulo.a;
-                    let rewritten = x.floordiv(&div.b).floormod(ex(&modulo.b).floordiv(&div.b));
-                    return self.recursive_rewrite(rewritten.expr()?, m);
-                }
-            }
+        let (x, y, z, lanes) = (PVar::expr(), PVar::expr(), PVar::expr(), PVar::expr());
+        let (c1, c2, c3) = (PVar::int(), PVar::int(), PVar::int());
+
+        // floordiv(floormod(x, c1 * c2), c2) = floormod(floordiv(x, c2), c1)
+        if x.floormod(&c3).floordiv(&c2).matches(&ret) && divides(&c2, &c3)? {
+            let rewritten = x.floordiv(&c2).floormod(c3.floordiv(&c2));
+            return self.recursive_rewrite(rewritten.eval()?, m);
         }
-        // The same with broadcast constants of one lane count.
-        if let (Some(modulo), Some((c2, lanes2))) =
-            (div.a.as_node::<FloorModObj>(), int_broadcast(&div.b))
-        {
-            if let Some((c3, lanes)) = int_broadcast(&modulo.b) {
-                if same_value(lanes, lanes2)? && divides(value(c2), value(c3))? {
-                    let x = &modulo.a;
-                    let divisor: Expr = Broadcast::new(c2, lanes)?.into();
-                    let quotient = ex(c3).floordiv(c2).expr()?;
-                    let modulus: Expr = Broadcast::new(quotient, lanes)?.into();
-                    let rewritten = x.floordiv(&divisor).floormod(&modulus);
-                    return self.recursive_rewrite(rewritten.expr()?, m);
-                }
-            }
+        let pattern = x.floormod(broadcast(&c3, &lanes)).floordiv(broadcast(&c2, &lanes));
+        if pattern.matches(&ret) && divides(&c2, &c3)? {
+            let rewritten =
+                x.floordiv(broadcast(&c2, &lanes)).floormod(broadcast(c3.floordiv(&c2), &lanes));
+            return self.recursive_rewrite(rewritten.eval()?, m);
         }
 
         // Factoring a product requires signed, non-wrapping index arithmetic.
-        if prim_dtype(&ret)?.code == tvm_ffi::DLDataTypeCode::kDLUInt as u8 {
+        if ret.prim_dtype()?.code == tvm_ffi::DLDataTypeCode::kDLUInt as u8 {
             return Ok(ret);
         }
 
-        // floordiv(x*c1*c3 + y, c2*c3) = floordiv(x*c1 + floordiv(y, c3), c2), and the same with
-        // a third term: floordiv(x*c1*c3 + y + z, c2*c3) = floordiv(x*c1 + floordiv(y + z, c3), c2).
-        for (three_terms, broadcast) in [(false, false), (false, true), (true, false), (true, true)]
-        {
-            if let Some(rewritten) = self.factor(div, three_terms, broadcast)? {
+        // floordiv(x*c1*c3 + y, c2*c3) = floordiv(x*c1 + floordiv(y, c3), c2)
+        if (&x * &c1 + &y).floordiv(&c2).matches(&ret) {
+            if let Some(rewritten) = factored(&x, &c1, &c2, ex(y.get()), None)? {
+                return self.recursive_rewrite(rewritten, m);
+            }
+        }
+        if (&x * broadcast(&c1, &lanes) + &y).floordiv(broadcast(&c2, &lanes)).matches(&ret) {
+            if let Some(rewritten) = factored(&x, &c1, &c2, ex(y.get()), Some(&lanes))? {
+                return self.recursive_rewrite(rewritten, m);
+            }
+        }
+
+        // floordiv(x*c1*c3 + y + z, c2*c3) = floordiv(x*c1 + floordiv(y + z, c3), c2)
+        if (&x * &c1 + &y + &z).floordiv(&c2).matches(&ret) {
+            if let Some(rewritten) = factored(&x, &c1, &c2, ex(y.get()) + z.get(), None)? {
+                return self.recursive_rewrite(rewritten, m);
+            }
+        }
+        let pattern = (&x * broadcast(&c1, &lanes) + &y + &z).floordiv(broadcast(&c2, &lanes));
+        if pattern.matches(&ret) {
+            if let Some(rewritten) = factored(&x, &c1, &c2, ex(y.get()) + z.get(), Some(&lanes))? {
                 return self.recursive_rewrite(rewritten, m);
             }
         }
         Ok(ret)
-    }
-
-    /// The factoring rule on `floordiv(x * c1 + y [+ z], c2)`, `None` when it does not apply.
-    fn factor(
-        &self,
-        div: &FloorDivObj,
-        three_terms: bool,
-        broadcast: bool,
-    ) -> Result<Option<Expr>> {
-        let Some(sum) = div.a.as_node::<AddObj>() else { return Ok(None) };
-        // `x * c1 + y` is the whole numerator, or the left operand of `... + z`.
-        let (product_sum, z) = if three_terms {
-            let Some(inner) = sum.a.as_node::<AddObj>() else { return Ok(None) };
-            (inner, Some(&sum.b))
-        } else {
-            (sum, None)
-        };
-        let Some((x, c1, lanes)) = scaled(&product_sum.a, broadcast) else { return Ok(None) };
-        let y = &product_sum.b;
-        let c2 = match (broadcast, lanes) {
-            (true, Some(lanes)) => match int_broadcast(&div.b) {
-                Some((c2, lanes2)) if same_value(lanes, lanes2)? => c2,
-                _ => return Ok(None),
-            },
-            _ => match int_const(&div.b) {
-                Some(_) => &div.b,
-                None => return Ok(None),
-            },
-        };
-        let (Some(c1_val), Some(c2_val)) = (positive(value(c1)), positive(value(c2))) else {
-            return Ok(None);
-        };
-        let c3 = gcd(c1_val, c2_val);
-        if c3 <= 1 {
-            return Ok(None);
-        }
-        let (c1_ty, c2_ty) = (prim_dtype(c1)?, prim_dtype(c2)?);
-        let lift = |value: Expr| -> Result<Expr> {
-            match lanes {
-                Some(lanes) => Ok(Broadcast::new(value, lanes)?.into()),
-                None => Ok(value),
-            }
-        };
-        let c1_div = lift(int_imm(c1_ty, c1_val / c3)?.into())?;
-        let c2_div = lift(int_imm(c2_ty, c2_val / c3)?.into())?;
-        let c3 = lift(int_imm(c1_ty, c3)?.into())?;
-        let remainder = match z {
-            Some(z) => (ex(y) + z).floordiv(&c3),
-            None => ex(y).floordiv(&c3),
-        };
-        Ok(Some((ex(x) * &c1_div + remainder).floordiv(&c2_div).expr()?))
     }
 }
 
@@ -248,12 +191,14 @@ impl SplitPatternRenormalizer {
     fn mutate_lt(&mut self, op: LT, m: &mut Mutator) -> Result<Any> {
         let a: Expr = m.mutate_as(self, &op.a)?;
         let b: Expr = m.mutate_as(self, &op.b)?;
-        let ret = LT::new(a.clone(), b.clone())?;
-        if let Some(c2) = int_const(&b) {
-            if c2.value > BigInt::from(0i64) && a.as_node::<VarObj>().is_none() {
-                let rewritten = a.floordiv(&b).less(1).expr()?;
-                return Ok(self.recursive_rewrite(rewritten, m)?.into());
-            }
+        let ret: Expr = LT::new(a, b)?.into();
+        let (x, c2) = (PVar::expr(), PVar::int());
+        if x.less(&c2).matches(&ret)
+            && c2.get().value > BigInt::from(0i64)
+            && x.get().as_node::<VarObj>().is_none()
+        {
+            let rewritten = x.floordiv(&c2).less(1).eval()?;
+            return Ok(self.recursive_rewrite(rewritten, m)?.into());
         }
         Ok(ret.into())
     }
@@ -261,24 +206,21 @@ impl SplitPatternRenormalizer {
     /// Double negation and negated comparisons.
     fn mutate_not(&mut self, op: Not, m: &mut Mutator) -> Result<Any> {
         let ret: Expr = m.default_mutate_as(self, &Expr::from(op))?;
-        let Some(not) = ret.as_node::<NotObj>() else { return Ok(ret.into()) };
-        let inner = &not.a;
-        if let Some(inner) = inner.as_node::<NotObj>() {
-            return Ok(inner.a.clone().into());
-        }
-        if let Some(le) = inner.as_node::<LEObj>() {
-            return Ok(le.b.less(&le.a).expr()?.into());
-        }
-        if let Some(ge) = inner.as_node::<GEObj>() {
-            return Ok(ge.a.less(&ge.b).expr()?.into());
-        }
-        if let Some(lt) = inner.as_node::<LTObj>() {
-            return Ok(lt.b.less_equal(&lt.a).expr()?.into());
-        }
-        if let Some(gt) = inner.as_node::<GTObj>() {
-            return Ok(gt.a.less_equal(&gt.b).expr()?.into());
-        }
-        Ok(ret.into())
+        let (x, y) = (PVar::expr(), PVar::expr());
+        let rewritten = if (!!&x).matches(&ret) {
+            x.get()
+        } else if (!x.less_equal(&y)).matches(&ret) {
+            y.less(&x).eval()?
+        } else if (!x.greater_equal(&y)).matches(&ret) {
+            x.less(&y).eval()?
+        } else if (!x.less(&y)).matches(&ret) {
+            y.less_equal(&x).eval()?
+        } else if (!x.greater(&y)).matches(&ret) {
+            x.less_equal(&y).eval()?
+        } else {
+            ret
+        };
+        Ok(rewritten.into())
     }
 
     /// The loop variable lies in `[min, min + extent)` throughout the loop.

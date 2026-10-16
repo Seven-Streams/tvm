@@ -47,8 +47,7 @@ use crate::ir::{
     TensorStoreObj, Type, Var, WhileObj,
 };
 use crate::ops::{
-    deep_equal, ex, int32, int_imm, make_const, prim_dtype, prim_type, structural_equal,
-    unknown_loc, PrimOps,
+    deep_equal, ex, int32, int_imm, make_const, prim_type, structural_equal, unknown_loc, PrimOps,
 };
 use crate::prim::{Let, Ramp, RampObj, Shuffle};
 use crate::runtime::MemoryScope;
@@ -134,8 +133,8 @@ fn void_dtype() -> DLDataType {
 }
 
 /// `as_or_throw<TensorVar>()`: a `Var` whose type is a tirx `TensorType`.
-fn tensor_var(expr: &Expr) -> Result<Var> {
-    match expr.clone().try_cast::<Var>() {
+fn tensor_var(expr: impl Into<Expr>) -> Result<Var> {
+    match expr.into().try_cast::<Var>() {
         Ok(var) if is_tensor(&var) => Ok(var),
         _ => Err(error!(TYPE_ERROR, "expected a tensor variable")),
     }
@@ -496,7 +495,7 @@ impl ContextPolicy<LinearAccessPatternFinder> for AccessScopes {
                         AllocEntry { num_physical_dimensions: ndim, level, alloc: op.clone() },
                     );
                 } else if DECL_TENSOR.is(&call.op) {
-                    let tensor = tensor_var(&op.var.clone().into())?;
+                    let tensor = tensor_var(&op.var)?;
                     let data = call.args.get(0)?;
                     ctx.state_mut().aliases.register(&tensor, &data)?;
                 }
@@ -608,7 +607,7 @@ impl ContextPolicy<InplaceOpVerifier> for InplaceAccesses {
             }
             if buf == state.src {
                 let Some(store) = state.store.clone() else { return Ok(state.fail()) };
-                if prim_dtype(&store.value)? != prim_dtype(&op.clone().into())? {
+                if store.value.prim_dtype()? != op.prim_dtype()? {
                     return Ok(state.fail());
                 }
                 tvm_ffi::ensure!(
@@ -774,7 +773,7 @@ impl StoragePlanRewriter {
         for (var, root) in aliased {
             if let Some(&(_, e)) = self.alloc_map.get(&ObjectIdentity::of(&root)) {
                 let backing = self.alloc_var(e)?;
-                self.remap_tensor(&tensor_var(&var.into())?, &backing)?;
+                self.remap_tensor(&tensor_var(var)?, &backing)?;
             }
         }
         let body: SeqStmt = structural_mutate(body, &mut self)?.try_into()?;
@@ -824,7 +823,7 @@ impl StoragePlanRewriter {
         } else {
             let ty = tensor_type(buf)?;
             let copy = retyped(&ty, ty.dtype.clone(), ty.shape.clone(), ty.layout.clone());
-            Var::new_full(backing.name.clone(), copy, buf.loc.clone())?
+            Var::new_full(backing.name.clone(), copy, &buf.loc)?
         };
         self.remap.insert(ObjectIdentity::of(buf), remapped.clone());
         self.remapped_backing.insert(ObjectIdentity::of(&remapped), backing.clone());
@@ -847,7 +846,7 @@ impl StoragePlanRewriter {
             INTERNAL_ERROR,
             "the offset is a whole number of elements"
         );
-        let offset = make_const(prim_dtype(&last)?, (bits_offset / elem_bits) as i64)?;
+        let offset = make_const(last.prim_dtype()?, (bits_offset / elem_bits) as i64)?;
         indices.push((ex(offset) + &last).expr()?);
         Ok(Array::new(indices))
     }
@@ -876,7 +875,7 @@ impl StoragePlanRewriter {
         let backing = self.alloc_var(e)?;
         let remapped = self.remap_tensor(&tensor, &backing)?;
         let indices = self.remap_indices(&tensor, &node.indices, e)?;
-        TensorLoad::new_full(remapped, indices.iter(), node.loc.clone())
+        TensorLoad::new_full(remapped, indices.iter(), &node.loc)
     }
 
     /// `alloc_tensor` binding of `buf`, volatile if asked.
@@ -1492,7 +1491,8 @@ impl StoragePlanRewriter {
         let type_bits = element_bits(entry.elem_type)?;
         let first_type = declared_type(first.value.as_node::<CallObj>().expect("a call"))?;
         let alloc_elements = total_bits / type_bits;
-        let mut shape_type = prim_dtype(&first_type.shape.get(0)?)?;
+        let first_extent = first_type.shape.get(0)?;
+        let mut shape_type = first_extent.prim_dtype()?;
         if shape_type.bits < 64 && alloc_elements > i32::MAX as u64 {
             shape_type = DLDataType { code: DLDataTypeCode::kDLInt as u8, bits: 64, lanes: 1 };
         }
@@ -1540,7 +1540,7 @@ impl StoragePlanRewriter {
             return m.default_mutate(self, op);
         };
         let backing = self.alloc_var(e)?;
-        let tensor = self.remap_tensor(&tensor_var(&op.var.clone().into())?, &backing)?;
+        let tensor = self.remap_tensor(&tensor_var(&op.var)?, &backing)?;
         let attrs: Option<Attrs> = m.mutate_as(self, &call.attrs)?;
         self.declared_view(&tensor, &backing, attrs, call, op)
     }
@@ -1561,9 +1561,9 @@ impl StoragePlanRewriter {
             Array::new(vec![backing.tensor_data()?]),
             attrs,
             Array::new(vec![ty]),
-            call.loc.clone(),
+            &call.loc,
         )?;
-        Ok(Bind::new_full(tensor.clone(), view, op.loc.clone())?.into())
+        Ok(Bind::new_full(tensor.clone(), view, &op.loc)?.into())
     }
 
     /// A masked load or store accesses its tensor like a load or store.
@@ -1580,7 +1580,7 @@ impl StoragePlanRewriter {
         let mask = &args[args.len() - 1];
         match value {
             None => {
-                let access = TensorLoad::new_full(tensor, indices, op.loc.clone())?;
+                let access = TensorLoad::new_full(tensor, indices, &op.loc)?;
                 let access = self.remap_load(access)?;
                 let mut args = vec![access.source.clone()];
                 args.extend(access.indices.iter());
@@ -1591,12 +1591,12 @@ impl StoragePlanRewriter {
                     Array::new(args),
                     op.attrs.clone(),
                     op.ty_args.clone(),
-                    op.loc.clone(),
+                    &op.loc,
                 )?;
                 Ok(call.into())
             }
             Some(value) => {
-                let access = TensorStore::new_full(tensor, indices, value, op.loc.clone())?;
+                let access = TensorStore::new_full(tensor, indices, value, &op.loc)?;
                 let access = self.remap_store(access)?;
                 let mut args = vec![access.dest.clone(), access.value.clone()];
                 args.extend(access.indices.iter());
@@ -1607,7 +1607,7 @@ impl StoragePlanRewriter {
                     Array::new(args),
                     op.attrs.clone(),
                     op.ty_args.clone(),
-                    op.loc.clone(),
+                    &op.loc,
                 )?;
                 Ok(call.into())
             }
@@ -1631,7 +1631,7 @@ impl StoragePlanRewriter {
         let node = if value.same_as(&op.value) && indices.same_as(&op.indices) {
             op
         } else {
-            TensorStore::new_full(op.dest.clone(), &indices, value, op.loc.clone())?
+            TensorStore::new_full(&op.dest, &indices, value, &op.loc)?
         };
         Ok(self.remap_store(node)?.into())
     }
@@ -1641,7 +1641,7 @@ impl StoragePlanRewriter {
         let node = if indices.same_as(&op.indices) {
             op
         } else {
-            TensorLoad::new_full(op.source.clone(), indices.iter(), op.loc.clone())?
+            TensorLoad::new_full(&op.source, indices.iter(), &op.loc)?
         };
         Ok(self.remap_load(node)?.into())
     }
@@ -1678,7 +1678,7 @@ impl StoragePlanRewriter {
                             Array::new(vec![data, offset.into()]),
                             None,
                             Array::new(vec![]),
-                            op.loc.clone(),
+                            &op.loc,
                         )?;
                         return Ok(call.into());
                     }
@@ -1719,8 +1719,8 @@ impl StoragePlanRewriter {
         let body = self.make_attach(&entries, op.body.clone())?;
         let stmt = For::new_full(
             op.loop_var.clone(),
-            op.min.clone(),
-            op.extent.clone(),
+            &op.min,
+            &op.extent,
             op.kind,
             body,
             op.annotations.clone(),
@@ -1931,13 +1931,13 @@ impl VectorTypeAccessChecker {
         let indices: Vec<Expr> = indices.iter().collect();
         for index in indices.iter().take(indices.len().saturating_sub(1)) {
             tvm_ffi::ensure!(
-                encoded_lanes(prim_dtype(index)?) == 1,
+                encoded_lanes(index.prim_dtype()?) == 1,
                 INTERNAL_ERROR,
                 "Only the last index of a buffer access may be a vector type."
             );
         }
         let index_lanes = match indices.last() {
-            Some(index) => lanes(prim_dtype(index)?)?,
+            Some(index) => lanes(index.prim_dtype()?)?,
             None => 1,
         };
         let access_dtype = value_dtype;
@@ -1965,7 +1965,7 @@ impl VectorTypeAccessChecker {
         }
         if self.detect_scalar_read_patterns && is_tensor_load {
             if let Some(last) = indices.last() {
-                if encoded_lanes(prim_dtype(last)?) == 1 {
+                if encoded_lanes(last.prim_dtype()?) == 1 {
                     let me = self.analyzer.modular_set(last)?;
                     // Fixed lane counts use 15 bits.
                     if (0..=32767).contains(&me.coeff) {
@@ -1987,7 +1987,7 @@ impl VectorTypeAccessChecker {
     /// A load's value type and indices: `masked_load`/`masked_store` take them as arguments.
     fn masked_access(&self, call: &Call, is_load: bool) -> Result<(DLDataType, Array<Expr>)> {
         let args: Vec<Expr> = call.args.iter().collect();
-        let dtype = if is_load { prim_dtype(&call.clone().into())? } else { prim_dtype(&args[1])? };
+        let dtype = if is_load { call.prim_dtype()? } else { (args[1]).prim_dtype()? };
         let first_index = if is_load { 1 } else { 2 };
         Ok((dtype, args[first_index..args.len() - 1].iter().cloned().collect()))
     }
@@ -1996,13 +1996,13 @@ impl VectorTypeAccessChecker {
 #[dispatch(walk)]
 impl VectorTypeAccessChecker {
     fn walk_tensor_load(&mut self, op: TensorLoad) -> Result<WalkResult> {
-        let dtype = prim_dtype(&op.clone().into())?;
+        let dtype = op.prim_dtype()?;
         self.on_array_access(dtype, &op.source, &op.indices, true)?;
         Ok(WalkResult::Advance)
     }
 
     fn walk_tensor_store(&mut self, op: TensorStore) -> Result<WalkResult> {
-        self.on_array_access(prim_dtype(&op.value)?, &op.dest, &op.indices, false)?;
+        self.on_array_access(op.value.prim_dtype()?, &op.dest, &op.indices, false)?;
         Ok(WalkResult::Advance)
     }
 
@@ -2014,7 +2014,7 @@ impl VectorTypeAccessChecker {
             self.on_array_access(dtype, &op.args.get(0)?, &indices, is_load)?;
         } else if ADDRESS_OF.is(&op.op) {
             if let Ok(load) = op.args.get(0)?.try_cast::<TensorLoad>() {
-                let dtype = prim_dtype(&load.clone().into())?;
+                let dtype = load.prim_dtype()?;
                 self.on_array_access(dtype, &load.source, &load.indices, false)?;
             }
         }
@@ -2034,7 +2034,7 @@ impl VectorTypeAccessChecker {
                 return Ok(WalkResult::Advance);
             }
             if DECL_TENSOR.is(&call.op) {
-                let tensor = tensor_var(&op.var.clone().into())?;
+                let tensor = tensor_var(&op.var)?;
                 self.aliases.register(&tensor, &call.args.get(0)?)?;
                 self.declare_tensor(&op.var, call, DECL_TENSOR_CALL)?;
                 return Ok(WalkResult::Advance);
@@ -2157,7 +2157,7 @@ struct VectorTypeRewriter {
 fn divided_shape(shape: &Array<Expr>, factor: i32) -> Result<Array<Expr>> {
     let mut extents: Vec<Expr> = shape.iter().collect();
     if let Some(last) = extents.pop() {
-        let factor = make_const(prim_dtype(&last)?, factor as i64)?;
+        let factor = make_const(last.prim_dtype()?, factor as i64)?;
         extents.push(last.div(factor).expr()?);
     }
     Ok(Array::new(extents))
@@ -2184,7 +2184,7 @@ impl VectorTypeRewriter {
                     let factor = lanes(preferred)? / lanes(var_info.element_dtype)?;
                     let shape = divided_shape(&ty.shape, factor)?;
                     let ty = retyped(&ty, prim_type(preferred)?, shape, None);
-                    Var::new_full(old.name.clone(), ty, old.loc.clone())?
+                    Var::new_full(old.name.clone(), ty, &old.loc)?
                 }
                 Err(_) => {
                     let pointer = old
@@ -2192,7 +2192,7 @@ impl VectorTypeRewriter {
                         .as_node::<PtrTypeObj>()
                         .ok_or_else(|| error!(TYPE_ERROR, "expected a pointer variable"))?;
                     let ty = PtrType::new(prim_type(preferred)?, pointer.scope.clone())?;
-                    Var::new_full(old.name.clone(), ty, old.loc.clone())?
+                    Var::new_full(old.name.clone(), ty, &old.loc)?
                 }
             };
             rewrite_map.insert(
@@ -2231,7 +2231,7 @@ impl VectorTypeRewriter {
         let mut indices: Vec<Expr> = indices.iter().collect();
         let last_dim_index =
             indices.last().cloned().ok_or_else(|| error!(INTERNAL_ERROR, "no indices"))?;
-        let index_dtype = prim_dtype(&last_dim_index)?;
+        let index_dtype = last_dim_index.prim_dtype()?;
         // Scalable accesses are neither checked nor rewritten.
         if is_scalable_vector(dtype_of(&tensor_type(tensor)?)) || is_scalable_vector(index_dtype) {
             return Ok(None);
@@ -2243,7 +2243,7 @@ impl VectorTypeRewriter {
         }) {
             let lanes = int_value(&ramp.lanes)?;
             let factor = info.factor()?;
-            let base_lanes = make_const(prim_dtype(&ramp.base_)?, lanes as i64)?;
+            let base_lanes = make_const(ramp.base_.prim_dtype()?, lanes as i64)?;
             let mut new_index = ramp.base_.div(base_lanes).expr()?;
             if lanes != factor {
                 tvm_ffi::ensure!(
@@ -2252,13 +2252,9 @@ impl VectorTypeRewriter {
                     "the ramp covers whole elements"
                 );
                 let new_lanes = lanes / factor;
-                new_index = Ramp::new_full(
-                    ex(&new_index) * new_lanes,
-                    ramp.stride.clone(),
-                    new_lanes,
-                    ramp.loc.clone(),
-                )?
-                .into();
+                new_index =
+                    Ramp::new_full(ex(&new_index) * new_lanes, &ramp.stride, new_lanes, &ramp.loc)?
+                        .into();
             }
             *indices.last_mut().expect("non-empty") = new_index;
         } else if lanes(index_dtype)? == 1 && info.factor()? > 1 {
@@ -2292,7 +2288,7 @@ impl VectorTypeRewriter {
             return Ok((node, -1));
         };
         let tensor = self.remap_tensor(&tensor)?;
-        Ok((TensorLoad::new_full(tensor, indices.iter(), node.loc.clone())?, shuffle_index))
+        Ok((TensorLoad::new_full(tensor, indices.iter(), &node.loc)?, shuffle_index))
     }
 
     /// The retyped tensor `buf` becomes: the new root, or an alias retyped like its root.
@@ -2310,7 +2306,7 @@ impl VectorTypeRewriter {
                 let ty = tensor_type(buf)?;
                 let shape = divided_shape(&ty.shape, info.factor()?)?;
                 let ty = retyped(&ty, prim_type(info.new_element_dtype)?, shape, None);
-                remapped = Var::new_full(buf.name.clone(), ty, buf.loc.clone())?;
+                remapped = Var::new_full(buf.name.clone(), ty, &buf.loc)?;
             }
         }
         self.remap.insert(id, remapped.clone());
@@ -2329,13 +2325,13 @@ impl VectorTypeRewriter {
         let first_index = if is_load { 1 } else { 2 };
         let mut indices: Vec<Expr> = Vec::new();
         for index in &args[first_index..args.len() - 1] {
-            prim_dtype(index)?;
+            index.prim_dtype()?;
             indices.push(m.mutate_as(self, index)?);
         }
         let mask = &args[args.len() - 1];
         let call = match value {
             None => {
-                let access = TensorLoad::new_full(tensor, indices, op.loc.clone())?;
+                let access = TensorLoad::new_full(tensor, indices, &op.loc)?;
                 let (modified, shuffle_index) = self.visit_load(access)?;
                 tvm_ffi::ensure!(
                     shuffle_index < 0,
@@ -2351,11 +2347,11 @@ impl VectorTypeRewriter {
                     Array::new(args),
                     op.attrs.clone(),
                     op.ty_args.clone(),
-                    op.loc.clone(),
+                    &op.loc,
                 )?
             }
             Some(value) => {
-                let access = TensorStore::new_full(tensor, indices, value, op.loc.clone())?;
+                let access = TensorStore::new_full(tensor, indices, value, &op.loc)?;
                 let (modified, shuffle_index) = self.visit_store(access)?;
                 tvm_ffi::ensure!(
                     shuffle_index < 0,
@@ -2371,7 +2367,7 @@ impl VectorTypeRewriter {
                     Array::new(args),
                     op.attrs.clone(),
                     op.ty_args.clone(),
-                    op.loc.clone(),
+                    &op.loc,
                 )?
             }
         };
@@ -2380,7 +2376,7 @@ impl VectorTypeRewriter {
 
     /// `alloc_tensor` of a retyped tensor: the binding of the new tensor.
     fn mutate_alloc_tensor(&mut self, op: &Bind, call: &CallObj, m: &mut Mutator) -> Result<Any> {
-        let new_buf = self.remap_tensor(&tensor_var(&op.var.clone().into())?)?;
+        let new_buf = self.remap_tensor(&tensor_var(&op.var)?)?;
         let mut args: Vec<Expr> = call.args.iter().collect();
         // C++ `args.Set(0, ...)` copies the shared array, so a call with arguments is rebuilt.
         let args_same = args.is_empty();
@@ -2398,16 +2394,16 @@ impl VectorTypeRewriter {
             Array::new(args),
             attrs,
             Array::new(vec![ty]),
-            call.loc.clone(),
+            &call.loc,
         )?;
-        Ok(Bind::new_full(new_buf, call, op.loc.clone())?.into())
+        Ok(Bind::new_full(new_buf, call, &op.loc)?.into())
     }
 
     /// `decl_tensor` of a retyped tensor or of a retyped tensor's data.
     fn mutate_decl_tensor(&mut self, op: &Bind, call: &CallObj, m: &mut Mutator) -> Result<Any> {
         let original = call.args.get(0)?;
         let data: Expr = m.mutate_as(self, &original)?;
-        let tensor = self.remap_tensor(&tensor_var(&op.var.clone().into())?)?;
+        let tensor = self.remap_tensor(&tensor_var(&op.var)?)?;
         let attrs: Option<Attrs> = m.mutate_as(self, &call.attrs)?;
         if tensor.same_as(&op.var) && data.same_as(&original) && attrs.same_field(&call.attrs) {
             return Ok(op.clone().into());
@@ -2419,9 +2415,9 @@ impl VectorTypeRewriter {
             Array::new(vec![data]),
             attrs,
             Array::new(vec![ty]),
-            call.loc.clone(),
+            &call.loc,
         )?;
-        Ok(Bind::new_full(tensor, call, op.loc.clone())?.into())
+        Ok(Bind::new_full(tensor, call, &op.loc)?.into())
     }
 }
 
@@ -2441,7 +2437,7 @@ impl VectorTypeRewriter {
         let node = if indices.same_as(&op.indices) {
             op
         } else {
-            TensorLoad::new_full(op.source.clone(), indices.iter(), op.loc.clone())?
+            TensorLoad::new_full(&op.source, indices.iter(), &op.loc)?
         };
         let (modified, shuffle_index) = self.visit_load(node.clone())?;
         if node.same_as(&modified) {
@@ -2460,7 +2456,7 @@ impl VectorTypeRewriter {
         let node = if value.same_as(&op.value) && indices.same_as(&op.indices) {
             op
         } else {
-            TensorStore::new_full(op.dest.clone(), &indices, value, op.loc.clone())?
+            TensorStore::new_full(&op.dest, &indices, value, &op.loc)?
         };
         let (modified, shuffle_index) = self.visit_store(node)?;
         tvm_ffi::ensure!(
@@ -2510,7 +2506,7 @@ impl VectorTypeRewriter {
                 call.args.clone(),
                 call.attrs.clone(),
                 call.ty_args.clone(),
-                call.loc.clone(),
+                &call.loc,
             )?
             .into();
             value_unchanged = false;
@@ -2552,7 +2548,7 @@ impl PointerVarSubstituter {
             call.args.clone(),
             call.attrs.clone(),
             call.ty_args.clone(),
-            call.loc.clone(),
+            &call.loc,
         )?;
         Ok(call.into())
     }

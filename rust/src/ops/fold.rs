@@ -29,7 +29,7 @@ use std::fmt::Display;
 
 use tvm_ffi::{BigInt, DLDataType, Error, ObjectRefCore, Result, INTERNAL_ERROR};
 
-use super::build::{big_int_imm, float_imm, prim_dtype};
+use super::build::{big_int_imm, float_imm};
 use super::math::{check_failed, BOOL, INT, UINT};
 use crate::ir::{Expr, FloatImmObj, IntImmObj};
 
@@ -137,7 +137,7 @@ fn keep(expr: &Expr) -> Folded {
 
 /// `TryConstFold<Add>`.
 pub(super) fn add(a: &Expr, b: &Expr) -> Folded {
-    let dtype = prim_dtype(a)?;
+    let dtype = a.prim_dtype()?;
     let (pa, pb, fa, fb) = (int(a), int(b), float(a), float(b));
     if let (Some(x), Some(y)) = (pa, pb) {
         return wrapped(dtype, x + y);
@@ -166,7 +166,7 @@ pub(super) fn add(a: &Expr, b: &Expr) -> Folded {
 
 /// `TryConstFold<Sub>`: an unsigned `0 - n` is an error, as it would be negative.
 pub(super) fn sub(a: &Expr, b: &Expr) -> Folded {
-    let dtype = prim_dtype(a)?;
+    let dtype = a.prim_dtype()?;
     let (pa, pb, fa, fb) = (int(a), int(b), float(a), float(b));
     let unsigned_zero = pa.is_some_and(BigInt::is_zero) && dtype.code == UINT;
     if unsigned_zero && pb.is_some_and(|y| !y.is_zero() && !y.is_negative()) && dtype.code == UINT {
@@ -200,7 +200,7 @@ pub(super) fn sub(a: &Expr, b: &Expr) -> Folded {
 
 /// `TryConstFold<Mul>`.
 pub(super) fn mul(a: &Expr, b: &Expr) -> Folded {
-    let dtype = prim_dtype(a)?;
+    let dtype = a.prim_dtype()?;
     let (pa, pb, fa, fb) = (int(a), int(b), float(a), float(b));
     if let (Some(x), Some(y)) = (pa, pb) {
         return wrapped(dtype, x * y);
@@ -249,7 +249,7 @@ pub(super) fn mul(a: &Expr, b: &Expr) -> Folded {
 
 /// `TryConstFold<Div>`: integers divide truncating.
 pub(super) fn div(a: &Expr, b: &Expr) -> Folded {
-    let dtype = prim_dtype(a)?;
+    let dtype = a.prim_dtype()?;
     let (pa, pb, fa, fb) = (int(a), int(b), float(a), float(b));
     if let (Some(x), Some(y)) = (pa, pb) {
         check_int_divisor(y)?;
@@ -287,9 +287,9 @@ pub(super) fn div(a: &Expr, b: &Expr) -> Folded {
 /// `TryConstFold<Mod>`, the truncating remainder: index types fold with the identities, wider
 /// integers fold only two constants.
 pub(super) fn truncmod(a: &Expr, b: &Expr) -> Folded {
-    let dtype = prim_dtype(a)?;
+    let dtype = a.prim_dtype()?;
     let (pa, pb) = (int(a), int(b));
-    if is_index_type(dtype) && is_index_type(prim_dtype(b)?) {
+    if is_index_type(dtype) && is_index_type(b.prim_dtype()?) {
         if let (Some(x), Some(y)) = (pa, pb) {
             check_int_divisor(y)?;
             return wrapped(dtype, x.try_rem(y)?);
@@ -315,7 +315,7 @@ pub(super) fn truncmod(a: &Expr, b: &Expr) -> Folded {
 
 /// `TryConstFold<FloorDiv>`.
 pub(super) fn floordiv(a: &Expr, b: &Expr) -> Folded {
-    let dtype = prim_dtype(a)?;
+    let dtype = a.prim_dtype()?;
     let (pa, pb, fa, fb) = (int(a), int(b), float(a), float(b));
     if let (Some(x), Some(y)) = (pa, pb) {
         check_int_divisor(y)?;
@@ -354,9 +354,9 @@ pub(super) fn floordiv(a: &Expr, b: &Expr) -> Folded {
 /// `TryConstFold<FloorMod>`: index types fold with the identities, wider or unsigned integers
 /// fold only two constants.
 pub(super) fn floormod(a: &Expr, b: &Expr) -> Folded {
-    let dtype = prim_dtype(a)?;
+    let dtype = a.prim_dtype()?;
     let (pa, pb) = (int(a), int(b));
-    if is_index_type(dtype) && is_index_type(prim_dtype(b)?) {
+    if is_index_type(dtype) && is_index_type(b.prim_dtype()?) {
         if let (Some(x), Some(y)) = (pa, pb) {
             check_int_divisor(y)?;
             return wrapped(dtype, x.floor_mod(y)?);
@@ -383,7 +383,7 @@ pub(super) fn floormod(a: &Expr, b: &Expr) -> Folded {
 /// `TryConstFold<Min>`: two constants, or an operand with itself. Floats compare as
 /// `std::min`, which keeps the first of two unordered values.
 pub(super) fn min(a: &Expr, b: &Expr) -> Folded {
-    let dtype = prim_dtype(a)?;
+    let dtype = a.prim_dtype()?;
     if let (Some(x), Some(y)) = (int(a), int(b)) {
         return int_result(dtype, x.min(y).clone());
     }
@@ -398,7 +398,7 @@ pub(super) fn min(a: &Expr, b: &Expr) -> Folded {
 
 /// `TryConstFold<Max>`, as [`min`] (`std::max` keeps the first of two unordered values).
 pub(super) fn max(a: &Expr, b: &Expr) -> Folded {
-    let dtype = prim_dtype(a)?;
+    let dtype = a.prim_dtype()?;
     if let (Some(x), Some(y)) = (int(a), int(b)) {
         return int_result(dtype, x.max(y).clone());
     }

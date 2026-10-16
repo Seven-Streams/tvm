@@ -36,7 +36,7 @@ use crate::ir::{
     Bind, Call, CallObj, Expr, FloatImm, LambdaExpr, PrimType, PrimTypeObj, PtrType, PtrTypeObj,
     SeqStmt, Stmt, TensorLoad, TensorStore, Tuple, TupleObj, Type, Var,
 };
-use crate::ops::{float_imm, prim_dtype, prim_type, repr, Ex, PrimOps};
+use crate::ops::{float_imm, prim_type, repr, Ex, PrimOps};
 use crate::prim::{
     Add, Broadcast, Cast, CastObj, Div, Let, Max, Min, Mul, Select, Shuffle, Sub, EQ, GE, GT, LE,
     LT, NE,
@@ -83,12 +83,6 @@ impl Family {
 // ---------------------------------------------------------------------------------------------
 // Shared helpers
 
-/// `as_or_throw<PrimType>()` of an expression's type.
-fn prim_ty(expr: &Expr) -> Result<PrimType> {
-    prim_dtype(expr)?;
-    expr.ty.clone().try_cast()
-}
-
 /// `TensorVar::dtype()`: the element type of a tensor variable.
 fn tensor_dtype(tensor: &Expr) -> Result<PrimType> {
     match tensor.ty.as_node::<TensorTypeObj>() {
@@ -99,7 +93,7 @@ fn tensor_dtype(tensor: &Expr) -> Result<PrimType> {
 
 /// `TensorLoad(tensor, indices).ty()`: what a load of `tensor` at `indices` yields.
 fn load_type(tensor: &Expr, indices: &[Expr]) -> Result<PrimType> {
-    let load = TensorLoad::new(tensor.clone(), indices.to_vec())?;
+    let load = TensorLoad::new(tensor, indices.to_vec())?;
     load.ty.clone().try_cast()
 }
 
@@ -109,8 +103,8 @@ fn with_lanes(dtype: DLDataType, other: DLDataType) -> DLDataType {
 }
 
 /// `var.CopyWithType(ty)`.
-fn copy_with_type(var: &Var, ty: Type) -> Var {
-    Var::from_complete_fields(var.loc.clone(), ty, var.name.clone())
+fn copy_with_type(var: &Var, ty: impl Into<Type>) -> Var {
+    Var::from_complete_fields(var.loc.clone(), ty.into(), var.name.clone())
 }
 
 /// `make_object<TensorTypeNode>(*ty)` with `dtype` replaced.
@@ -154,14 +148,19 @@ fn reinfer(call: Call) -> Result<Call> {
 }
 
 /// `Call(ty, op, args, attrs, ty_args, loc)`.
-fn call_like(original: &Call, ty: Type, args: Vec<Expr>, ty_args: Array<Type>) -> Result<Expr> {
+fn call_like(
+    original: &Call,
+    ty: impl Into<Type>,
+    args: Vec<Expr>,
+    ty_args: Array<Type>,
+) -> Result<Expr> {
     let call = Call::new_full(
-        Some(ty),
+        Some(ty.into()),
         original.op.clone(),
         Array::new(args),
         original.attrs.clone(),
         ty_args,
-        original.loc.clone(),
+        &original.loc,
     )?;
     Ok(call.into())
 }
@@ -259,7 +258,7 @@ impl ComputeLegalizer {
     /// Every cast to the family's type becomes one to the promoted type.
     fn mutate_cast(&mut self, op: Cast, m: &mut Mutator) -> Result<Any> {
         let value = self.promoted(&op.value, m)?;
-        let op_dtype = prim_dtype(&op.clone().into())?;
+        let op_dtype = op.prim_dtype()?;
         if self.family.matches_dtype(op_dtype) {
             return Ok(Ex::from(value).cast(with_lanes(self.promote, op_dtype)).expr()?.into());
         }
@@ -288,7 +287,7 @@ impl ComputeLegalizer {
         if value.same_as(&op.value) && !self.family.matches(&op.ty) {
             return Ok(op.into());
         }
-        Ok(Broadcast::new(value, op.lanes.clone())?.into())
+        Ok(Broadcast::new(value, &op.lanes)?.into())
     }
 
     fn mutate_shuffle(&mut self, op: Shuffle, m: &mut Mutator) -> Result<Any> {
@@ -333,7 +332,7 @@ impl ComputeLegalizer {
             let value: Expr = m.mutate_as(self, &arg)?;
             args.push(if is_prim { self.promote(value)? } else { value });
         }
-        let op_dtype = prim_dtype(&op.clone().into())?;
+        let op_dtype = op.prim_dtype()?;
         if self.family.matches_dtype(op_dtype) {
             let ty: Type = prim_type(with_lanes(self.promote, op_dtype))?.into();
             return Ok(call_like(&op, ty, args, Array::new(vec![]))?.into());
@@ -341,7 +340,7 @@ impl ComputeLegalizer {
         if same_elements(&args, &op.args) {
             return Ok(op.into());
         }
-        Ok(call_like(&op, op.ty.clone(), args, Array::new(vec![]))?.into())
+        Ok(call_like(&op, &op.ty, args, Array::new(vec![]))?.into())
     }
 
     fn mutate_float_imm(&mut self, op: FloatImm) -> Result<Any> {
@@ -362,51 +361,51 @@ impl ComputeLegalizer {
     }
 
     fn mutate_add(&mut self, op: Add, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a + b)
+        self.binary(&op, &op.a, &op.b, m, |a, b| a + b)
     }
 
     fn mutate_sub(&mut self, op: Sub, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a - b)
+        self.binary(&op, &op.a, &op.b, m, |a, b| a - b)
     }
 
     fn mutate_mul(&mut self, op: Mul, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a * b)
+        self.binary(&op, &op.a, &op.b, m, |a, b| a * b)
     }
 
     fn mutate_div(&mut self, op: Div, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a.div(b))
+        self.binary(&op, &op.a, &op.b, m, |a, b| a.div(b))
     }
 
     fn mutate_min(&mut self, op: Min, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a.min(b))
+        self.binary(&op, &op.a, &op.b, m, |a, b| a.min(b))
     }
 
     fn mutate_max(&mut self, op: Max, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a.max(b))
+        self.binary(&op, &op.a, &op.b, m, |a, b| a.max(b))
     }
 
     fn mutate_lt(&mut self, op: LT, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a.less(b))
+        self.binary(&op, &op.a, &op.b, m, |a, b| a.less(b))
     }
 
     fn mutate_le(&mut self, op: LE, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a.less_equal(b))
+        self.binary(&op, &op.a, &op.b, m, |a, b| a.less_equal(b))
     }
 
     fn mutate_gt(&mut self, op: GT, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a.greater(b))
+        self.binary(&op, &op.a, &op.b, m, |a, b| a.greater(b))
     }
 
     fn mutate_ge(&mut self, op: GE, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a.greater_equal(b))
+        self.binary(&op, &op.a, &op.b, m, |a, b| a.greater_equal(b))
     }
 
     fn mutate_eq(&mut self, op: EQ, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a.equal(b))
+        self.binary(&op, &op.a, &op.b, m, |a, b| a.equal(b))
     }
 
     fn mutate_ne(&mut self, op: NE, m: &mut Mutator) -> Result<Any> {
-        self.binary(op.clone().into(), &op.a, &op.b, m, |a, b| a.not_equal(b))
+        self.binary(&op, &op.a, &op.b, m, |a, b| a.not_equal(b))
     }
 
     /// A binding of a non-scalar value promotes the allocation the planner chose; a scalar
@@ -449,7 +448,7 @@ impl ComputeLegalizer {
         if tensor.same_as(&op.source) && indices.same_as(&op.indices) {
             return Ok(op.into());
         }
-        Ok(TensorLoad::new_full(tensor, indices.iter(), op.loc.clone())?.into())
+        Ok(TensorLoad::new_full(tensor, indices.iter(), &op.loc)?.into())
     }
 }
 
@@ -476,13 +475,13 @@ impl ComputeLegalizer {
 
     /// C++ `PromoteToTarget`: a value of the family's type in the promoted type.
     fn promote(&self, value: Expr) -> Result<Expr> {
-        let dtype = prim_dtype(&value)?;
+        let dtype = value.prim_dtype()?;
         if !self.family.matches_dtype(dtype) {
             return Ok(value);
         }
         let target = with_lanes(self.promote, dtype);
         if let Some(cast) = value.as_node::<CastObj>() {
-            if prim_dtype(&cast.value)? == target {
+            if cast.value.prim_dtype()? == target {
                 return Ok(cast.value.clone());
             }
         }
@@ -491,7 +490,7 @@ impl ComputeLegalizer {
 
     /// C++ `CastTargetToDType`: a promoted float value back in `dtype`.
     fn cast_target_to_dtype(&self, value: Expr, dtype: &PrimType) -> Result<Expr> {
-        let value_dtype = prim_dtype(&value)?;
+        let value_dtype = value.prim_dtype()?;
         if value_dtype.code != DLDataTypeCode::kDLFloat as u8 {
             return Ok(value);
         }
@@ -505,10 +504,10 @@ impl ComputeLegalizer {
 
     /// The variable of a scalar binding: retyped, and remapped, when its value's type changed.
     fn retyped(&mut self, var: &Var, value: &Expr, original: &Expr) -> Result<Var> {
-        if prim_dtype(value)? == prim_dtype(original)? {
+        if value.prim_dtype()? == original.prim_dtype()? {
             return Ok(var.clone());
         }
-        let retyped = copy_with_type(var, value.ty.clone());
+        let retyped = copy_with_type(var, &value.ty);
         self.remap.insert(ObjectIdentity::of(var), retyped.clone());
         Ok(retyped)
     }
@@ -525,7 +524,7 @@ impl ComputeLegalizer {
             value = self.cast_target_to_dtype(value, &load_type(tensor, indices)?)?;
         }
         let storage = load_type(tensor, indices)?;
-        if prim_dtype(&value)? != storage.dtype {
+        if value.prim_dtype()? != storage.dtype {
             check!(self.family.matches(&value.ty), INTERNAL_ERROR, "MatchType(value.ty())");
             value = dtype_conversion(value, &storage)?;
         }
@@ -534,12 +533,13 @@ impl ComputeLegalizer {
 
     fn binary(
         &mut self,
-        original: Expr,
+        original: impl Into<Expr>,
         a: &Expr,
         b: &Expr,
         m: &mut Mutator,
         combine: fn(Ex, Expr) -> Ex,
     ) -> Result<Any> {
+        let original: Expr = original.into();
         let new_a = self.promoted(a, m)?;
         let new_b = self.promoted(b, m)?;
         if new_a.same_as(a) && new_b.same_as(b) && !self.family.matches(&original.ty) {
@@ -594,9 +594,9 @@ impl ComputeLegalizer {
         let mut vars = Vec::new();
         for (i, var) in combine.vars.iter().enumerate() {
             let field_ty: PrimType = value_fields[i % value_fields.len()].ty.clone().try_cast()?;
-            vars.push(copy_with_type(&var, field_ty.into()));
+            vars.push(copy_with_type(&var, field_ty));
         }
-        let arguments: Array<Expr> = vars.iter().map(|var| Expr::from(var.clone())).collect();
+        let arguments: Array<Expr> = vars.iter().map(Expr::from).collect();
         let applied = combine.apply(arguments)?;
         let body = self.map_operand(&applied, &mut |this, value| {
             let value: Expr = m.mutate_as(this, value)?;
@@ -623,7 +623,7 @@ impl ComputeLegalizer {
         for field in tuple.fields.iter() {
             fields.push(transform(self, &field)?);
         }
-        Ok(Tuple::new_full(fields, operand.loc.clone())?.into())
+        Ok(Tuple::new_full(fields, &operand.loc)?.into())
     }
 }
 
@@ -689,7 +689,7 @@ impl StorageLegalizer {
         if tensor.same_as(&op.source) && indices.same_as(&op.indices) {
             return Ok(op.into());
         }
-        Ok(TensorLoad::new_full(tensor, indices.iter(), op.loc.clone())?.into())
+        Ok(TensorLoad::new_full(tensor, indices.iter(), &op.loc)?.into())
     }
 
     fn mutate_call(&mut self, op: Call, m: &mut Mutator) -> Result<Any> {
@@ -709,7 +709,7 @@ impl StorageLegalizer {
             return Ok(self.legalize_masked(&op, is_load, m)?.into());
         }
         if let Some(pointer) = op.ty.as_node::<PtrTypeObj>() {
-            let result: Expr = m.default_mutate_as(self, &Expr::from(op.clone()))?;
+            let result: Expr = m.default_mutate_as(self, &Expr::from(&op))?;
             let element = pointer.element_type.as_node::<PrimTypeObj>().map(|ty| ty.dtype);
             let Some(element) = element.filter(|dtype| self.family.matches_dtype(*dtype)) else {
                 return Ok(result.into());
@@ -722,7 +722,7 @@ impl StorageLegalizer {
                 call.args.clone(),
                 call.attrs.clone(),
                 call.ty_args.clone(),
-                call.loc.clone(),
+                &call.loc,
             )?;
             return Ok(rebuilt.into());
         }
@@ -735,8 +735,8 @@ impl StorageLegalizer {
             return m.default_mutate(self, &op);
         }
         let value: Expr = m.mutate_as(self, &source)?;
-        let op_ty = prim_ty(&op.clone().into())?;
-        if prim_dtype(&value)? == op_ty.dtype {
+        let op_ty = op.prim_ty()?;
+        if value.prim_dtype()? == op_ty.dtype {
             return Ok(value.into());
         }
         if self.family.matches_dtype(op_ty.dtype) {
@@ -784,7 +784,7 @@ impl StorageLegalizer {
 
     /// C++ `ChangeToUInt`: a reinterpret to the family's type becomes one to its storage type.
     fn change_to_uint(&self, value: Expr) -> Result<Expr> {
-        let dtype = prim_dtype(&value)?;
+        let dtype = value.prim_dtype()?;
         if !self.family.matches_dtype(dtype) {
             return Ok(value);
         }

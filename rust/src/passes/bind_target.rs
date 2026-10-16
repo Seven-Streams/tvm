@@ -29,7 +29,7 @@ use tvm_ffi::{
 };
 
 use super::util::{dict_without, get_attr, has_nonzero_attr, module_pass, with_attr};
-use crate::ir::{BaseFunc, Call, Expr, GlobalVar, IRModule, RegionStmt, SeqStmt};
+use crate::ir::{BaseFunc, Call, Expr, GlobalVar, GlobalVarObj, IRModule, RegionStmt, SeqStmt};
 use crate::target::Target;
 use crate::tirx::op::{DEVICE_ENTRY, LAUNCH_THREAD};
 use crate::tirx::Function;
@@ -54,13 +54,13 @@ struct Classifier {
 #[dispatch(walk)]
 impl Classifier {
     fn walk_call(&mut self, call: Call) -> WalkResult {
-        if let Ok(callee) = call.op.clone().try_cast::<GlobalVar>() {
+        if call.op.as_node::<GlobalVarObj>().is_some() {
             let callers = if self.under_device_scope {
                 &mut self.device_called
             } else {
                 &mut self.host_called
             };
-            callers.insert(ObjectIdentity::of(&callee));
+            callers.insert(ObjectIdentity::of(&call.op));
         }
         WalkResult::Advance
     }
@@ -101,11 +101,9 @@ struct CallSubstitutor<'a> {
 impl CallSubstitutor<'_> {
     fn mutate_call(&mut self, call: Call, ctx: &mut Mutator) -> Result<Any> {
         let call: Call = ctx.default_mutate(self, &call)?.try_into()?;
-        if !self.under_device_scope {
-            if let Ok(old) = call.op.clone().try_cast::<GlobalVar>() {
-                if let Some(new) = self.replacements.get(&ObjectIdentity::of(&old)) {
-                    return Ok(Any::from(call.with_op(new.clone().into())));
-                }
+        if !self.under_device_scope && call.op.as_node::<GlobalVarObj>().is_some() {
+            if let Some(new) = self.replacements.get(&ObjectIdentity::of(&call.op)) {
+                return Ok(Any::from(call.with_op(Expr::from(new))));
             }
         }
         Ok(Any::from(call))
@@ -188,7 +186,7 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
     let mut walk = WalkWithContextPolicy::new(classifier, DeviceScope);
     for (_gvar, func) in module.functions.iter() {
         if is_externally_exposed(&func)? {
-            if let Ok(function) = func.clone().try_cast::<Function>() {
+            if let Ok(function) = func.try_cast::<Function>() {
                 structural_walk(&function.body, &mut walk, WalkOrder::PreOrder)?;
             }
         }
@@ -203,8 +201,8 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
     let names = UniqueNames::new(state.functions.iter().map(|(gvar, _)| gvar.name_hint.clone()))?;
     let mut replacements: HashMap<ObjectIdentity, GlobalVar> = HashMap::new();
     for (gvar, func) in module.functions.iter() {
-        let Ok(function) = func.clone().try_cast::<Function>() else { continue };
         let exposed = is_externally_exposed(&func)?;
+        let Ok(function) = func.try_cast::<Function>() else { continue };
         if let Some(func_target) = get_attr(&function.attrs, TARGET)? {
             let func_target: Target = func_target.try_into()?;
             if let Some(host) = host_of(target)? {
@@ -248,10 +246,10 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
     // Step 3: point host-side calls in externally exposed functions at the host duplicates.
     if !replacements.is_empty() {
         for (gvar, func) in state.functions.clone() {
-            let Ok(function) = func.clone().try_cast::<Function>() else { continue };
             if !is_externally_exposed(&func)? {
                 continue;
             }
+            let Ok(function) = func.try_cast::<Function>() else { continue };
             let mut substitutor =
                 CallSubstitutor { under_device_scope: false, replacements: &replacements };
             let body: Option<SeqStmt> = match function.body.clone() {

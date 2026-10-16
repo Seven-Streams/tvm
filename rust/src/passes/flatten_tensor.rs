@@ -34,7 +34,7 @@ use tvm_ffi::{
 use super::analyzer::{is_const_int, AnalyzerBase, AnalyzerScope, AnalyzerState};
 use super::flattened_tensor::{as_tensor_var, elem_offset, flattened_tensor, tensor_type};
 use super::stmt_simplify::mark_global_non_neg_value;
-use super::util::{function_pass, int_imm, prim_dtype, MutatorExt};
+use super::util::{function_pass, int_imm, MutatorExt};
 use crate::ir::{Bind, Call, CallObj, Expr, SeqStmt, Stmt, TensorLoad, TensorStore, Var};
 use crate::ops::structural_equal;
 use crate::sym::Analyzer;
@@ -118,7 +118,7 @@ impl TensorFlattener {
         let indices: Array<Expr> = m.mutate_as(self, &op.indices)?;
         let original: Var = op.source.clone().try_cast()?;
         let (flattened, indices) = self.access(&original, &indices)?;
-        Ok(TensorLoad::new_full(flattened, indices.iter(), op.loc.clone())?.into())
+        Ok(TensorLoad::new_full(flattened, indices.iter(), &op.loc)?.into())
     }
 
     fn mutate_call(&mut self, call: Call, m: &mut Mutator) -> Result<Any> {
@@ -131,8 +131,7 @@ impl TensorFlattener {
                 indices.push(m.mutate_as(self, &call.args.get(i)?)?);
             }
             self.tensors_used.insert(ObjectIdentity::of(&original));
-            let flattened = self.lookup(&original)?.flattened.clone();
-            let mut args: Vec<Expr> = vec![flattened.into()];
+            let mut args = vec![Expr::from(&self.lookup(&original)?.flattened)];
             if !is_load {
                 args.push(m.mutate_as(self, &call.args.get(1)?)?);
             }
@@ -144,17 +143,16 @@ impl TensorFlattener {
                 Array::new(args),
                 call.attrs.clone(),
                 call.ty_args.clone(),
-                call.loc.clone(),
+                &call.loc,
             )?;
             return Ok(call.into());
         }
         if TENSOR_DATA_PTR.is(&call.op) && call.args.len() == 1 {
             let arg = call.args.get(0)?;
-            if let Ok(original) = arg.clone().try_cast::<Var>() {
+            if let Ok(original) = arg.try_cast::<Var>() {
                 if tensor_type(&original).is_ok() {
                     self.tensors_used.insert(ObjectIdentity::of(&original));
-                    let flattened = self.lookup(&original)?.flattened.clone();
-                    return Ok(flattened.tensor_data()?.into());
+                    return Ok(self.lookup(&original)?.flattened.tensor_data()?.into());
                 }
             }
         }
@@ -212,7 +210,7 @@ impl TensorFlattener {
             ty.offset_factor,
             layout,
         );
-        let fold_var = Var::new_full(buf.name.clone(), fold_view.clone(), buf.loc.clone())?;
+        let fold_var = Var::new_full(buf.name.clone(), &fold_view, &buf.loc)?;
 
         // The husk: the linearized indices carry layout and elem_offset, so it keeps neither.
         let (_, flat_ty) = flattened_tensor(&fold_var, &fold_view)?;
@@ -222,7 +220,7 @@ impl TensorFlattener {
         }
         let elem_offset = match is_const_int(&flat_ty.elem_offset, 0) {
             true => flat_ty.elem_offset.clone(),
-            false => int_imm(prim_dtype(&flat_ty.elem_offset)?, 0)?.into(),
+            false => int_imm(flat_ty.elem_offset.prim_dtype()?, 0)?.into(),
         };
         let husk = TensorType::from_complete_fields(
             flat_ty.loc.clone(),
@@ -239,7 +237,7 @@ impl TensorFlattener {
         // always rebuilds, as the epilogue aliases the husk onto the argument.
         let flattened = match !self.extern_tensors.contains(&key) && structural_equal(&husk, &ty)? {
             true => buf.clone(),
-            false => Var::new_full(buf.name.clone(), husk, buf.loc.clone())?,
+            false => Var::new_full(buf.name.clone(), husk, &buf.loc)?,
         };
         self.remap.insert(key.clone(), flattened.clone());
         self.flat.insert(key, FlatInfo { fold_view, flattened });
@@ -345,9 +343,9 @@ impl TensorFlattener {
             Array::new(args),
             call.attrs.clone(),
             Array::new(vec![ty]),
-            call.loc.clone(),
+            &call.loc,
         )?;
-        Ok(Bind::new_full(flattened, value, op.loc.clone())?.into())
+        Ok(Bind::new_full(flattened, value, &op.loc)?.into())
     }
 }
 
@@ -364,7 +362,7 @@ fn flatten(func: Function) -> Result<Function> {
         }
     }
     for param in func.params.iter() {
-        if as_tensor_var(&param.clone().into()).is_some() {
+        if as_tensor_var(&param).is_some() {
             pass.extern_tensors.insert(ObjectIdentity::of(&param));
             pass.define(&mut Site::Params, &param)?;
         }
@@ -375,8 +373,7 @@ fn flatten(func: Function) -> Result<Function> {
     // Tensor parameters stay unflattened for argument validation; the body's husks alias them.
     let params: Vec<Var> = func.params.iter().collect();
     for param in params.iter().rev() {
-        if as_tensor_var(&param.clone().into()).is_none()
-            || !pass.tensors_used.contains(&ObjectIdentity::of(param))
+        if as_tensor_var(param).is_none() || !pass.tensors_used.contains(&ObjectIdentity::of(param))
         {
             continue;
         }

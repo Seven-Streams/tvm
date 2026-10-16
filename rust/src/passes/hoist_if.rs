@@ -94,8 +94,7 @@ impl IfHoister {
         for (condition, preserve_else) in
             std::mem::take(&mut self.loops[index].conditions).into_iter().rev()
         {
-            let else_case =
-                if preserve_else { Some(SeqStmt::from_stmt(stmt.clone())?) } else { None };
+            let else_case = if preserve_else { Some(SeqStmt::from_stmt(&stmt)?) } else { None };
             stmt = If::new(condition, stmt, else_case)?.into();
         }
         Ok(stmt.into())

@@ -65,11 +65,9 @@ impl NoOpRemover {
         let else_is_no_op = op.else_case.as_ref().is_none_or(is_no_op);
         let rewritten = match (then_is_no_op, else_is_no_op, &op.else_case) {
             (true, true, _) => Some(evaluate(&op.condition)?),
-            (false, true, Some(_)) => {
-                Some(If::new(&op.condition, op.then_case.clone(), None)?.into())
-            }
+            (false, true, Some(_)) => Some(If::new(&op.condition, &op.then_case, None)?.into()),
             (true, false, Some(else_case)) => {
-                Some(If::new(!&op.condition, else_case.clone(), None)?.into())
+                Some(If::new(!&op.condition, else_case, None)?.into())
             }
             _ => None,
         };
@@ -144,7 +142,7 @@ impl NoOpRemover {
 
     fn stores_existing_value(&self, store: &TensorStore) -> Result<bool> {
         let dest: Var = store.dest.clone().try_cast()?;
-        let load = TensorLoad::new(dest.clone(), store.indices.iter())?;
+        let load = TensorLoad::new(&dest, store.indices.iter())?;
         let unchanged = (&store.value - load).equal(0).expr()?;
         if is_const_int(&self.base.analyzer.simplify(&unchanged, 2)?, 1) {
             return Ok(true);

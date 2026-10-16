@@ -34,7 +34,7 @@ use super::util::{MutatorExt, function_pass, get_attr, has_nonzero_attr, prim_ty
 use crate::ir::{
     Bind, BindObj, Call, CallObj, DictAttrs, Evaluate, Expr, For, ForObj, If, IfObj, IntImmObj, Op,
     PrimType, PrimTypeObj, PtrType, PtrTypeObj, RegionStmt, RegionStmtObj, SeqStmt, Stmt,
-    StringImm, StringImmObj, TensorLoad, TensorStore, Var,
+    StringImm, StringImmObj, TensorLoad, TensorStore, Type, Var,
 };
 use crate::ops::{int32, int_imm, repr, unknown_loc, Ex, PrimOps};
 use crate::prim::Cast;
@@ -288,7 +288,8 @@ impl BuiltinLower {
     }
 
     /// `AppendPendingFrees(body)`: the frees of the current scope after `body`, newest first.
-    fn append_pending_frees(&mut self, body: Stmt) -> Result<Stmt> {
+    fn append_pending_frees(&mut self, body: impl Into<Stmt>) -> Result<Stmt> {
+        let body = body.into();
         let frees = std::mem::take(self.pending_frees.last_mut().expect("a scope is active"));
         if frees.is_empty() {
             return Ok(body);
@@ -361,7 +362,7 @@ impl BuiltinLower {
                 vec![StringImm::new("shape")?.into(), int32(scope.max.shape)?.into()],
             )?;
             let decl = Call::new_full(
-                Some(tensor.clone().into()),
+                Some(Type::from(&tensor)),
                 DECL_TENSOR.get()?.into(),
                 Array::new(vec![data.into()]),
                 None,
@@ -383,7 +384,7 @@ impl BuiltinLower {
     /// `Bind(var, stack_alloca(kind, size))`.
     fn stack_alloca(&self, var: &Var, kind: &str, size: u64) -> Result<Stmt> {
         let args = vec![StringImm::new(kind)?.into(), int32(size as i64)?.into()];
-        let call = Call::new(var.ty.clone(), STACK_ALLOCA.get()?, args)?;
+        let call = Call::new(&var.ty, STACK_ALLOCA.get()?, args)?;
         Ok(Bind::new(var.clone(), call)?.into())
     }
 
@@ -399,7 +400,8 @@ impl BuiltinLower {
     }
 
     /// `VisitBodyAndRealizeAlloca` for a parallel loop body, reached during the rewrite.
-    fn realize_loop_body(&mut self, stmt: Stmt, m: &mut Mutator) -> Result<Stmt> {
+    fn realize_loop_body(&mut self, stmt: impl Into<Stmt>, m: &mut Mutator) -> Result<Stmt> {
+        let stmt = stmt.into();
         if self.is_precheck {
             return Ok(stmt);
         }
@@ -413,7 +415,8 @@ impl BuiltinLower {
     }
 
     /// `Mutate(stmt)` in a fresh free scope, with the scope's frees after it.
-    fn visit_scoped(&mut self, stmt: Stmt, m: &mut Mutator) -> Result<Stmt> {
+    fn visit_scoped(&mut self, stmt: impl Into<Stmt>, m: &mut Mutator) -> Result<Stmt> {
+        let stmt = stmt.into();
         self.with_new_scope(|this| {
             let visited: Stmt = m.mutate_as(this, &stmt)?;
             this.append_pending_frees(visited)
@@ -493,20 +496,20 @@ impl BuiltinLower {
         let (device_type, device_id) = self.require_device()?;
         let int32_ty = ty(INT, 32)?;
         let throw_last_error: Stmt =
-            Evaluate::new(Call::new(int32_ty.clone(), THROW_LAST_ERROR.get()?, vec![])?)?.into();
+            Evaluate::new(Call::new(&int32_ty, THROW_LAST_ERROR.get()?, vec![])?)?.into();
         let data: Expr = Call::new(
             var_type.data_ptr_type()?,
             TENSOR_DATA_PTR.get()?,
-            vec![bind.var.clone().into()],
+            vec![Expr::from(&bind.var)],
         )?
         .into();
         let is_null = Call::new(ty(BOOL, 8)?, ISNULLPTR.get()?, vec![data.clone()])?;
-        let alloc_nullptr_check: Stmt = If::new(is_null, throw_last_error.clone(), None)?.into();
+        let alloc_nullptr_check: Stmt = If::new(is_null, &throw_last_error, None)?.into();
 
-        let device_type = device_type.cast(int32_ty.clone()).expr()?;
-        let device_id = device_id.cast(int32_ty.clone()).expr()?;
+        let device_type = device_type.cast(&int32_ty).expr()?;
+        let device_id = device_id.cast(&int32_ty).expr()?;
         let free = Call::new(
-            int32_ty.clone(),
+            &int32_ty,
             FREE_WORKSPACE.get()?,
             vec![device_type.clone(), device_id.clone(), data],
         )?;
@@ -526,14 +529,14 @@ impl BuiltinLower {
             ],
         )?;
         let decl = Call::new_full(
-            Some(var_type.clone().into()),
+            Some(Type::from(&var_type)),
             DECL_TENSOR.get()?.into(),
             Array::new(vec![alloc.into()]),
             None,
             Array::new(vec![var_type.into()]),
-            tensor_call.loc.clone(),
+            &tensor_call.loc,
         )?;
-        let alloc_bind: Stmt = Bind::new_full(bind.var.clone(), decl, bind.loc.clone())?.into();
+        let alloc_bind: Stmt = Bind::new_full(bind.var.clone(), decl, &bind.loc)?.into();
         Ok(SeqStmt::new(vec![alloc_bind, alloc_nullptr_check])?.into())
     }
 
@@ -545,7 +548,7 @@ impl BuiltinLower {
         let (device_type, device_id) = self.require_device()?;
         let int32_ty = ty(INT, 32)?;
         let throw_last_error: Stmt =
-            Evaluate::new(Call::new(int32_ty.clone(), THROW_LAST_ERROR.get()?, vec![])?)?.into();
+            Evaluate::new(Call::new(&int32_ty, THROW_LAST_ERROR.get()?, vec![])?)?.into();
         let element = op
             .var
             .ty
@@ -561,9 +564,9 @@ impl BuiltinLower {
             int32(element.bits as i64)?.into(),
         ];
         args.extend(call.args.iter());
-        let call_packed = Call::new(op.var.ty.clone(), CALL_PACKED.get()?, args)?;
-        let is_null = Call::new(ty(BOOL, 8)?, ISNULLPTR.get()?, vec![op.var.clone().into()])?;
-        let null_check: Stmt = If::new(is_null, throw_last_error.clone(), None)?.into();
+        let call_packed = Call::new(&op.var.ty, CALL_PACKED.get()?, args)?;
+        let is_null = Call::new(ty(BOOL, 8)?, ISNULLPTR.get()?, vec![Expr::from(&op.var)])?;
+        let null_check: Stmt = If::new(is_null, &throw_last_error, None)?.into();
 
         let free = Call::new(
             int32_ty,
@@ -573,7 +576,7 @@ impl BuiltinLower {
                 device_type,
                 device_id,
                 call.args.get(0)?,
-                op.var.clone().into(),
+                Expr::from(&op.var),
             ],
         )?;
         let failed = Ex::from(free).not_equal(int32(0)?).expr()?;
@@ -613,7 +616,7 @@ impl BuiltinLower {
             let device_id: Expr = m.mutate_as(self, &op.args.get(1)?)?;
             let saved_type = self.device_type.replace(device_type);
             let saved_id = self.device_id.replace(device_id);
-            let body = self.visit_scoped(op.body.clone().into(), m);
+            let body = self.visit_scoped(&op.body, m);
             self.device_type = saved_type;
             self.device_id = saved_id;
             return body;
@@ -623,7 +626,7 @@ impl BuiltinLower {
             if this.pending_frees.last().is_some_and(|frees| frees.is_empty()) {
                 return Ok(region.into());
             }
-            let body = this.append_pending_frees(region.body.clone().into())?;
+            let body = this.append_pending_frees(&region.body)?;
             Ok(region.with_body(SeqStmt::from_stmt(body)?).into())
         })
     }
@@ -632,9 +635,9 @@ impl BuiltinLower {
         let min: Expr = m.mutate_as(self, &op.min)?;
         let extent: Expr = m.mutate_as(self, &op.extent)?;
         let body: Stmt = if op.kind == FOR_PARALLEL {
-            self.realize_loop_body(op.body.clone().into(), m)?
+            self.realize_loop_body(&op.body, m)?
         } else {
-            self.visit_scoped(op.body.clone().into(), m)?
+            self.visit_scoped(&op.body, m)?
         };
         if min.same_as(&op.min) && extent.same_as(&op.extent) && body.same_as(&op.body) {
             return Ok(op.into());
@@ -652,11 +655,9 @@ impl BuiltinLower {
     /// Each arm frees what it allocates.
     fn lower_if(&mut self, op: If, m: &mut Mutator) -> Result<Stmt> {
         let condition: Expr = m.mutate_as(self, &op.condition)?;
-        let then_case = self.visit_scoped(op.then_case.clone().into(), m)?;
+        let then_case = self.visit_scoped(&op.then_case, m)?;
         let else_case = match &op.else_case {
-            Some(else_case) => {
-                Some(SeqStmt::from_stmt(self.visit_scoped(else_case.clone().into(), m)?)?)
-            }
+            Some(else_case) => Some(SeqStmt::from_stmt(self.visit_scoped(else_case, m)?)?),
             None => None,
         };
         if condition.same_as(&op.condition)
@@ -665,7 +666,7 @@ impl BuiltinLower {
         {
             return Ok(op.into());
         }
-        Ok(If::new_full(condition, then_case, else_case, op.loc.clone())?.into())
+        Ok(If::new_full(condition, then_case, else_case, &op.loc)?.into())
     }
 
     // -----------------------------------------------------------------------------------------
@@ -721,7 +722,7 @@ impl BuiltinLower {
         if attr.force_cu_dtype != -1 {
             args.push(int32_imm(attr.force_cu_dtype)?);
         }
-        Call::new(call.ty.clone(), CALL_PACKED.get()?, args)
+        Call::new(&call.ty, CALL_PACKED.get()?, args)
     }
 
     /// `MakeShape`: the extents stored on the shape stack, passed as the address of the first.
@@ -742,11 +743,11 @@ impl BuiltinLower {
         let int64 = ty(INT, 64)?;
         for (i, arg) in call.args.iter().enumerate() {
             let index: Expr = int32(begin + i as i64)?.into();
-            let value = arg.cast(int64.clone()).expr()?;
-            let store = TensorStore::new(stack_shape.clone(), [index], value)?;
+            let value = arg.cast(&int64).expr()?;
+            let store = TensorStore::new(&stack_shape, [index], value)?;
             self.prep().push(store.into());
         }
-        let load = TensorLoad::new(stack_shape.clone(), vec![int32(begin)?.into()])?;
+        let load = TensorLoad::new(&stack_shape, vec![int32(begin)?.into()])?;
         let tensor = tensor_type_of(&stack_shape)?;
         Ok(Call::new(tensor.data_ptr_type()?, ADDRESS_OF.get()?, vec![load.into()])?.into())
     }
@@ -754,7 +755,7 @@ impl BuiltinLower {
     /// `abi_field_set(stack, index, field, value)` as a statement.
     fn set_field(&self, stack: &Var, index: i64, field: i32, value: Expr) -> Result<Stmt> {
         let args =
-            vec![stack.clone().into(), int32(index)?.into(), int32(field as i64)?.into(), value];
+            vec![Expr::from(stack), int32(index)?.into(), int32(field as i64)?.into(), value];
         let call = Call::new(ty(INT, 32)?, ABI_FIELD_SET.get()?, args)?;
         Ok(Evaluate::new(call)?.into())
     }
@@ -936,7 +937,7 @@ impl BuiltinLower {
             int32(arg_begin as i64)?.into(),
             int32((arg_begin + num_args) as i64)?.into(),
         ];
-        Ok(Call::new(call.ty.clone(), lowered, args)?.into())
+        Ok(Call::new(&call.ty, lowered, args)?.into())
     }
 }
 
