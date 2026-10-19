@@ -27,7 +27,7 @@
 //! `tirx.device_scope`. The statements the dispatchers ask for through their callbacks land at
 //! the kernel's replace point, after the tensor they follow, or on the host.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     bail, dispatch, structural_mutate, structural_walk, Any, AnyCompatible, AnyView, Array,
@@ -383,15 +383,15 @@ impl TileDispatcher {
             variable_cluster: false,
             cluster_bounds: Vec::new(),
             var_ranges: Vec::new(),
-            var_index: HashMap::new(),
+            var_index: HashMap::default(),
             analyzer: Analyzer::new()?,
             analysis: None,
             launch_params: Vec::new(),
             alloc_tensors: Vec::new(),
             device_init_stmts: Vec::new(),
             host_init_stmts: Vec::new(),
-            tensor_root: HashMap::new(),
-            post_tensor_def_stmts: HashMap::new(),
+            tensor_root: HashMap::default(),
+            post_tensor_def_stmts: HashMap::default(),
             shared_state: Map::new(),
             is_first_block: true,
         })

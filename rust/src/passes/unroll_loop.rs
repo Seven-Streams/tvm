@@ -20,7 +20,7 @@
 //! `tirx.UnrollLoop` (`src/tirx/transform/unroll_loop.cc`): unroll loops marked for unrolling and
 //! the small constant loops the `tirx.UnrollLoop` config selects, then restore SSA form.
 
-use std::collections::HashSet;
+use crate::fast_hash::HashSet;
 
 use tvm_ffi::{
     dispatch, structural_map, structural_mutate, structural_visit, Any, Array, DefRegionKind, Map,
@@ -305,7 +305,7 @@ pub fn unroll_loop() -> Result<Pass> {
             auto_max_depth,
             auto_max_extent,
             unroll_local_access,
-            indexes_local: HashSet::new(),
+            indexes_local: HashSet::default(),
             analyzer: Analyzer::new()?,
             local: MemoryScope::get("local")?,
             warp: MemoryScope::get("warp")?,

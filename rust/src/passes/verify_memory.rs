@@ -20,7 +20,7 @@
 //! `tirx.VerifyMemory` (`src/tirx/analysis/verify_memory.cc`): on a GPU target, reject a function
 //! that accesses a tensor from its arguments outside any thread environment.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     dispatch, structural_walk, ContextPolicy, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
@@ -178,8 +178,12 @@ fn verify(func: &Function) -> Result<Vec<std::string::String>> {
     if !GPU_DEVICES.contains(&target.device_type()?) {
         return Ok(vec![]);
     }
-    let verifier =
-        MemoryAccessVerifier { func, in_thread_env: false, errors: vec![], defs: HashMap::new() };
+    let verifier = MemoryAccessVerifier {
+        func,
+        in_thread_env: false,
+        errors: vec![],
+        defs: HashMap::default(),
+    };
     let mut walk = WalkWithContextPolicy::new(verifier, ThreadScope);
     structural_walk(&func.body, &mut walk, WalkOrder::PreOrder)?;
     Ok(walk.into_state().errors)

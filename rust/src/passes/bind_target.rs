@@ -20,7 +20,7 @@
 //! `tirx.BindTarget` (`src/tirx/transform/bind_target.cc`): bind a host or device target to every
 //! function according to where it is called from, duplicating functions called from both.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{HashMap, HashSet};
 
 use tvm_ffi::{
     dispatch, structural_mutate, structural_walk, Any, Array, ContextPolicy, Map, Mutator,
@@ -180,8 +180,8 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
     // Step 1: who calls whom, from the bodies of the externally exposed functions.
     let classifier = Classifier {
         under_device_scope: false,
-        host_called: HashSet::new(),
-        device_called: HashSet::new(),
+        host_called: HashSet::default(),
+        device_called: HashSet::default(),
     };
     let mut walk = WalkWithContextPolicy::new(classifier, DeviceScope);
     for (_gvar, func) in module.functions.iter() {
@@ -199,7 +199,7 @@ fn bind(module: IRModule, target: &Target) -> Result<IRModule> {
         global_var_map: module.global_var_map.iter().collect(),
     };
     let names = UniqueNames::new(state.functions.iter().map(|(gvar, _)| gvar.name_hint.clone()))?;
-    let mut replacements: HashMap<ObjectIdentity, GlobalVar> = HashMap::new();
+    let mut replacements: HashMap<ObjectIdentity, GlobalVar> = HashMap::default();
     for (gvar, func) in module.functions.iter() {
         let exposed = is_externally_exposed(&func)?;
         let Ok(function) = func.try_cast::<Function>() else { continue };

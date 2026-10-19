@@ -21,7 +21,7 @@
 //! the facts of its enclosing loops, bindings, and branches, and drop branches and self-stores
 //! the analyzer proves dead.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     dispatch, Mutator, structural_map, Any, Array, DefRegionKind, ObjectIdentity, ObjectRefCast,
@@ -289,7 +289,7 @@ pub fn stmt_simplify() -> Result<Pass> {
     function_pass("tirx.StmtSimplify", 0, |func, _module, _context| {
         let mut simplifier = StmtSimplifier {
             base: AnalyzerBase::new(Analyzer::new()?)?,
-            non_inlined_bindings: HashMap::new(),
+            non_inlined_bindings: HashMap::default(),
         };
         simplifier.mark_tensor_param_shapes(&func)?;
         let Some(body) = func.body.clone() else { return Ok(Some(func)) };

@@ -21,7 +21,7 @@
 //! TIRx lowering. Every tensor is flattened to its storage, an access through a layout becomes
 //! the layout's element offset, and every `tensor_data_ptr` projects the storage root.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     dispatch, structural_mutate, Any, Array, Map, Mutator, ObjectIdentity, ObjectRefCast,
@@ -156,8 +156,8 @@ impl LayoutApplier {
     fn new(analyzer: Analyzer) -> Result<Self> {
         Ok(Self {
             base: AnalyzerBase::new(analyzer)?,
-            remap: HashMap::new(),
-            tensor_aliases: HashMap::new(),
+            remap: HashMap::default(),
+            tensor_aliases: HashMap::default(),
         })
     }
 

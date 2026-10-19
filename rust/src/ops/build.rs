@@ -20,7 +20,7 @@
 //! Constructors shaped like the C++ ones, and the constants they build on (see the module doc).
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fmt::Display;
 use std::sync::OnceLock;
@@ -105,7 +105,7 @@ pub(crate) fn scalar_dtype(code: DLDataTypeCode, bits: u8) -> DLDataType {
 /// comes from the native cache, fetched once per thread and dtype.
 pub fn prim_type(dtype: DLDataType) -> Result<PrimType> {
     thread_local! {
-        static PRIM_TYPES: RefCell<HashMap<(u8, u8, u16), PrimType>> = RefCell::new(HashMap::new());
+        static PRIM_TYPES: RefCell<HashMap<(u8, u8, u16), PrimType>> = RefCell::new(HashMap::default());
     }
     let key = (dtype.code, dtype.bits, dtype.lanes);
     if let Some(ty) = PRIM_TYPES.with(|types| types.borrow().get(&key).cloned()) {
@@ -158,9 +158,19 @@ pub(crate) fn int_imm_at(dtype: DLDataType, value: BigInt, loc: &Location) -> Re
 }
 
 /// The checks of C++ `IntImm(ty, value)`: a scalar integer type whose range holds `value`.
+/// Formats a dtype only when an error message is actually built.
+struct LazyName(DLDataType);
+
+impl std::fmt::Display for LazyName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.to_string())
+    }
+}
+
 fn check_int_imm(dtype: DLDataType, value: &BigInt) -> Result<()> {
-    let name = dtype.to_string();
-    let name = name.as_str();
+    // The dtype name is only needed for an error message; formatting it eagerly cost about
+    // 700 instructions on every IntImm construction.
+    let name = LazyName(dtype);
     if !is_scalar_type(dtype) {
         let condition = "!value_ty.IsScalableVector() && !value_ty.IsFixedLengthVector()";
         let message = format!("IntImm can only take scalar, but {name} was supplied.");
@@ -185,19 +195,21 @@ fn check_int_imm(dtype: DLDataType, value: &BigInt) -> Result<()> {
                 format!("Literal value {value} is negative for unsigned integer type {name}");
             return Err(compare_failed(VALUE_ERROR, "value >= 0", value, 0, &message));
         }
-        let message = format!("Literal value {value} exceeds maximum of {name}");
+        // Build the message only on the failing path: formatting the BigInt and the dtype
+        // eagerly cost about 700 instructions on every IntImm construction.
+        let message = || format!("Literal value {value} exceeds maximum of {name}");
         if bits <= 64 {
             let fits = value.to_u64().is_some_and(|small| bits == 64 || small < 1u64 << bits);
             if !fits {
                 let condition =
                     "small.has_value() && (bits == 64 || *small < (uint64_t{1} << bits))";
-                return Err(check_failed(VALUE_ERROR, condition, &message));
+                return Err(check_failed(VALUE_ERROR, condition, &message()));
             }
         } else {
             let limit = BigInt::from(1i64).try_shl(bits as i64)?;
             if *value >= limit {
                 let condition = "value < ffi::BigInt(1) << bits";
-                return Err(compare_failed(VALUE_ERROR, condition, value, &limit, &message));
+                return Err(compare_failed(VALUE_ERROR, condition, value, &limit, &message()));
             }
         }
     } else if bits == 1 || dtype.code == BOOL {
@@ -206,7 +218,7 @@ fn check_int_imm(dtype: DLDataType, value: &BigInt) -> Result<()> {
             return Err(check_failed(VALUE_ERROR, "value == 0 || value == 1", &message));
         }
     } else {
-        let message = format!("Literal value {value} exceeds range of {name}");
+        let message = || format!("Literal value {value} exceeds range of {name}");
         if bits <= 64 {
             let half = 1i128 << (bits - 1);
             let fits = value.to_i64().is_some_and(|small| {
@@ -215,7 +227,7 @@ fn check_int_imm(dtype: DLDataType, value: &BigInt) -> Result<()> {
             if !fits {
                 let condition = "small.has_value() && (bits == 64 || (*small >= -(int64_t{1} << \
                                  (bits - 1)) && *small < (int64_t{1} << (bits - 1))))";
-                return Err(check_failed(VALUE_ERROR, condition, &message));
+                return Err(check_failed(VALUE_ERROR, condition, &message()));
             }
         } else {
             let limit = BigInt::from(1i64).try_shl(bits as i64 - 1)?;
@@ -223,7 +235,7 @@ fn check_int_imm(dtype: DLDataType, value: &BigInt) -> Result<()> {
                 return Err(check_failed(
                     VALUE_ERROR,
                     "value >= -limit && value < limit",
-                    &message,
+                    &message(),
                 ));
             }
         }
@@ -1714,7 +1726,7 @@ impl RegionStmt {
                 return Err(check_failed(VALUE_ERROR, condition, &message));
             }
         }
-        let mut definitions = HashSet::new();
+        let mut definitions: HashSet<_> = HashSet::default();
         if !body_params
             .iter()
             .chain(result_vars.iter())
@@ -1753,7 +1765,7 @@ fn region_body_params(op: &Op, args: &Array<Expr>, attrs: &DictAttrs) -> Result<
     );
     validate_call(op, &signature)?;
     let params: Array<Var> = get_body_params.call(&signature)?;
-    let mut definitions = HashSet::new();
+    let mut definitions: HashSet<_> = HashSet::default();
     for param in &params {
         if param.ty.as_node::<MissingTypeObj>().is_some() {
             let message = format!("FRegionGetBodyParams for {name} must return typed variables");

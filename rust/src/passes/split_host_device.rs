@@ -21,7 +21,7 @@
 //! each host function with the device target, move every marked region into a kernel function
 //! of its own, and lower the calls to kernels into launches (`call_ffi_kernel`) or external calls.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{HashMap, HashSet};
 
 use tvm_ffi::{
     bail, dispatch, structural_map, structural_mutate, structural_walk, Any, Array, ContextPolicy,
@@ -266,7 +266,7 @@ impl HostDeviceSplitter<'_> {
             };
             params.sort_by_key(key);
         } else {
-            let mut order = HashMap::new();
+            let mut order: HashMap<_, _> = HashMap::default();
             for (index, param) in self.cur_func.params.iter().enumerate() {
                 if param.ty.as_node::<TensorTypeObj>().is_none() {
                     bail!(TYPE_ERROR, "Function parameter is not a tirx.TensorVar");
@@ -297,8 +297,8 @@ impl HostDeviceSplitter<'_> {
         // declares a tensor of its own over it.
         let mut kernel_params = Vec::new();
         let mut call_args: Vec<Expr> = Vec::new();
-        let mut data_params: HashMap<ObjectIdentity, Var> = HashMap::new();
-        let mut rewriter = KernelBodyRewriter { tensors: HashMap::new() };
+        let mut data_params: HashMap<ObjectIdentity, Var> = HashMap::default();
+        let mut rewriter = KernelBodyRewriter { tensors: HashMap::default() };
         for param in &params {
             match param.ty.as_node::<TensorTypeObj>() {
                 Some(ty) => {
@@ -612,7 +612,7 @@ fn collect_kernel_info(
         inferred_shmem_size: None,
         use_pdl: false,
         use_cooperative_launch: false,
-        bind_map: HashMap::new(),
+        bind_map: HashMap::default(),
     };
     if let Some(requested) = typed_attr::<Array<String>>(&func.attrs, KERNEL_LAUNCH_PARAMS)? {
         for tag in requested.iter() {
@@ -875,7 +875,7 @@ impl DeviceKernelMutator {
             info.params.len(),
             args.len()
         );
-        let mut param_map = HashMap::new();
+        let mut param_map = HashMap::default();
         for (param, arg) in info.params.iter().zip(&args) {
             if is_prim_expr(arg) {
                 param_map.insert(ObjectIdentity::of(&param), arg.clone());
@@ -1012,13 +1012,13 @@ impl ModuleFunctions {
 
 /// `LowerDeviceKernelLaunches(mod)`.
 fn lower_device_kernel_launches(module: IRModule) -> Result<IRModule> {
-    let mut collector = CalledFunctions { called: HashSet::new() };
+    let mut collector = CalledFunctions { called: HashSet::default() };
     for (_gvar, base_func) in module.functions.iter() {
         if let Ok(func) = base_func.try_cast::<Function>() {
             structural_walk(&func.body, &mut collector, WalkOrder::PreOrder)?;
         }
     }
-    let mut device_info = HashMap::new();
+    let mut device_info = HashMap::default();
     for (gvar, base_func) in module.functions.iter() {
         if !collector.called.contains(&ObjectIdentity::of(&gvar)) {
             continue;
@@ -1032,8 +1032,8 @@ fn lower_device_kernel_launches(module: IRModule) -> Result<IRModule> {
         current_target: None,
         caller_host_target: None,
         device_info,
-        kernel_launches: HashSet::new(),
-        extern_calls: HashSet::new(),
+        kernel_launches: HashSet::default(),
+        extern_calls: HashSet::default(),
     };
 
     let mut table = ModuleFunctions::of(&module);

@@ -24,7 +24,7 @@
 //! the pass derives, once, the fold view (the original geometry with its expressions rewritten,
 //! the source of `f`) and the flattened storage husk `buf'`. Every use looks the pair up.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{HashMap, HashSet};
 
 use tvm_ffi::{
     dispatch, structural_mutate, Any, Array, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore,
@@ -164,10 +164,10 @@ impl TensorFlattener {
     fn new(analyzer: Analyzer) -> Result<Self> {
         Ok(Self {
             base: AnalyzerBase::new(analyzer)?,
-            flat: HashMap::new(),
-            remap: HashMap::new(),
-            extern_tensors: HashSet::new(),
-            tensors_used: HashSet::new(),
+            flat: HashMap::default(),
+            remap: HashMap::default(),
+            extern_tensors: HashSet::default(),
+            tensors_used: HashSet::default(),
         })
     }
 

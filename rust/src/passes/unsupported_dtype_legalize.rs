@@ -22,7 +22,7 @@
 //! without native bfloat16 / float8 support, compute in a wider float type, then store the
 //! remaining narrow values as unsigned integers of the same width.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{HashMap, HashSet};
 
 use tvm_ffi::{
     dispatch, structural_mutate, structural_walk, Any, Array, DLDataType, DLDataTypeCode,
@@ -223,7 +223,8 @@ impl Planner {
 
 /// `ComputeLegalizePlanner::Plan(func)`: an opaque access anywhere vetoes a candidate.
 fn plan(family: Family, body: &SeqStmt) -> Result<HashSet<ObjectIdentity>> {
-    let mut planner = Planner { family, candidates: HashSet::new(), opaque: HashSet::new() };
+    let mut planner =
+        Planner { family, candidates: HashSet::default(), opaque: HashSet::default() };
     structural_walk(body, &mut planner, WalkOrder::PreOrder)?;
     let Planner { mut candidates, opaque, .. } = planner;
     candidates.retain(|var| !opaque.contains(var));
@@ -461,7 +462,7 @@ impl ComputeLegalizer {
             promote,
             promoted_tensors: plan(family, &body)?,
             allocation_to_promote: None,
-            remap: HashMap::new(),
+            remap: HashMap::default(),
         };
         let body: Stmt = structural_mutate(body, &mut legalizer)?.try_into()?;
         Ok(func.with_body(Some(SeqStmt::from_stmt(body)?)))
@@ -759,7 +760,7 @@ impl StorageLegalizer {
             "!param->ty.as<TensorTypeNode>()",
             "This pass must be called after MakePackedAPI"
         );
-        let mut legalizer = StorageLegalizer { family, remap: HashMap::new() };
+        let mut legalizer = StorageLegalizer { family, remap: HashMap::default() };
         let mut params = Vec::with_capacity(func.params.len());
         for param in func.params.iter() {
             params.push(legalizer.remap_var_def(&param)?);

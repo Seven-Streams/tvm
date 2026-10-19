@@ -34,7 +34,7 @@
 //! `VarRemapSet` entries are kept in [`DataTypeRewriterBase::remap`]; the engine keeps the rest,
 //! the variables whose type it rewrote at their definition.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     bail, match_any, Any, AnyView, Array, MutContextPolicy, MutateContext, MutateValue,
@@ -80,7 +80,7 @@ impl DataTypeRewriterBase {
             is_enabled: false,
             is_condition: false,
             clamp_shift_amounts: false,
-            remap: HashMap::new(),
+            remap: HashMap::default(),
         }
     }
 

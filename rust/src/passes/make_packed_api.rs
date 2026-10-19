@@ -22,7 +22,7 @@
 //! arguments are decoded and checked by [`super::tvm_ffi_binder`], a `return` writes the packed
 //! result, and calls between such functions become `call_cpacked`.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 use tvm_ffi::{
@@ -318,7 +318,7 @@ fn make_packed_function(func: Function) -> Result<Function> {
 
 pub fn make_packed_api() -> Result<Pass> {
     module_pass("tirx.MakePackedAPI", 0, |module, _context| {
-        let mut methods = HashMap::new();
+        let mut methods = HashMap::default();
         for (gvar, base_func) in module.functions.iter() {
             if let Ok(func) = base_func.try_cast::<Function>() {
                 if let Some(symbol) = requires_packed_api(&func)? {

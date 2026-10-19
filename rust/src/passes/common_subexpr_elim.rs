@@ -25,7 +25,7 @@
 //! in the order C++ `StmtExprVisitor` does, not in reflected field order: the order expressions
 //! are first seen numbers the variables.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{HashMap, HashSet};
 
 use tvm_ffi::{
     dispatch, structural_map, structural_mutate, structural_walk, Any, Array, DefRegionKind,
@@ -77,7 +77,7 @@ struct ExprTable<T> {
 
 impl<T> ExprTable<T> {
     fn new() -> Self {
-        Self { entries: Vec::new(), buckets: HashMap::new() }
+        Self { entries: Vec::new(), buckets: HashMap::default() }
     }
 
     /// The hash of `key` and the index of its entry, if any.
@@ -372,7 +372,7 @@ impl Planner {
             }
         }
 
-        let mut plan = Plan { insert_before: HashMap::new(), remap: ExprTable::new() };
+        let mut plan = Plan { insert_before: HashMap::default(), remap: ExprTable::new() };
         let mut counter = 0;
         for (position, &index) in order.iter().enumerate() {
             let entry = &self.table.entries[index].1;
@@ -663,7 +663,7 @@ impl Rewriter {
         if self.materialized.insert(key) {
             stmts.extend(binds.iter().map(Stmt::from));
         } else {
-            let mut fresh_vars: HashMap<ObjectIdentity, Var> = HashMap::new();
+            let mut fresh_vars: HashMap<ObjectIdentity, Var> = HashMap::default();
             for bind in binds {
                 let value: Expr = rename(&bind.value, &fresh_vars)?;
                 let ty = bind.var.ty.as_node::<PrimTypeObj>().expect("a binding of a PrimExpr");
@@ -743,7 +743,7 @@ pub fn common_subexpr_elim() -> Result<Pass> {
         if plan.insert_before.is_empty() {
             return Ok(Some(func));
         }
-        let mut rewriter = Rewriter { plan, materialized: HashSet::new(), opaque: false };
+        let mut rewriter = Rewriter { plan, materialized: HashSet::default(), opaque: false };
         let body: Stmt = structural_mutate(body, &mut rewriter)?.try_into()?;
         Ok(Some(func.with_body(Some(SeqStmt::from_stmt(body)?))))
     })

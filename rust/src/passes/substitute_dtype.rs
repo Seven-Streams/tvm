@@ -25,7 +25,7 @@
 //! Only the expression handlers of `DataTypeLegalizer` are here; the statement ones (`For`,
 //! `RegionStmt`, `Bind`) never apply to an expression.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     bail, dispatch, structural_mutate, structural_walk, Any, AnyCompatible, AnyView, Array,
@@ -49,9 +49,9 @@ pub fn substitute_with_dtype_legalization(
     expr: Expr,
     mut vmap: impl FnMut(&Var) -> Result<Option<Expr>>,
 ) -> Result<Expr> {
-    let mut collector = VarCollector { seen: HashMap::new(), order: Vec::new() };
+    let mut collector = VarCollector { seen: HashMap::default(), order: Vec::new() };
     structural_walk(&expr, &mut collector, WalkOrder::PreOrder)?;
-    let mut remap = HashMap::new();
+    let mut remap = HashMap::default();
     for var in collector.order {
         if let Some(replacement) = vmap(&var)? {
             remap.insert(ObjectIdentity::of(&var), replacement);

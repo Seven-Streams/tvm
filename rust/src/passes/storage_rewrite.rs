@@ -30,7 +30,7 @@
 //! PointerValueTypeRewrite retypes a tensor or pointer that is only ever accessed as one vector
 //! type to that vector element type, dividing its indices. StorageRewrite ends with it.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     dispatch, structural_mutate, structural_walk, Any, Array, ContextPolicy, DLDataType,
@@ -328,7 +328,7 @@ impl LinearAccessPatternFinder {
         }
         Self {
             linear_seq: Vec::new(),
-            alloc_info: HashMap::new(),
+            alloc_info: HashMap::default(),
             aliases,
             in_thread_env: false,
             scope: Vec::new(),
@@ -729,14 +729,14 @@ impl StoragePlanRewriter {
             detect_inplace: false,
             thread_scope: None,
             thread_scope_stack: Vec::new(),
-            event_map: HashMap::new(),
+            event_map: HashMap::default(),
             const_free_map: Vec::new(),
             sym_free_list: Vec::new(),
-            attach_map: HashMap::new(),
-            alloc_map: HashMap::new(),
+            attach_map: HashMap::default(),
+            alloc_map: HashMap::default(),
             alloc_vec: Vec::new(),
-            remapped_backing: HashMap::new(),
-            remap: HashMap::new(),
+            remapped_backing: HashMap::default(),
+            remap: HashMap::default(),
             aliases: TensorAliases::default(),
             analyzer: Analyzer::new()?,
         })
@@ -1819,7 +1819,7 @@ impl VectorTypeAccessChecker {
         detect_scalar_read_patterns: bool,
     ) -> Result<Self> {
         let mut checker = Self {
-            info_map: HashMap::new(),
+            info_map: HashMap::default(),
             aliases: TensorAliases::default(),
             allow_untyped_pointers,
             detect_scalar_read_patterns,
@@ -2170,7 +2170,7 @@ impl VectorTypeRewriter {
         options: RewriteOptions,
     ) -> Result<Self> {
         let rewrite_mask = options.rewrite_mask();
-        let mut rewrite_map = HashMap::new();
+        let mut rewrite_map = HashMap::default();
         for (id, var_info) in info_map {
             let preferred = var_info.preferred_dtype()?;
             if preferred == var_info.element_dtype
@@ -2209,7 +2209,7 @@ impl VectorTypeRewriter {
             rewrite_indices: options.rewrite_indices,
             rewrite_map,
             aliases,
-            remap: HashMap::new(),
+            remap: HashMap::default(),
             analyzer: Analyzer::new()?,
         })
     }

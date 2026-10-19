@@ -26,7 +26,7 @@
 //! elements at `m * y + x`, and a load of `A[m * z + (width * m) * y + x]` becomes a shuffle of
 //! the local element `m * y + x` from thread `z`.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     bail, dispatch, structural_mutate, structural_walk, Any, AnyCompatible, AnyView, Array,
@@ -907,7 +907,7 @@ struct UpdatePointerStorageScope {
 
 impl UpdatePointerStorageScope {
     fn new(new_storage_scopes: &[(Var, MemoryScope)]) -> Result<Self> {
-        let mut remap = HashMap::new();
+        let mut remap = HashMap::default();
         for (var, scope) in new_storage_scopes {
             let replacement: Var = if let Some(ty) = var.ty.as_node::<TensorTypeObj>() {
                 let ty = TensorType::from_complete_fields(
@@ -936,7 +936,7 @@ impl UpdatePointerStorageScope {
             };
             remap.insert(ObjectIdentity::of(var), replacement);
         }
-        Ok(Self { remap, tensor_scopes: HashMap::new() })
+        Ok(Self { remap, tensor_scopes: HashMap::default() })
     }
 }
 
@@ -1054,9 +1054,9 @@ pub fn lower_warp_memory() -> Result<Pass> {
             warp: MemoryScope::get("warp")?,
             warp_size: thread_warp_size(&target)?,
             analyzer: Analyzer::new()?,
-            active: HashMap::new(),
+            active: HashMap::default(),
             warp_index: None,
-            aliases: HashMap::new(),
+            aliases: HashMap::default(),
             new_storage_scopes: Vec::new(),
         };
         let stmt = rewriter.rewrite(body.into())?;

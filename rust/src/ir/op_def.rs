@@ -27,7 +27,7 @@
 
 use std::any::TypeId;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -363,7 +363,7 @@ pub fn register_ops(ops: &[&OpHandle]) -> Result<()> {
 }
 
 thread_local! {
-    static OPS: RefCell<HashMap<&'static str, Op>> = RefCell::new(HashMap::new());
+    static OPS: RefCell<HashMap<&'static str, Op>> = RefCell::new(HashMap::default());
 }
 
 /// `Op::Get(name)`, fetched once per thread, as C++ keeps an operator in a `static`.
@@ -399,7 +399,7 @@ thread_local! {
     /// The operator attribute columns read as raw values, fetched once per thread as C++ keeps
     /// them in `static`s. A column no operator registered yet is looked up again.
     static RAW_COLUMNS: RefCell<HashMap<&'static str, Rc<OpAttrMap<tvm_ffi::Function>>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
 }
 
 impl OpObj {

@@ -125,6 +125,7 @@ macro_rules! error {
     };
 }
 
+pub(crate) mod fast_hash;
 pub mod ir;
 pub mod ops;
 pub mod passes;

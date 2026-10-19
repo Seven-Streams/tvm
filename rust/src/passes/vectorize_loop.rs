@@ -23,7 +23,7 @@
 //!
 //! The C++ `VecAllocAccess` and `SkipVectorize` are not used by the pass and are not ported.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     dispatch, structural_map, structural_mutate, structural_walk, Any, AnyView, Array, BigInt,
@@ -953,7 +953,7 @@ impl Vectorizer {
             .ok_or_else(|| error!(INTERNAL_ERROR, "Attribute 'TVectorizable' is not registered"))?;
         let dtype = var.prim_dtype()?;
         let ramp: Expr = Ramp::new(int_imm(dtype, 0)?, int_imm(dtype, 1)?, &var_lanes)?.into();
-        let mut remap = HashMap::new();
+        let mut remap = HashMap::default();
         remap.insert(ObjectIdentity::of(&var), ramp);
         Ok(Self {
             var,

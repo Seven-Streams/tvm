@@ -20,7 +20,7 @@
 //! `tirx.HoistIf` (`src/tirx/transform/hoist_if.cc`): wrap a loop in the loop-invariant `if`
 //! conditions found inside it (`InsertHoistedIf`), then simplify (`StmtSimplify`, `RemoveNoOp`).
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{HashMap, HashSet};
 
 use tvm_ffi::{
     dispatch, structural_mutate, structural_walk, Any, Mutator, ObjectIdentity, ObjectRefCore,
@@ -164,7 +164,7 @@ impl IfHoister {
             loop_depths: &scope.loop_depths,
             loops: scope.loops.len(),
             destination: 0,
-            visited: HashSet::new(),
+            visited: HashSet::default(),
         };
         let blocked = structural_walk(condition, &mut walker, WalkOrder::PreOrder)?;
         Ok(if blocked.is_some() { scope.loops.len() } else { walker.destination })

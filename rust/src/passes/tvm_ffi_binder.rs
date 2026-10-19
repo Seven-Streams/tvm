@@ -26,7 +26,7 @@
 //! per-field checks that guard later loads), `asserts` (the checks of bound values) and
 //! `decl_tensors` (the tensor declarations of the parameters).
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::tvm_ffi_sys::TVMFFITypeIndex as TypeIndex;
 use tvm_ffi::{
@@ -250,7 +250,7 @@ impl AbiBinder {
     ) -> Result<Self> {
         let (packed_args, device_type, device_id) =
             (packed_args.into(), device_type.into(), device_id.into());
-        let mut param_names = HashMap::new();
+        let mut param_names = HashMap::default();
         let mut entries = Vec::new();
         for (i, param) in params.iter().enumerate() {
             let name = param.name.as_str().to_string();
@@ -279,7 +279,7 @@ impl AbiBinder {
         }
         let signature = format!("{func_name}({})", entries.join(", "));
         let mut binder = Self {
-            var_defs: HashMap::new(),
+            var_defs: HashMap::default(),
             init_nest: Vec::new(),
             asserts: Vec::new(),
             decl_tensors: Vec::new(),
@@ -287,7 +287,7 @@ impl AbiBinder {
             analyzer: Analyzer::new()?,
             func_name: func_name.to_string(),
             params: params.iter().collect(),
-            tensor_handles: HashMap::new(),
+            tensor_handles: HashMap::default(),
             packed_args,
             device_type,
             device_id,

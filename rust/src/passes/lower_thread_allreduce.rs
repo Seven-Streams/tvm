@@ -21,7 +21,8 @@
 //! `tirx.gpu_thread_allreduce` to warp shuffles, or to a reduction through shared memory, over the
 //! threads of its enclosing `launch_thread` regions.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use crate::fast_hash::{HashMap, HashSet};
 
 use tvm_ffi::{
     bail, dispatch, structural_map, structural_mutate, Any, AnyCompatible, AnyView, Array,
@@ -356,7 +357,7 @@ impl ThreadAllreduceBuilder {
             max_num_threads: attr("max_num_threads", -1)?,
             need_warp_shuffle_mask: false,
             thread_extents: Vec::new(),
-            load_remap: HashMap::new(),
+            load_remap: HashMap::default(),
             analyzer: Analyzer::new()?,
             remaps,
         })
@@ -534,7 +535,7 @@ impl ThreadAllreduceBuilder {
             tensors.push(as_tensor_var(&load.source)?);
         }
 
-        let mut reduce_set = HashSet::new();
+        let mut reduce_set: HashSet<_> = HashSet::default();
         for axis in &thread_axes {
             match as_prim_var(axis) {
                 Some(var) => {

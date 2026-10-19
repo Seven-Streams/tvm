@@ -26,7 +26,7 @@
 //! retypes the constants and casts inside indices; the [`DataTypeRewrite`] policy keeps the
 //! surrounding expressions consistent.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{HashMap, HashSet};
 
 use tvm_ffi::{
     dispatch, structural_mutate, structural_visit, Any, DLDataType, DefRegionKind, Mutator,
@@ -79,11 +79,11 @@ impl DataTypeVisitor {
             analyzer: Analyzer::new()?,
             bits: target_bits,
             target_bits,
-            vextent: HashMap::new(),
-            bounds: HashMap::new(),
-            memoized_lets: HashSet::new(),
-            released_lets: HashSet::new(),
-            vmap: HashMap::new(),
+            vextent: HashMap::default(),
+            bounds: HashMap::default(),
+            memoized_lets: HashSet::default(),
+            released_lets: HashSet::default(),
+            vmap: HashMap::default(),
         })
     }
 
@@ -486,7 +486,7 @@ fn narrow_body(body: SeqStmt, target_bits: i32) -> Result<SeqStmt> {
     let mut visitor = VisitCallbacks::new(DataTypeVisitor::new(target_bits)?, visit);
     structural_visit(&body, &mut visitor)?;
     let mut rewriter =
-        NarrowRewriter { base: DataTypeRewriterBase::new(true), vmap: HashMap::new() };
+        NarrowRewriter { base: DataTypeRewriterBase::new(true), vmap: HashMap::default() };
     for (key, (expr, dtype)) in visitor.into_state().vmap {
         if expr.prim_dtype()? == dtype {
             continue;

@@ -24,7 +24,7 @@
 //! definition region the engine reports. Scopes that end a definition's reach (`Let`, loops,
 //! branch arms, region bodies) push a lexical scope of renames.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{HashMap, HashSet};
 
 use tvm_ffi::{
     dispatch, structural_mutate, structural_walk, Any, Array, DefRegionKind, Mutator,
@@ -127,11 +127,11 @@ impl ConvertSsa {
 impl ConvertSsa {
     /// A converter with the bottom scope C++ `ScopeStack` starts with.
     pub(crate) fn new() -> Self {
-        Self { scopes: vec![HashMap::new()], defined: HashSet::new() }
+        Self { scopes: vec![HashMap::default()], defined: HashSet::default() }
     }
 
     fn scoped<T>(&mut self, body: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         let result = body(self);
         self.scopes.pop();
         result
@@ -161,7 +161,7 @@ impl ConvertSsa {
     /// then the body.
     fn visit_function(&mut self, func: Function) -> Result<Function> {
         self.scoped(|this| {
-            let mut defined: HashSet<ObjectIdentity> = HashSet::new();
+            let mut defined: HashSet<ObjectIdentity> = HashSet::default();
             for param in func.params.iter() {
                 let ty: Type = structural_mutate(param.ty.clone(), &mut *this)?.try_into()?;
                 this.define(&param, ty);

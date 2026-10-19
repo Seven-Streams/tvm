@@ -20,7 +20,7 @@
 //! `tirx.RemoveNoOp` (`src/tirx/transform/remove_no_op.cc`): drop statements without effect,
 //! empty loops and branches, and stores of the value already in place.
 
-use std::collections::HashMap;
+use crate::fast_hash::HashMap;
 
 use tvm_ffi::{
     dispatch, Any, Array, Map, Mutator, ObjectIdentity, ObjectRefCast, ObjectRefCore, Result,
@@ -247,7 +247,7 @@ pub fn remove_no_op() -> Result<Pass> {
         };
         let mut remover = NoOpRemover {
             base: AnalyzerBase::new(analyzer)?,
-            loop_ranges: HashMap::new(),
+            loop_ranges: HashMap::default(),
             profiler_ops,
         };
         let body: Stmt = tvm_ffi::structural_mutate(body, &mut remover)?.try_into()?;

@@ -27,11 +27,12 @@
 //! body, a branch assumes its condition for its arm, and so on. Children re-enter the pass's
 //! handlers.
 
-use std::collections::HashSet;
+use crate::fast_hash::HashSet;
 
 use tvm_ffi::{
-    match_any, structural_walk, Any, Array, Map, MutContextPolicy, MutateContext, MutateValue,
-    ObjectIdentity, ObjectRefCore, Result, String, UnchangedOr, WalkOrder, WalkResult,
+    Any, AnyView, Array, Map, match_any, MutateContext, MutateValue, MutContextPolicy,
+    ObjectIdentity, ObjectRefCore, Result, String, structural_walk, StructuralView, UnchangedOr,
+    WalkOrder, WalkResult,
 };
 
 use super::side_effect::{side_effect, PURE};
@@ -170,7 +171,7 @@ impl<S: AnalyzerState> MutContextPolicy<S> for AnalyzerScope {
         value: MutateValue<'_>,
         ctx: &mut MutateContext<'_, S, D>,
     ) -> Result<UnchangedOr<Any>> {
-        match descend(ctx, value.to_owned())? {
+        match descend(ctx, value.as_value())? {
             Some(result) => Ok(UnchangedOr::changed(result)),
             None => ctx.default_maybe_inplace_mutate_result(value),
         }
@@ -200,8 +201,12 @@ impl<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized> Scoped for MutateCo
 /// The nodes whose descent the analyzer scopes; `None` for every other value.
 fn descend<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
     ctx: &mut MutateContext<'_, S, D>,
-    value: Any,
+    view: &StructuralView,
 ) -> Result<Option<Any>> {
+    // Match on the borrowed view: only a matching arm takes a reference on the node, so the
+    // nodes this policy does not handle (most of them) cost one type test and no refcount
+    // traffic.
+    let value = AnyView::from(view);
     let result: Any = match_any! {
         value {
             For(op) => descend_for(ctx, op)?.into(),
