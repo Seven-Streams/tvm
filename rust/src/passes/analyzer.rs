@@ -165,10 +165,10 @@ pub trait AnalyzerState {
 pub struct AnalyzerScope;
 
 impl<S: AnalyzerState> MutContextPolicy<S> for AnalyzerScope {
-    fn default_mutate(
+    fn default_mutate<D: tvm_ffi::MutateDriver<S> + ?Sized>(
         &self,
         value: MutateValue<'_>,
-        ctx: &mut MutateContext<'_, S>,
+        ctx: &mut MutateContext<'_, S, D>,
     ) -> Result<UnchangedOr<Any>> {
         match descend(ctx, value.to_owned())? {
             Some(result) => Ok(UnchangedOr::changed(result)),
@@ -191,14 +191,17 @@ trait Scoped {
     }
 }
 
-impl<S: AnalyzerState> Scoped for MutateContext<'_, S> {
+impl<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized> Scoped for MutateContext<'_, S, D> {
     fn base(&mut self) -> &mut AnalyzerBase {
         self.state_mut().base()
     }
 }
 
 /// The nodes whose descent the analyzer scopes; `None` for every other value.
-fn descend<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, value: Any) -> Result<Option<Any>> {
+fn descend<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: &mut MutateContext<'_, S, D>,
+    value: Any,
+) -> Result<Option<Any>> {
     let result: Any = match_any! {
         value {
             For(op) => descend_for(ctx, op)?.into(),
@@ -218,7 +221,10 @@ fn descend<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, value: Any) -> Resu
 }
 
 /// The loop variable ranges over the loop for all of it; the body may also assume the loop runs.
-fn descend_for<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: For) -> Result<For> {
+fn descend_for<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: &mut MutateContext<'_, S, D>,
+    op: For,
+) -> Result<For> {
     ctx.scoped(|ctx| {
         let range = Range::from_min_extent(&op.min, &op.extent)?;
         ctx.base().analyzer.bind_range(&op.loop_var, &range)?;
@@ -242,7 +248,10 @@ fn descend_for<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: For) -> Res
 }
 
 /// A pure bound value is known for the rest of the scope.
-fn descend_bind<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Bind) -> Result<Bind> {
+fn descend_bind<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: &mut MutateContext<'_, S, D>,
+    op: Bind,
+) -> Result<Bind> {
     let value: Expr = ctx.mutate_as(&op.value)?;
     if is_prim_expr(&value) && side_effect(&value)? <= PURE {
         ctx.base().analyzer.bind(&op.var, &value)?;
@@ -251,7 +260,10 @@ fn descend_bind<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Bind) -> R
 }
 
 /// Each arm assumes the condition it runs under; a constant condition selects its arm.
-fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Result<Any> {
+fn descend_if<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: &mut MutateContext<'_, S, D>,
+    op: If,
+) -> Result<Any> {
     ctx.scoped(|ctx| {
         let condition: Expr = ctx.mutate_as(&op.condition)?;
         let real_condition = match condition.as_node::<crate::ir::CallObj>() {
@@ -302,7 +314,10 @@ fn descend_if<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: If) -> Resul
 
 /// A launched thread index ranges over its extent, and the launch fields bound the CUDA block and
 /// thread indices, for the region's body.
-fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionStmt) -> Result<Any> {
+fn descend_region<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: &mut MutateContext<'_, S, D>,
+    op: RegionStmt,
+) -> Result<Any> {
     ctx.scoped(|ctx| {
         if LAUNCH_THREAD.is(&op.op) {
             let var = op.body_params.get(0)?;
@@ -331,10 +346,10 @@ fn descend_region<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: RegionSt
 
 /// C++ `WithRecordIterPredicate(condition, body)`: `condition` is recorded for `body` when it
 /// mentions a loop variable.
-fn with_iter_predicate<S: AnalyzerState, T>(
-    ctx: &mut MutateContext<'_, S>,
+fn with_iter_predicate<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized, T>(
+    ctx: &mut MutateContext<'_, S, D>,
     condition: Option<&Expr>,
-    body: impl FnOnce(&mut MutateContext<'_, S>) -> Result<T>,
+    body: impl FnOnce(&mut MutateContext<'_, S, D>) -> Result<T>,
 ) -> Result<T> {
     let record = match condition {
         Some(condition) => ctx.base().mentions_iter_var(condition)?,
@@ -356,8 +371,8 @@ fn launch_index(intrinsic: &OpHandle, axis: &str) -> Result<Expr> {
 }
 
 /// A pure asserted condition holds for the rest of the scope.
-fn descend_assert<S: AnalyzerState>(
-    ctx: &mut MutateContext<'_, S>,
+fn descend_assert<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: &mut MutateContext<'_, S, D>,
     op: AssertStmt,
 ) -> Result<AssertStmt> {
     let condition: Expr = ctx.mutate_as(&op.condition)?;
@@ -368,7 +383,10 @@ fn descend_assert<S: AnalyzerState>(
 }
 
 /// `if_then_else(c, t, f)`: `t` under `c`, `f` under `!c`; a constant `c` selects its value.
-fn descend_if_then_else<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Call) -> Result<Any> {
+fn descend_if_then_else<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: &mut MutateContext<'_, S, D>,
+    op: Call,
+) -> Result<Any> {
     let (cond, true_value, false_value) = (op.args.get(0)?, op.args.get(1)?, op.args.get(2)?);
     let cond_new: Expr = ctx.mutate_as(&cond)?;
     let true_new: Expr = ctx.scoped(|ctx| {
@@ -401,7 +419,10 @@ fn descend_if_then_else<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Ca
 }
 
 /// A pure let value is known inside the body.
-fn descend_let<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Let) -> Result<Any> {
+fn descend_let<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: &mut MutateContext<'_, S, D>,
+    op: Let,
+) -> Result<Any> {
     let value: Expr = ctx.mutate_as(&op.value)?;
     if side_effect(&value)? <= PURE {
         ctx.base().analyzer.bind(&op.var, &value)?;
@@ -414,7 +435,10 @@ fn descend_let<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Let) -> Res
 }
 
 /// `select(c, t, f)`: `t` under `c`, `f` under `!c`; a constant `c` selects its value.
-fn descend_select<S: AnalyzerState>(ctx: &mut MutateContext<'_, S>, op: Select) -> Result<Any> {
+fn descend_select<S: AnalyzerState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: &mut MutateContext<'_, S, D>,
+    op: Select,
+) -> Result<Any> {
     let cond: Expr = ctx.mutate_as(&op.condition)?;
     let true_value: Expr = ctx.scoped(|ctx| {
         ctx.base().assume_facts(&cond)?;

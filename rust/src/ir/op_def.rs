@@ -33,10 +33,10 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use tvm_ffi::tvm_ffi_sys::{TVMFFIAny, TVMFFITypeIndex};
+use tvm_ffi::tvm_ffi_sys::{TVMFFIAny, TVMFFIObject, TVMFFITypeIndex};
 use tvm_ffi::{
     Any, AnyView, Array, Error, ObjectArc, ObjectRefCore, Result, String, INTERNAL_ERROR,
     TYPE_ERROR, VALUE_ERROR,
@@ -244,6 +244,9 @@ pub struct OpHandle {
     defined: OnceLock<std::result::Result<(), std::string::String>>,
     /// This handle's slot in each thread's cache of fetched operators.
     slot: OnceLock<usize>,
+    /// The operator once fetched, for identity tests: operators are registry singletons that
+    /// live for the process, and `is` is the hot path of every pass that looks at `Call::op`.
+    object: AtomicPtr<TVMFFIObject>,
 }
 
 /// The documentation and the definition of an operator Rust defines.
@@ -260,14 +263,26 @@ thread_local! {
 impl OpHandle {
     /// The operator `name`, registered elsewhere.
     pub const fn registered(name: &'static str) -> Self {
-        Self { name, definition: None, defined: OnceLock::new(), slot: OnceLock::new() }
+        Self {
+            name,
+            definition: None,
+            defined: OnceLock::new(),
+            slot: OnceLock::new(),
+            object: AtomicPtr::new(std::ptr::null_mut()),
+        }
     }
 
     /// The operator `name`, defined here: `define` adds to `OpDef::new(name, doc)`. An operator
     /// of that name registered elsewhere is an error, as Rust does not take operators over.
     pub const fn define(name: &'static str, doc: &'static str, define: fn(OpDef) -> OpDef) -> Self {
         let definition = Some((doc, define));
-        Self { name, definition, defined: OnceLock::new(), slot: OnceLock::new() }
+        Self {
+            name,
+            definition,
+            defined: OnceLock::new(),
+            slot: OnceLock::new(),
+            object: AtomicPtr::new(std::ptr::null_mut()),
+        }
     }
 
     pub fn name(&self) -> &'static str {
@@ -305,7 +320,21 @@ impl OpHandle {
     /// Whether `value`, such as a Call's `op`, is this operator (C++ `value.same_as(op)`). No
     /// value is an operator that cannot be fetched, such as one this build does not register.
     pub fn is(&self, value: &impl ObjectRefCore) -> bool {
-        self.with(|op| value.same_as(op)).unwrap_or(false)
+        let cached = self.object.load(Ordering::Acquire);
+        if !cached.is_null() {
+            // SAFETY: the pointer is only compared, never dereferenced.
+            let pointer = unsafe { ObjectArc::as_raw(ObjectRefCore::data(value)) };
+            return pointer.cast::<TVMFFIObject>().cast_mut() == cached;
+        }
+        self.with(|op| {
+            // Keep one reference so the pointer stays valid for the process (a second thread
+            // racing here leaks one more, which is harmless for a registry singleton).
+            // SAFETY: the raw pointer is never turned back into an `ObjectArc`.
+            let pointer = unsafe { ObjectArc::into_raw(Op::into_data(op.clone())) };
+            self.object.store(pointer.cast::<TVMFFIObject>().cast_mut(), Ordering::Release);
+            value.same_as(op)
+        })
+        .unwrap_or(false)
     }
 
     /// `use_op` applied to the operator, fetched into this thread's slot the first time.

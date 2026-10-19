@@ -71,10 +71,10 @@ impl Classifier {
 struct DeviceScope;
 
 impl ContextPolicy<Classifier> for DeviceScope {
-    fn default_visit(
+    fn default_visit<D: tvm_ffi::VisitDriver<Classifier> + ?Sized>(
         &self,
         value: &StructuralView,
-        ctx: &mut VisitContext<'_, Classifier>,
+        ctx: &mut VisitContext<'_, Classifier, D>,
     ) -> Result<Option<VisitInterrupt>> {
         match value.cast::<RegionStmt>() {
             Some(region) if opens_device_scope(&region) => {

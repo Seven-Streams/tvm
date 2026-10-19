@@ -37,8 +37,8 @@
 use std::collections::HashMap;
 
 use tvm_ffi::{
-    bail, match_any, Any, Array, MutContextPolicy, MutateContext, MutateValue, ObjectIdentity,
-    ObjectRefCore, Result, UnchangedOr, INTERNAL_ERROR, TYPE_ERROR,
+    bail, match_any, Any, AnyView, Array, MutContextPolicy, MutateContext, MutateValue,
+    ObjectIdentity, ObjectRefCore, Result, StructuralView, UnchangedOr, INTERNAL_ERROR, TYPE_ERROR,
 };
 
 use super::util::ContextExt;
@@ -104,19 +104,19 @@ pub trait DataTypeRewriterState {
 pub struct DataTypeRewrite;
 
 impl<S: DataTypeRewriterState> MutContextPolicy<S> for DataTypeRewrite {
-    fn default_mutate(
+    fn default_mutate<D: tvm_ffi::MutateDriver<S> + ?Sized>(
         &self,
         value: MutateValue<'_>,
-        ctx: &mut MutateContext<'_, S>,
+        ctx: &mut MutateContext<'_, S, D>,
     ) -> Result<UnchangedOr<Any>> {
-        match rewrite(ctx, value.to_owned())? {
+        match rewrite(ctx, value.as_value())? {
             Some(result) => Ok(result),
             None => ctx.default_maybe_inplace_mutate_result(value),
         }
     }
 }
 
-type Ctx<'a, 'b, S> = &'a mut MutateContext<'b, S>;
+type Ctx<'a, 'b, S, D> = &'a mut MutateContext<'b, S, D>;
 type Rewritten = Result<Option<UnchangedOr<Any>>>;
 
 fn changed(value: impl Into<Any>) -> Rewritten {
@@ -128,21 +128,42 @@ fn unchanged() -> Rewritten {
 }
 
 /// The nodes the base classes rewrite; `None` for every other value.
-fn rewrite<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, value: Any) -> Rewritten {
+fn rewrite<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    view: &StructuralView,
+) -> Rewritten {
     let index = ctx.state_mut().base().index;
+    // `Var` is not a final type and the index-only arms carry guards; both would keep the
+    // `match_any!` below off its exact-leaf lookup table, so they are tested on their own first.
+    if let Some(var) = view.cast::<Var>() {
+        return match ctx.state_mut().base().remap_get(&var) {
+            Some(replacement) => changed(replacement.clone()),
+            None => Ok(None),
+        };
+    }
+    let value = AnyView::from(view);
+    if index {
+        let indexed = match_any! {
+            value {
+                TensorType(ty) => {
+                    let base = ctx.state_mut().base();
+                    let enabled = std::mem::replace(&mut base.is_enabled, true);
+                    let result = ctx.default_mutate(&ty);
+                    ctx.state_mut().base().is_enabled = enabled;
+                    Some(changed(result?))
+                },
+                TensorStore(op) => Some(index_store(ctx, op)),
+                TensorLoad(op) => Some(index_load(ctx, op)),
+                If(op) => Some(index_if(ctx, op)),
+                _ => None,
+            }
+        };
+        if let Some(result) = indexed {
+            return result;
+        }
+    }
     match_any! {
         value {
-            Var(var) => match ctx.state_mut().base().remap_get(&var) {
-                Some(replacement) => changed(replacement.clone()),
-                None => Ok(None),
-            },
-            TensorType(ty) if index => {
-                let base = ctx.state_mut().base();
-                let enabled = std::mem::replace(&mut base.is_enabled, true);
-                let result = ctx.default_mutate(&ty);
-                ctx.state_mut().base().is_enabled = enabled;
-                changed(result?)
-            },
             RegionStmt(op) => {
                 let base = ctx.state_mut().base();
                 let enabled = base.is_enabled;
@@ -153,9 +174,6 @@ fn rewrite<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, value: Any) -> Rewritt
                 ctx.state_mut().base().is_enabled = enabled;
                 result
             },
-            TensorStore(op) if index => index_store(ctx, op),
-            TensorLoad(op) if index => index_load(ctx, op),
-            If(op) if index => index_if(ctx, op),
             For(op) => if index { index_for(ctx, op) } else { legalize_for(ctx, op) },
             Bind(op) => if index { index_bind(ctx, op) } else { legalize_bind(ctx, op) },
             Call(op) => {
@@ -225,7 +243,10 @@ fn cast(value: Expr, ty: &PrimType) -> Result<Expr> {
 // DataTypeLegalizer
 
 /// A launched thread's extent takes the type of its thread variable.
-fn legalize_region<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: RegionStmt) -> Rewritten {
+fn legalize_region<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: RegionStmt,
+) -> Rewritten {
     let result = ctx.default_mutate(&op)?;
     let Ok(region) = RegionStmt::try_from(result.clone()) else { return changed(result) };
     if !LAUNCH_THREAD.is(&region.op) {
@@ -243,7 +264,10 @@ fn legalize_region<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: RegionStmt
 }
 
 /// A loop's bounds and step take the type of its variable.
-fn legalize_for<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: For) -> Rewritten {
+fn legalize_for<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: For,
+) -> Rewritten {
     let result: For = ctx.default_mutate(&op)?.try_into()?;
     let var: Expr = ctx.mutate_as(&result.loop_var)?.into();
     let var_ty = var.prim_ty()?;
@@ -258,7 +282,10 @@ fn legalize_for<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: For) -> Rewri
 }
 
 /// A bound variable takes the type of its value.
-fn legalize_bind<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Bind) -> Rewritten {
+fn legalize_bind<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: Bind,
+) -> Rewritten {
     if op.value.ty.as_node::<PrimTypeObj>().is_none() {
         return changed(ctx.default_mutate(&op)?);
     }
@@ -277,7 +304,10 @@ fn legalize_bind<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Bind) -> Rew
 }
 
 /// A let variable takes the type of its value, or the value the type of a replaced variable.
-fn legalize_let<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Let) -> Rewritten {
+fn legalize_let<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: Let,
+) -> Rewritten {
     let mut value: Expr = ctx.mutate_as(&op.value)?;
     let mut value_unchanged = value.same_as(&op.value);
     let mut var: Var = ctx.mutate_as(&op.var)?;
@@ -299,7 +329,11 @@ fn legalize_let<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Let) -> Rewri
 }
 
 /// The two arms of a select take the wider of their types.
-fn select<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Select, index: bool) -> Rewritten {
+fn select<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: Select,
+    index: bool,
+) -> Rewritten {
     let base = ctx.state_mut().base();
     let flag = index || base.is_condition;
     let condition_flag = std::mem::replace(&mut base.is_condition, flag);
@@ -329,7 +363,10 @@ fn widen(lhs: Expr, rhs: Expr) -> Result<(Expr, Expr)> {
     Ok((lhs, rhs))
 }
 
-fn legalize_ramp<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Ramp) -> Rewritten {
+fn legalize_ramp<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: Ramp,
+) -> Rewritten {
     let base: Expr = ctx.mutate_as(&op.base_)?;
     let stride: Expr = ctx.mutate_as(&op.stride)?;
     let (base_ty, stride_ty) = (base.prim_ty()?, stride.prim_ty()?);
@@ -347,7 +384,10 @@ fn legalize_ramp<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Ramp) -> Rew
 }
 
 /// Rebuilt by its constructor, which infers the type again.
-fn legalize_broadcast<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Broadcast) -> Rewritten {
+fn legalize_broadcast<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: Broadcast,
+) -> Rewritten {
     let value: Expr = ctx.mutate_as(&op.value)?;
     let lanes: Expr = ctx.mutate_as(&op.lanes)?;
     if value.same_as(&op.value) && lanes.same_as(&op.lanes) {
@@ -357,7 +397,10 @@ fn legalize_broadcast<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Broadca
 }
 
 /// Rebuilt by its constructor, which infers the type again.
-fn legalize_shuffle<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Shuffle) -> Rewritten {
+fn legalize_shuffle<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: Shuffle,
+) -> Rewritten {
     let vectors: Array<Expr> = ctx.mutate_as(&op.vectors)?;
     let indices: Array<Expr> = ctx.mutate_as(&op.indices)?;
     if vectors.same_as(&op.vectors) && indices.same_as(&op.indices) {
@@ -368,8 +411,8 @@ fn legalize_shuffle<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Shuffle) 
 
 /// A shift by the C++ operator; with `clamp_shift_amounts`, a shift amount of a narrowed signed
 /// value is clamped below its new width.
-fn shift<S: DataTypeRewriterState>(
-    ctx: Ctx<'_, '_, S>,
+fn shift<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
     a: &Expr,
     b: &Expr,
     combine: fn(&Expr, &Expr) -> Ex,
@@ -389,8 +432,8 @@ fn shift<S: DataTypeRewriterState>(
     changed(combine(&lhs, &rhs).expr()?)
 }
 
-fn legalize_bitwise_not<S: DataTypeRewriterState>(
-    ctx: Ctx<'_, '_, S>,
+fn legalize_bitwise_not<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
     op: BitwiseNot,
 ) -> Rewritten {
     let a: Expr = ctx.mutate_as(&op.a)?;
@@ -401,8 +444,8 @@ fn legalize_bitwise_not<S: DataTypeRewriterState>(
 }
 
 /// A binary operation rebuilt by its C++ operator, which matches the operand types.
-fn binary<S: DataTypeRewriterState>(
-    ctx: Ctx<'_, '_, S>,
+fn binary<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
     a: &Expr,
     b: &Expr,
     combine: fn(&Expr, &Expr) -> Ex,
@@ -416,8 +459,8 @@ fn binary<S: DataTypeRewriterState>(
 }
 
 /// A comparison; under the index rewriter, an integer comparison in a condition is an index.
-fn comparison<S: DataTypeRewriterState>(
-    ctx: Ctx<'_, '_, S>,
+fn comparison<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
     a: &Expr,
     b: &Expr,
     index: bool,
@@ -435,7 +478,10 @@ fn comparison<S: DataTypeRewriterState>(
 }
 
 /// `pow`, `if_then_else` and `clz` calls are rebuilt for their new argument types.
-fn legalize_call<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, before: Call) -> Rewritten {
+fn legalize_call<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    before: Call,
+) -> Rewritten {
     let result = ctx.default_mutate(&before)?;
     let call: Call = result.clone().try_into()?;
     if call.ty.as_node::<PrimTypeObj>().is_none() {
@@ -479,8 +525,8 @@ fn legalize_call<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, before: Call) ->
 // IndexDataTypeRewriter
 
 /// Mutate `indices` as tensor indices.
-fn visit_indices<S: DataTypeRewriterState>(
-    ctx: Ctx<'_, '_, S>,
+fn visit_indices<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
     indices: &Array<Expr>,
 ) -> Result<Array<Expr>> {
     let enabled = std::mem::replace(&mut ctx.state_mut().base().is_enabled, true);
@@ -490,7 +536,10 @@ fn visit_indices<S: DataTypeRewriterState>(
 }
 
 /// A stored scalar takes the element type of its (possibly retyped) tensor.
-fn index_store<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: TensorStore) -> Rewritten {
+fn index_store<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: TensorStore,
+) -> Rewritten {
     let dest: Expr = ctx.mutate_as(&op.dest)?;
     let mut value: Expr = ctx.mutate_as(&op.value)?;
     let mut value_unchanged = value.same_as(&op.value);
@@ -507,7 +556,10 @@ fn index_store<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: TensorStore) -
     changed(TensorStore::from_complete_fields(op.loc.clone(), dest, indices, value))
 }
 
-fn index_load<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: TensorLoad) -> Rewritten {
+fn index_load<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: TensorLoad,
+) -> Rewritten {
     let source: Expr = ctx.mutate_as(&op.source)?;
     let indices = visit_indices(ctx, &op.indices)?;
     if source.same_as(&op.source) && indices.same_as(&op.indices) {
@@ -516,7 +568,10 @@ fn index_load<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: TensorLoad) -> 
     changed(TensorLoad::new_full(source, indices.iter(), &op.loc)?)
 }
 
-fn index_if<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: If) -> Rewritten {
+fn index_if<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: If,
+) -> Rewritten {
     let condition_flag = std::mem::replace(&mut ctx.state_mut().base().is_condition, true);
     let condition = ctx.mutate_as(&op.condition);
     ctx.state_mut().base().is_condition = condition_flag;
@@ -539,7 +594,10 @@ fn index_if<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: If) -> Rewritten 
 }
 
 /// The loop variable and bounds are indices; the bounds take the variable's type.
-fn index_for<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: For) -> Rewritten {
+fn index_for<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: For,
+) -> Rewritten {
     let enabled = std::mem::replace(&mut ctx.state_mut().base().is_enabled, true);
     let header = (|| -> Result<(Var, Expr, Expr)> {
         Ok((ctx.mutate_as(&op.loop_var)?, ctx.mutate_as(&op.min)?, ctx.mutate_as(&op.extent)?))
@@ -566,7 +624,10 @@ fn index_for<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: For) -> Rewritte
 }
 
 /// A bound variable replaced before its definition takes the value, cast to its type.
-fn index_bind<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Bind) -> Rewritten {
+fn index_bind<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: Bind,
+) -> Rewritten {
     if op.value.ty.as_node::<PrimTypeObj>().is_none() {
         return changed(ctx.default_mutate(&op)?);
     }
@@ -581,7 +642,10 @@ fn index_bind<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Bind) -> Rewrit
 }
 
 /// `if_then_else`: the condition is a condition, and the arms take the wider type.
-fn index_if_then_else<S: DataTypeRewriterState>(ctx: Ctx<'_, '_, S>, op: Call) -> Rewritten {
+fn index_if_then_else<S: DataTypeRewriterState, D: tvm_ffi::MutateDriver<S> + ?Sized>(
+    ctx: Ctx<'_, '_, S, D>,
+    op: Call,
+) -> Rewritten {
     let condition_flag = std::mem::replace(&mut ctx.state_mut().base().is_condition, true);
     let condition = ctx.mutate_as(&op.args.get(0)?);
     ctx.state_mut().base().is_condition = condition_flag;

@@ -130,10 +130,10 @@ impl MemoryAccessVerifier<'_> {
 struct ThreadScope;
 
 impl<'a> ContextPolicy<MemoryAccessVerifier<'a>> for ThreadScope {
-    fn default_visit(
+    fn default_visit<D: tvm_ffi::VisitDriver<MemoryAccessVerifier<'a>> + ?Sized>(
         &self,
         value: &StructuralView,
-        ctx: &mut VisitContext<'_, MemoryAccessVerifier<'a>>,
+        ctx: &mut VisitContext<'_, MemoryAccessVerifier<'a>, D>,
     ) -> Result<Option<VisitInterrupt>> {
         let Some(region) = value.cast::<RegionStmt>() else { return ctx.visit_children() };
         if ctx.state().in_thread_env || !ctx.state().opens_thread_env(&region)? {

@@ -21,7 +21,7 @@
 
 use tvm_ffi::{
     Any, AnyView, Array, Function as FfiFunction, Map, MutateContext, MutateDispatch, Mutator,
-    ObjectRefCore, RValueRef, Result, String,
+    ObjectRefCore, RValueRef, Result, String, UnchangedOr,
 };
 
 use crate::ir::{BaseFunc, DictAttrs, GlobalVar, IRModule};
@@ -96,34 +96,46 @@ pub trait MutatorExt {
     fn mutate_as<D, T>(&mut self, dispatch: &mut D, value: &T) -> Result<T>
     where
         D: MutateDispatch,
-        T: TryFrom<Any, Error = tvm_ffi::Error>,
+        T: TryFrom<Any, Error = tvm_ffi::Error> + Clone,
         for<'x> AnyView<'x>: From<&'x T>;
 
     /// Default descent of `value`, the C++ `Parent::Mutate_(op)`, as its own type.
     fn default_mutate_as<D, T>(&mut self, dispatch: &mut D, value: &T) -> Result<T>
     where
         D: MutateDispatch,
-        T: TryFrom<Any, Error = tvm_ffi::Error>,
+        T: TryFrom<Any, Error = tvm_ffi::Error> + Clone,
         for<'x> AnyView<'x>: From<&'x T>;
+}
+
+/// The typed result of a mutation: an unchanged result is the original, which already has the
+/// type, so only a replacement is checked and converted.
+fn typed_or_original<T>(mapped: UnchangedOr<Any>, original: &T) -> Result<T>
+where
+    T: TryFrom<Any, Error = tvm_ffi::Error> + Clone,
+{
+    match mapped.into_option() {
+        Some(replacement) => replacement.try_into(),
+        None => Ok(original.clone()),
+    }
 }
 
 impl MutatorExt for Mutator {
     fn mutate_as<D, T>(&mut self, dispatch: &mut D, value: &T) -> Result<T>
     where
         D: MutateDispatch,
-        T: TryFrom<Any, Error = tvm_ffi::Error>,
+        T: TryFrom<Any, Error = tvm_ffi::Error> + Clone,
         for<'x> AnyView<'x>: From<&'x T>,
     {
-        self.mutate(dispatch, value)?.try_into()
+        typed_or_original(self.mutate_result(dispatch, value)?, value)
     }
 
     fn default_mutate_as<D, T>(&mut self, dispatch: &mut D, value: &T) -> Result<T>
     where
         D: MutateDispatch,
-        T: TryFrom<Any, Error = tvm_ffi::Error>,
+        T: TryFrom<Any, Error = tvm_ffi::Error> + Clone,
         for<'x> AnyView<'x>: From<&'x T>,
     {
-        self.default_mutate(dispatch, value)?.try_into()
+        typed_or_original(self.default_mutate_result(dispatch, value)?, value)
     }
 }
 
@@ -131,17 +143,17 @@ impl MutatorExt for Mutator {
 pub trait ContextExt {
     fn mutate_as<T>(&mut self, value: &T) -> Result<T>
     where
-        T: TryFrom<Any, Error = tvm_ffi::Error>,
+        T: TryFrom<Any, Error = tvm_ffi::Error> + Clone,
         for<'x> AnyView<'x>: From<&'x T>;
 }
 
-impl<S> ContextExt for MutateContext<'_, S> {
+impl<S, D: tvm_ffi::MutateDriver<S> + ?Sized> ContextExt for MutateContext<'_, S, D> {
     fn mutate_as<T>(&mut self, value: &T) -> Result<T>
     where
-        T: TryFrom<Any, Error = tvm_ffi::Error>,
+        T: TryFrom<Any, Error = tvm_ffi::Error> + Clone,
         for<'x> AnyView<'x>: From<&'x T>,
     {
-        self.mutate(value)?.try_into()
+        typed_or_original(self.mutate_result(value)?, value)
     }
 }
 
