@@ -131,7 +131,6 @@ pub mod ops;
 pub mod passes;
 pub mod prim;
 pub mod runtime;
-pub mod structural_hooks;
 pub mod sym;
 pub mod target;
 pub mod tirx;
@@ -198,8 +197,7 @@ static OPS: &[&ir::OpHandle] = &[];
 /// success; on failure prints the error and returns -1.
 #[no_mangle]
 pub extern "C" fn tvm_rust_register_ops() -> i32 {
-    let registered = ir::register_ops(OPS).and_then(|()| structural_hooks::register());
-    report("tvm_rust_register_ops", registered)
+    report("tvm_rust_register_ops", ir::register_ops(OPS))
 }
 
 /// Entry point for a host process that loads this crate as a shared library: registers this
@@ -207,9 +205,7 @@ pub extern "C" fn tvm_rust_register_ops() -> i32 {
 /// on failure prints the error and returns -1.
 #[no_mangle]
 pub extern "C" fn tvm_rust_register_passes() -> i32 {
-    let registered = ir::register_ops(OPS)
-        .and_then(|()| structural_hooks::register())
-        .and_then(|()| passes::register_globals());
+    let registered = ir::register_ops(OPS).and_then(|()| passes::register_globals());
     report("tvm_rust_register_passes", registered)
 }
 
