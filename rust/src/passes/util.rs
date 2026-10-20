@@ -147,7 +147,7 @@ pub trait ContextExt {
         for<'x> AnyView<'x>: From<&'x T>;
 }
 
-impl<S, D: tvm_ffi::MutateDriver<S> + ?Sized> ContextExt for MutateContext<'_, S, D> {
+impl<S> ContextExt for MutateContext<'_, S> {
     fn mutate_as<T>(&mut self, value: &T) -> Result<T>
     where
         T: TryFrom<Any, Error = tvm_ffi::Error> + Clone,

@@ -570,10 +570,10 @@ impl DeviceInfoCollector {
 struct RegionScope;
 
 impl ContextPolicy<DeviceInfoCollector> for RegionScope {
-    fn default_visit<D: tvm_ffi::VisitDriver<DeviceInfoCollector> + ?Sized>(
+    fn default_visit(
         &self,
         value: &StructuralView,
-        ctx: &mut VisitContext<'_, DeviceInfoCollector, D>,
+        ctx: &mut VisitContext<'_, DeviceInfoCollector>,
     ) -> Result<Option<VisitInterrupt>> {
         let Some(region) = value.cast::<RegionStmt>() else { return ctx.visit_children() };
         ctx.state_mut().enter_region(&region)?;

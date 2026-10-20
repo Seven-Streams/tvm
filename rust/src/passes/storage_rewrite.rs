@@ -387,8 +387,8 @@ struct AccessScopes;
 
 impl AccessScopes {
     /// `VisitNewScope`: a begin entry, the body, and an end entry carrying the body's touches.
-    fn visit_new_scope<D: tvm_ffi::VisitDriver<LinearAccessPatternFinder> + ?Sized>(
-        ctx: &mut VisitContext<'_, LinearAccessPatternFinder, D>,
+    fn visit_new_scope(
+        ctx: &mut VisitContext<'_, LinearAccessPatternFinder>,
         stmt: Stmt,
     ) -> Result<Option<VisitInterrupt>> {
         let state = ctx.state_mut();
@@ -416,8 +416,8 @@ impl AccessScopes {
 
     /// `VisitBindingValue`: a binding is a leaf; retained metadata of a tensor declaration can be
     /// the only use of an earlier allocation.
-    fn visit_binding<D: tvm_ffi::VisitDriver<LinearAccessPatternFinder> + ?Sized>(
-        ctx: &mut VisitContext<'_, LinearAccessPatternFinder, D>,
+    fn visit_binding(
+        ctx: &mut VisitContext<'_, LinearAccessPatternFinder>,
         op: Bind,
     ) -> Result<Option<VisitInterrupt>> {
         ctx.state_mut().scope.push(Vec::new());
@@ -432,10 +432,10 @@ impl AccessScopes {
 }
 
 impl ContextPolicy<LinearAccessPatternFinder> for AccessScopes {
-    fn default_visit<D: tvm_ffi::VisitDriver<LinearAccessPatternFinder> + ?Sized>(
+    fn default_visit(
         &self,
         value: &StructuralView,
-        ctx: &mut VisitContext<'_, LinearAccessPatternFinder, D>,
+        ctx: &mut VisitContext<'_, LinearAccessPatternFinder>,
     ) -> Result<Option<VisitInterrupt>> {
         // The value first, then the indices; the destination is an access, not a read.
         if let Some(op) = value.cast::<TensorStore>() {
@@ -566,10 +566,10 @@ impl InplaceOpVerifier {
 struct InplaceAccesses;
 
 impl ContextPolicy<InplaceOpVerifier> for InplaceAccesses {
-    fn default_visit<D: tvm_ffi::VisitDriver<InplaceOpVerifier> + ?Sized>(
+    fn default_visit(
         &self,
         value: &StructuralView,
-        ctx: &mut VisitContext<'_, InplaceOpVerifier, D>,
+        ctx: &mut VisitContext<'_, InplaceOpVerifier>,
     ) -> Result<Option<VisitInterrupt>> {
         if let Some(op) = value.cast::<TensorStore>() {
             ctx.state_mut().mem_nest += 1;
@@ -2049,10 +2049,10 @@ impl VectorTypeAccessChecker {
 struct AddressOfOperand;
 
 impl ContextPolicy<VectorTypeAccessChecker> for AddressOfOperand {
-    fn default_visit<D: tvm_ffi::VisitDriver<VectorTypeAccessChecker> + ?Sized>(
+    fn default_visit(
         &self,
         value: &StructuralView,
-        ctx: &mut VisitContext<'_, VectorTypeAccessChecker, D>,
+        ctx: &mut VisitContext<'_, VectorTypeAccessChecker>,
     ) -> Result<Option<VisitInterrupt>> {
         if let Some(call) = value.as_node::<CallObj>() {
             if ADDRESS_OF.is(&call.op) {

@@ -34,6 +34,9 @@
 //! The blocks are formatted the way rustfmt formats them, so `cargo fmt --check` and
 //! `tvm-ffi-stubgen --check` agree. That needs the generator of tvm-ffi `abcc398` or later, the
 //! `3rdparty/tvm-ffi` this tree pins.
+//!
+//! Node types defined in Rust rather than mirrored from C++ derive their reflection with
+//! tvm-ffi's `#[reflect]` fields; [`node`] supplies what extending a C++ IR node needs.
 
 /// Copy-on-write edits for a complete, `#[type_final]` node, written next to its binding.
 ///
@@ -127,6 +130,7 @@ macro_rules! error {
 
 pub(crate) mod fast_hash;
 pub mod ir;
+pub mod node;
 pub mod ops;
 pub mod passes;
 pub mod prim;
